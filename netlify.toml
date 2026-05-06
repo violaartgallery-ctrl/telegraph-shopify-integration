@@ -1,0 +1,13 @@
+[build]
+command = "npm run build && npm run prisma:deploy"
+publish = "public"
+functions = "dist/netlify/functions"
+
+[[redirects]]
+from = "/*"
+to = "/.netlify/functions/api/:splat"
+status = 200
+
+[[scheduled.functions]]
+name = "sync-open-shipments"
+cron = "*/10 * * * *"

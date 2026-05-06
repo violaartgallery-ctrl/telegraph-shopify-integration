@@ -1,0 +1,17 @@
+client_id = "PENDING_VIOLA_CLIENT_ID"
+name = "viola-telegraph"
+handle = "viola-telegraph"
+application_url = "https://viola-telegraph.netlify.app/"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2025-10"
+
+[access_scopes]
+scopes = "read_all_orders,read_orders,write_orders,read_customers,read_products,write_products,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders"
+
+[auth]
+redirect_urls = [ "https://viola-telegraph.netlify.app/api/auth" ]

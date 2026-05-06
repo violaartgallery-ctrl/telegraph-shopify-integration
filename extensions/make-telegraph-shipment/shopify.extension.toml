@@ -1,0 +1,9 @@
+uid = "1cc55f71-32b5-9ade-2c50-81c9fe3774bd4e0e02db"
+[[extensions]]
+name = "t:name"
+handle = "make-telegraph-shipment"
+type = "admin_link"
+
+[[extensions.targeting]]
+target = "admin.order-details.action.link"
+url = "/orders/make-telegraph"

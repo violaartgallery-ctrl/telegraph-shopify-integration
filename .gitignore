@@ -1,0 +1,11 @@
+node_modules
+dist
+.bin/
+.env
+prisma/dev.db
+prisma/dev.db-journal
+prisma/prisma/
+logs
+.netlify
+*.log
+*.pid

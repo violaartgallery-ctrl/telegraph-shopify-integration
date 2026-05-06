@@ -1,0 +1,41 @@
+{
+  "id": 9876543210,
+  "admin_graphql_api_id": "gid://shopify/Order/9876543210",
+  "name": "#1025",
+  "order_number": 1025,
+  "financial_status": "paid",
+  "fulfillment_status": null,
+  "confirmed": true,
+  "note": "Call before delivery",
+  "total_price": "1499.00",
+  "payment_gateway_names": ["cash_on_delivery"],
+  "phone": "+201001234567",
+  "shipping_address": {
+    "first_name": "Mona",
+    "last_name": "Ali",
+    "name": "Mona Ali",
+    "address1": "12 Nile Street",
+    "address2": "Apartment 3",
+    "city": "Cairo",
+    "province": "Cairo",
+    "zip": "11511",
+    "country": "Egypt",
+    "phone": "+201001234567"
+  },
+  "customer": {
+    "first_name": "Mona",
+    "last_name": "Ali",
+    "phone": "+201001234567",
+    "email": "mona@example.com"
+  },
+  "line_items": [
+    {
+      "id": 1,
+      "title": "Genuine leather - Envelope bag",
+      "sku": "BAG-ENV-001",
+      "quantity": 1,
+      "price": "1499.00",
+      "variant_title": "Crocodile"
+    }
+  ]
+}

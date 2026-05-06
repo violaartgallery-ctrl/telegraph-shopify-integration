@@ -1,0 +1,32 @@
+{
+  "name": "viola-telegraph-integration",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "prisma generate && tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test:shopify-token": "tsx src/scripts/testShopifyToken.ts",
+    "test:accurate-config": "tsx src/scripts/testAccurateConfig.ts",
+    "test:full-cycle": "tsx src/scripts/testFullCycle.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.7.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "graphql": "^16.11.0",
+    "serverless-http": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.23",
+    "@types/node": "^24.0.0",
+    "prisma": "^6.7.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3"
+  }
+}
