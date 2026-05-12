@@ -48,5 +48,40 @@ export const shipmentCodeService = {
 
       return code;
     });
+  },
+
+  reserveFreshForOrder: async (shopifyOrderId: string): Promise<string | undefined> => {
+    if (!env.shipmentCodePrefix) {
+      return undefined;
+    }
+
+    return await prisma.$transaction(async (transaction) => {
+      await transaction.shipmentSequence.upsert({
+        where: { name: sequenceName },
+        update: {},
+        create: {
+          name: sequenceName,
+          nextValue: env.shipmentCodeStart
+        }
+      });
+
+      const updatedSequence = await transaction.shipmentSequence.update({
+        where: { name: sequenceName },
+        data: {
+          nextValue: {
+            increment: 1
+          }
+        }
+      });
+
+      const code = formatCode(updatedSequence.nextValue - 1);
+
+      await transaction.shipmentRecord.update({
+        where: { shopifyOrderId },
+        data: { plannedShipmentCode: code }
+      });
+
+      return code;
+    });
   }
 };

@@ -5,10 +5,10 @@ export const handler = async () => {
   const { shipmentStatusSyncService } = createAppServices();
 
   try {
-    await shipmentStatusSyncService.syncOpenShipments();
+    const result = await shipmentStatusSyncService.syncOpenShipments();
     return {
       statusCode: 200,
-      body: JSON.stringify({ ok: true })
+      body: JSON.stringify({ ok: true, ...result })
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown scheduled sync error';

@@ -30,6 +30,11 @@ const optionalFloat = (name: string): number | undefined => {
   return parsed;
 };
 
+const optionalBool = (name: string): boolean => {
+  const value = process.env[name];
+  return ['1', 'true', 'yes', 'on'].includes((value ?? '').trim().toLowerCase());
+};
+
 const productIdMap = (() => {
   const raw = process.env.ACCURATE_PRODUCT_ID_MAP_JSON;
   if (!raw) return {} as Record<string, number>;
@@ -42,6 +47,7 @@ export const env = {
   logLevel: process.env.LOG_LEVEL ?? 'info',
   databaseUrl: required('DATABASE_URL'),
   syncOpenShipmentsIntervalMs: optionalInt('SYNC_OPEN_SHIPMENTS_INTERVAL_MS') ?? 600_000,
+  syncOpenShipmentsBatchSize: optionalInt('SYNC_OPEN_SHIPMENTS_BATCH_SIZE') ?? 10,
   shipmentCodePrefix: process.env.SHIPMENT_CODE_PREFIX,
   shipmentCodeStart: optionalInt('SHIPMENT_CODE_START') ?? 1,
   orderReferencePrefix: process.env.ORDER_REFERENCE_PREFIX ?? 'Loomlac',
@@ -83,6 +89,14 @@ export const env = {
     defaultWeight: optionalFloat('ACCURATE_DEFAULT_WEIGHT'),
     productIdMap,
     defaultProductTypeCode: process.env.ACCURATE_DEFAULT_PRODUCT_TYPE_CODE
+  },
+  odoo: {
+    enabled: optionalBool('ODOO_SYNC_ENABLED'),
+    url: process.env.ODOO_URL?.replace(/\/$/, ''),
+    db: process.env.ODOO_DB,
+    username: process.env.ODOO_USERNAME,
+    password: process.env.ODOO_PASSWORD,
+    paymentJournalId: optionalInt('ODOO_PAYMENT_JOURNAL_ID')
   }
 };
 

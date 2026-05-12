@@ -23,7 +23,50 @@ const TAGS_ADD_MUTATION = `
   }
 `;
 
+const TAGS_REMOVE_MUTATION = `
+  mutation RemoveOrderTags($id: ID!, $tags: [String!]!) {
+    tagsRemove(id: $id, tags: $tags) {
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
 const toOrderGid = (id: string | number): string => `gid://shopify/Order/${id}`;
+
+const statusTagsToReplace = [
+  'accurate-cancelled',
+  'accurate-delivered',
+  'accurate-collected',
+  'accurate-delivered-not-collected',
+  'accurate-payment-review',
+  'accurate-returned',
+  'accurate-returned-settled',
+  'accurate-returned-unsettled',
+  'accurate-out-for-delivery',
+  'accurate-redelivery-pending',
+  'accurate-delivery-exception',
+  'accurate-return-in-transit',
+  'accurate-received',
+  'accurate-scheduled',
+  'accurate-pkr',
+  'accurate-pkm',
+  'accurate-pkh',
+  'accurate-pkd',
+  'accurate-prp',
+  'accurate-bmr',
+  'accurate-bmt',
+  'accurate-std',
+  'accurate-dtr',
+  'accurate-dex',
+  'accurate-htr',
+  'accurate-rtrn',
+  'accurate-rts',
+  'accurate-rjct',
+  'accurate-unknown'
+];
 
 export interface ShopifyStatusUpdateInput {
   orderId: string | number;
@@ -93,6 +136,14 @@ export const shopifyStatusSyncClient = {
 
     if (metafieldsResponse.metafieldsSet.userErrors.length > 0) {
       throw new Error(metafieldsResponse.metafieldsSet.userErrors.map((entry) => entry.message).join('; '));
+    }
+
+    const removeTagsResponse = await requestShopifyAdmin<{
+      tagsRemove: { userErrors: Array<{ message: string }> };
+    }>(TAGS_REMOVE_MUTATION, { id: ownerId, tags: statusTagsToReplace });
+
+    if (removeTagsResponse.tagsRemove.userErrors.length > 0) {
+      throw new Error(removeTagsResponse.tagsRemove.userErrors.map((entry) => entry.message).join('; '));
     }
 
     const tagsResponse = await requestShopifyAdmin<{

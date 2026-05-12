@@ -10,4 +10,4 @@ status = 200
 
 [[scheduled.functions]]
 name = "sync-open-shipments"
-cron = "*/10 * * * *"
+cron = "0 * * * *"

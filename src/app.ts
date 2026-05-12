@@ -9,18 +9,22 @@ import { createAccurateWebhookHandler } from './routes/accurateWebhookRoute.js';
 import { createAdminAppRouter } from './routes/adminAppRoute.js';
 import { createShopifyWebhookHandler } from './routes/shopifyWebhookRoute.js';
 import { ShipmentStatusSyncService } from './services/shipmentStatusSyncService.js';
+import { OdooClient } from './odoo/odooClient.js';
+import { OdooSyncService } from './odoo/odooSyncService.js';
 
 export const createAppServices = () => {
   const accurateClient = new AccurateClient();
   const zoneResolver = new AccurateZoneResolver(accurateClient);
   const accurateMapper = new AccurateMapper(zoneResolver);
-  const shopifyOrderProcessor = new ShopifyOrderProcessor(accurateClient, accurateMapper);
-  const shipmentStatusSyncService = new ShipmentStatusSyncService(accurateClient);
+  const odooSyncService = new OdooSyncService(new OdooClient());
+  const shopifyOrderProcessor = new ShopifyOrderProcessor(accurateClient, accurateMapper, odooSyncService);
+  const shipmentStatusSyncService = new ShipmentStatusSyncService(accurateClient, odooSyncService);
 
   return {
     accurateClient,
     shopifyOrderProcessor,
-    shipmentStatusSyncService
+    shipmentStatusSyncService,
+    odooSyncService
   };
 };
 
@@ -43,7 +47,7 @@ export const createApp = () => {
     response.status(200).json({ ok: true });
   });
 
-  app.use(createAdminAppRouter(services.shopifyOrderProcessor, services.accurateClient));
+  app.use(createAdminAppRouter(services.shopifyOrderProcessor, services.accurateClient, services.odooSyncService));
 
   app.post(
     '/webhooks/shopify/orders-create',

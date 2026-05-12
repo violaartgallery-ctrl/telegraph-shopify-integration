@@ -17,15 +17,33 @@ model ShipmentRecord {
   accurateShipmentId   Int?
   accurateShipmentCode String?
   accurateStatus       String?
+  accurateStatusCode   String?
   accurateReturnStatus String?
+  accurateReturnStatusCode String?
+  accurateIsTerminal   Boolean?
   collectionStatus     String?
   trackingUrl          String?
   collectedAmount      Float?
   pendingCollectionAmount Float?
   returnedValue        Float?
+  deliveryFees         Float?
+  returnFees           Float?
+  returningDueFees     Float?
+  customerDue          Float?
   deliveredAt          DateTime?
   lastSyncedAt         DateTime?
   lastError            String?
+  odooSaleOrderId      Int?
+  odooSaleOrderName    String?
+  odooInvoiceId        Int?
+  odooInvoiceName      String?
+  odooPaymentId        Int?
+  odooSalePaymentId    Int?
+  odooReturnBillId     Int?
+  odooReturnPaymentId  Int?
+  odooSyncStatus       String?
+  odooLastError        String?
+  odooSyncedAt         DateTime?
   rawOrderJson         String?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt

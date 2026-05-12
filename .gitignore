@@ -7,5 +7,6 @@ prisma/dev.db-journal
 prisma/prisma/
 logs
 .netlify
+.claude/
 *.log
 *.pid

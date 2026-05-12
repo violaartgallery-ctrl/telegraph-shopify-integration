@@ -60,6 +60,10 @@ export const GET_SHIPMENT_QUERY = `
       collectedAmount
       pendingCollectionAmount
       returnedValue
+      deliveryFees
+      returnFees
+      returningDueFees
+      customerDue
       status {
         code
         name

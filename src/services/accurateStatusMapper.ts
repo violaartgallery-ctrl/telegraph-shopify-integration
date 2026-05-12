@@ -6,16 +6,19 @@ export interface ShopifyShipmentProjection {
 }
 
 const terminalStatusCodes = new Set([
-  'DTR',
   'RTRN',
   'RTS',
   'RJCT',
-  'DEX',
   'PRPD'
 ]);
 
 const deliveredStatusCodes = new Set(['DTR']);
 const returnedStatusCodes = new Set(['RTRN', 'RTS', 'RJCT']);
+const receivedStatusCodes = new Set(['RCV', 'RITS']);
+const branchMovementStatusCodes = new Set(['BMR', 'BMT', 'STD']);
+const pickupStatusCodes = new Set(['PKR', 'PKM', 'PKH', 'PKD', 'PRP']);
+const deliveryExceptionStatusCodes = new Set(['DEX', 'HTR']);
+const returnInProgressStatusCodes = new Set(['OTR']);
 
 export const projectAccurateStatusToShopify = (input: {
   statusCode?: string | null;
@@ -25,9 +28,11 @@ export const projectAccurateStatusToShopify = (input: {
   collected?: boolean;
   paidToCustomer?: boolean;
   cancelled?: boolean;
+  customerDue?: number | null;
 }): ShopifyShipmentProjection => {
   const statusCode = input.statusCode?.toUpperCase() ?? '';
   const returnStatusCode = input.returnStatusCode?.toUpperCase() ?? '';
+  const customerDue = Number(input.customerDue ?? 0);
   const shipmentStatus =
     input.statusName ??
     input.returnStatusName ??
@@ -38,9 +43,12 @@ export const projectAccurateStatusToShopify = (input: {
   let collectionStatus = 'pending';
   const tags = ['accurate'];
 
-  if (input.cancelled || statusCode === 'DEX') {
+  if (input.cancelled) {
     tags.push('accurate-cancelled');
     collectionStatus = 'cancelled';
+  } else if (deliveredStatusCodes.has(statusCode) && customerDue < 0) {
+    tags.push('accurate-delivered', 'accurate-payment-review');
+    collectionStatus = 'payment-review';
   } else if (deliveredStatusCodes.has(statusCode)) {
     tags.push('accurate-delivered');
     collectionStatus = input.collected ? 'collected' : 'delivered-not-collected';
@@ -51,21 +59,42 @@ export const projectAccurateStatusToShopify = (input: {
     tags.push(input.paidToCustomer ? 'accurate-returned-settled' : 'accurate-returned-unsettled');
   } else if (statusCode === 'OTD') {
     tags.push('accurate-out-for-delivery');
-  } else if (statusCode === 'RCV') {
+  } else if (deliveryExceptionStatusCodes.has(statusCode)) {
+    tags.push(statusCode === 'HTR' ? 'accurate-redelivery-pending' : 'accurate-delivery-exception');
+  } else if (returnInProgressStatusCodes.has(statusCode)) {
+    tags.push('accurate-return-in-transit');
+  } else if (receivedStatusCodes.has(statusCode)) {
     tags.push('accurate-received');
-  } else if (statusCode === 'STD') {
+  } else if (branchMovementStatusCodes.has(statusCode)) {
     tags.push('accurate-scheduled');
+  } else if (pickupStatusCodes.has(statusCode)) {
+    tags.push(`accurate-${statusCode.toLowerCase()}`);
   } else {
     tags.push(`accurate-${(statusCode || 'unknown').toLowerCase()}`);
   }
+
+  const isTerminal =
+    collectionStatus === 'cancelled' ||
+    collectionStatus === 'collected' ||
+    collectionStatus === 'payment-review' ||
+    collectionStatus === 'returned' ||
+    collectionStatus === 'returned-settled' ||
+    terminalStatusCodes.has(statusCode) ||
+    terminalStatusCodes.has(returnStatusCode);
 
   return {
     shipmentStatus,
     collectionStatus,
     tags,
-    isTerminal: terminalStatusCodes.has(statusCode) || terminalStatusCodes.has(returnStatusCode)
+    isTerminal
   };
 };
 
-export const isTerminalAccurateStatus = (statusCode?: string | null, returnStatusCode?: string | null): boolean =>
-  terminalStatusCodes.has(statusCode?.toUpperCase() ?? '') || terminalStatusCodes.has(returnStatusCode?.toUpperCase() ?? '');
+export const isTerminalAccurateStatus = (input: {
+  statusCode?: string | null;
+  returnStatusCode?: string | null;
+  collected?: boolean;
+  paidToCustomer?: boolean;
+  cancelled?: boolean;
+}): boolean =>
+  projectAccurateStatusToShopify(input).isTerminal;

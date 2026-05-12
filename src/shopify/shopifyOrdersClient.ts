@@ -28,7 +28,15 @@ interface ShopifyGraphqlLineItem {
   quantity: number;
   currentQuantity: number;
   variantTitle?: string | null;
+  variant?: {
+    id: string;
+    sku?: string | null;
+    title?: string | null;
+  } | null;
   discountedUnitPriceSet: MoneySet;
+  discountAllocations?: Array<{
+    allocatedAmountSet: MoneySet;
+  }>;
 }
 
 interface ShopifyGraphqlAttribute {
@@ -149,9 +157,21 @@ const ORDER_FIELDS = `
         quantity
         currentQuantity
         variantTitle
+        variant {
+          id
+          sku
+          title
+        }
         discountedUnitPriceSet {
           shopMoney {
             amount
+          }
+        }
+        discountAllocations {
+          allocatedAmountSet {
+            shopMoney {
+              amount
+            }
           }
         }
       }
@@ -215,11 +235,14 @@ const mapLineItems = (lineItems: ShopifyGraphqlLineItem[]): ShopifyLineItem[] =>
   lineItems.map((item) => ({
     id: Number.parseInt(item.id.replace(/\D/g, ''), 10),
     title: item.title,
-    sku: item.sku ?? null,
+    sku: item.sku ?? item.variant?.sku ?? null,
     quantity: item.currentQuantity,
     current_quantity: item.currentQuantity,
     price: item.discountedUnitPriceSet.shopMoney.amount,
-    variant_title: item.variantTitle
+    variant_title: item.variantTitle,
+    discount_allocations: item.discountAllocations?.map((allocation) => ({
+      amount: allocation.allocatedAmountSet.shopMoney.amount
+    }))
   }));
 
 const mapOrder = (order: ShopifyGraphqlOrder): ShopifyOrder => ({

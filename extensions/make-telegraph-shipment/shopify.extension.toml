@@ -7,3 +7,30 @@ type = "admin_link"
 [[extensions.targeting]]
 target = "admin.order-details.action.link"
 url = "/orders/make-telegraph"
+
+[[extensions]]
+name = "Make Odoo Sales Order"
+handle = "make-odoo-sales-order"
+type = "admin_link"
+
+[[extensions.targeting]]
+target = "admin.order-details.action.link"
+url = "/orders/create-odoo-sales-order"
+
+[[extensions]]
+name = "Make Telegraph shipments"
+handle = "make-telegraph-shipments-bulk"
+type = "admin_link"
+
+[[extensions.targeting]]
+target = "admin.order-index.selection-action.link"
+url = "/orders/make-telegraph/bulk"
+
+[[extensions]]
+name = "Make Odoo Sales Orders"
+handle = "make-odoo-sales-orders-bulk"
+type = "admin_link"
+
+[[extensions.targeting]]
+target = "admin.order-index.selection-action.link"
+url = "/orders/create-odoo-sales-order/bulk"

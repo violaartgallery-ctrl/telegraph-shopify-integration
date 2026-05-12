@@ -1,9 +1,11 @@
 import { AccurateClient } from '../accurate/accurateClient.js';
+import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { shopifyStatusSyncClient } from '../shopify/shopifyStatusSyncClient.js';
 import { projectAccurateStatusToShopify } from './accurateStatusMapper.js';
 import { failedPayloadService } from './failedPayloadService.js';
 import { shipmentRepository } from './shipmentRepository.js';
+import { OdooSyncService } from '../odoo/odooSyncService.js';
 
 const buildStatusNote = (params: {
   shipmentCode?: string | null;
@@ -12,6 +14,10 @@ const buildStatusNote = (params: {
   collectedAmount?: number | null;
   pendingCollectionAmount?: number | null;
   returnedValue?: number | null;
+  deliveryFees?: number | null;
+  returnFees?: number | null;
+  returningDueFees?: number | null;
+  customerDue?: number | null;
   trackingUrl?: string | null;
 }): string =>
   [
@@ -22,13 +28,20 @@ const buildStatusNote = (params: {
     `Collected amount: ${params.collectedAmount ?? 0}`,
     `Pending collection amount: ${params.pendingCollectionAmount ?? 0}`,
     `Returned value: ${params.returnedValue ?? 0}`,
+    `Delivery fees: ${params.deliveryFees ?? 0}`,
+    `Return fees: ${params.returnFees ?? 0}`,
+    `Returning due fees: ${params.returningDueFees ?? 0}`,
+    `Customer due: ${params.customerDue ?? 0}`,
     params.trackingUrl ? `Tracking URL: ${params.trackingUrl}` : undefined
   ]
     .filter(Boolean)
     .join('\n');
 
 export class ShipmentStatusSyncService {
-  constructor(private readonly accurateClient: AccurateClient) {}
+  constructor(
+    private readonly accurateClient: AccurateClient,
+    private readonly odooSyncService?: OdooSyncService
+  ) {}
 
   async syncRecord(record: {
     id: number;
@@ -56,17 +69,25 @@ export class ShipmentStatusSyncService {
       returnStatusName: shipment.returnStatus?.name,
       collected: shipment.collected,
       paidToCustomer: shipment.paidToCustomer,
-      cancelled: shipment.cancelled
+      cancelled: shipment.cancelled,
+      customerDue: shipment.customerDue
     });
 
     await shipmentRepository.updateAccurateSnapshot(record.id, {
       accurateStatus: projection.shipmentStatus,
+      accurateStatusCode: shipment.status?.code ?? null,
       accurateReturnStatus: shipment.returnStatus?.name ?? shipment.returnStatus?.code ?? null,
+      accurateReturnStatusCode: shipment.returnStatus?.code ?? null,
+      accurateIsTerminal: projection.isTerminal,
       collectionStatus: projection.collectionStatus,
       trackingUrl: shipment.trackingUrl,
       collectedAmount: shipment.collectedAmount,
       pendingCollectionAmount: shipment.pendingCollectionAmount,
       returnedValue: shipment.returnedValue,
+      deliveryFees: shipment.deliveryFees,
+      returnFees: shipment.returnFees,
+      returningDueFees: shipment.returningDueFees,
+      customerDue: shipment.customerDue,
       deliveredAt: shipment.deliveredOrReturnedDate ? new Date(shipment.deliveredOrReturnedDate) : null
     });
 
@@ -85,19 +106,89 @@ export class ShipmentStatusSyncService {
         collectedAmount: shipment.collectedAmount,
         pendingCollectionAmount: shipment.pendingCollectionAmount,
         returnedValue: shipment.returnedValue,
+        deliveryFees: shipment.deliveryFees,
+        returnFees: shipment.returnFees,
+        returningDueFees: shipment.returningDueFees,
+        customerDue: shipment.customerDue,
         trackingUrl: shipment.trackingUrl
       })
     });
+
+    if (projection.collectionStatus === 'payment-review') {
+      await failedPayloadService.save({
+        source: 'payment-review',
+        externalId: record.shopifyOrderId,
+        reason: 'Telegraph delivered shipment needs manual payment review',
+        payload: {
+          record,
+          shipment: {
+            code: shipment.code,
+            statusCode: shipment.status?.code,
+            customerDue: shipment.customerDue,
+            collectedAmount: shipment.collectedAmount,
+            deliveryFees: shipment.deliveryFees,
+            returnFees: shipment.returnFees,
+            returningDueFees: shipment.returningDueFees
+          }
+        }
+      });
+      return;
+    }
+
+    if (projection.collectionStatus === 'collected' && this.odooSyncService) {
+      try {
+        await this.odooSyncService.syncCollectedShipment(record.id);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'Unknown Odoo sync error';
+        logger.error('Failed to sync collected shipment to Odoo', {
+          recordId: record.id,
+          shopifyOrderId: record.shopifyOrderId,
+          reason
+        });
+        await failedPayloadService.save({
+          source: 'odoo-collected-sync',
+          externalId: record.shopifyOrderId,
+          reason,
+          payload: record
+        });
+      }
+    }
+
+    if ((projection.collectionStatus === 'returned' || projection.collectionStatus === 'returned-settled') && this.odooSyncService) {
+      try {
+        await this.odooSyncService.syncReturnedShipmentCharge(record.id);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'Unknown Odoo return charge sync error';
+        logger.error('Failed to sync returned shipment charge to Odoo', {
+          recordId: record.id,
+          shopifyOrderId: record.shopifyOrderId,
+          reason
+        });
+        await failedPayloadService.save({
+          source: 'odoo-return-charge-sync',
+          externalId: record.shopifyOrderId,
+          reason,
+          payload: record
+        });
+      }
+    }
   }
 
-  async syncOpenShipments(): Promise<void> {
-    const openShipments = await shipmentRepository.findOpenShipments();
+  async syncOpenShipments(): Promise<{ processed: number; failed: number }> {
+    const openShipments = await shipmentRepository.findOpenShipments(env.syncOpenShipmentsBatchSize);
+    let processed = 0;
+    let failed = 0;
     for (const record of openShipments) {
       try {
         await this.syncRecord(record);
+        processed += 1;
       } catch (error) {
+        failed += 1;
         const reason = error instanceof Error ? error.message : 'Unknown sync error';
         logger.error('Failed to sync shipment record', { recordId: record.id, reason });
+        if (/shipment not found/i.test(reason)) {
+          await shipmentRepository.clearDeletedShipment(record.shopifyOrderId, reason);
+        }
         await failedPayloadService.save({
           source: 'accurate-polling-sync',
           externalId: record.accurateShipmentCode ?? String(record.accurateShipmentId ?? record.id),
@@ -106,5 +197,6 @@ export class ShipmentStatusSyncService {
         });
       }
     }
+    return { processed, failed };
   }
 }

@@ -6,6 +6,8 @@ import { shipmentRepository } from '../services/shipmentRepository.js';
 import { ShopifyOrderProcessor } from '../services/shopifyOrderProcessor.js';
 import { getTelegraphLocationSelection, withTelegraphLocationSelection } from '../services/telegraphLocation.js';
 import { shopifyOrdersClient } from '../shopify/shopifyOrdersClient.js';
+import { OdooSyncService } from '../odoo/odooSyncService.js';
+import { ValidationError } from '../lib/errors.js';
 
 interface ZoneEntry {
   id: number;
@@ -98,14 +100,16 @@ const renderAppShell = (): string => `<!doctype html>
         const response = await fetch('/api/orders');
         const data = await response.json();
         if (!response.ok) throw new Error(data.message || 'Could not load orders');
-        target.innerHTML = '<table><thead><tr><th>Order</th><th>Customer</th><th>Address</th><th>Payment</th><th>Shipment</th><th>Action</th></tr></thead><tbody>' +
+        target.innerHTML = '<table><thead><tr><th>Order</th><th>Customer</th><th>Address</th><th>Payment</th><th>Shipment</th><th>Odoo</th><th>Action</th></tr></thead><tbody>' +
           data.orders.map((order) => '<tr>' +
             '<td><div class="stack"><strong>' + html(order.name) + '</strong><span class="muted">' + html(order.id) + '</span></div></td>' +
             '<td>' + html(order.customerName || '-') + '<br><span class="muted">' + html(order.phone || '-') + '</span></td>' +
             '<td>' + html(order.city || '-') + '<br><span class="muted">' + html(order.province || '-') + '</span></td>' +
             '<td>' + html(order.financialStatus || '-') + '<br><span class="muted">' + html(order.gateway || '-') + '</span></td>' +
             '<td>' + statusBadge(order.shipmentStatus) + (order.shipmentCode ? '<br><span class="muted">' + html(order.shipmentCode) + '</span>' : '') + '</td>' +
-            '<td><button class="primary" data-order-gid="' + html(order.gid) + '" ' + (order.shipmentCode ? 'disabled' : '') + '>Make Telegraph shipment</button></td>' +
+            '<td>' + statusBadge(order.odooSyncStatus) + (order.odooSaleOrderName ? '<br><span class="muted">' + html(order.odooSaleOrderName) + '</span>' : '') + (order.odooLastError ? '<br><span class="muted">' + html(order.odooLastError) + '</span>' : '') + '</td>' +
+            '<td><div class="stack"><button class="primary" data-order-gid="' + html(order.gid) + '" ' + (order.shipmentCode ? 'disabled' : '') + '>Make Telegraph shipment</button>' +
+            '<button data-odoo-order-gid="' + html(order.gid) + '" ' + (order.odooSaleOrderName ? 'disabled' : '') + '>Retry Odoo Sales Order</button></div></td>' +
           '</tr>').join('') + '</tbody></table>';
         target.querySelectorAll('button[data-order-gid]').forEach((button) => {
           button.addEventListener('click', async () => {
@@ -119,7 +123,32 @@ const renderAppShell = (): string => `<!doctype html>
               });
               const payload = await response.json();
               if (!response.ok) throw new Error(payload.message || 'Could not create shipment');
-              setToast(payload.skipped ? 'Skipped: ' + payload.reason : 'Shipment created successfully');
+              const odooMessage = payload.odoo?.saleOrderName
+                ? ' Odoo Sales Order: ' + payload.odoo.saleOrderName + '.'
+                : payload.odoo?.reason
+                  ? ' Odoo needs attention: ' + payload.odoo.reason
+                  : '';
+              setToast((payload.skipped ? 'Skipped: ' + payload.reason : 'Shipment created successfully.') + odooMessage);
+              await loadOrders();
+            } catch (error) {
+              setToast(error.message, true);
+              button.disabled = false;
+            }
+          });
+        });
+        target.querySelectorAll('button[data-odoo-order-gid]').forEach((button) => {
+          button.addEventListener('click', async () => {
+            button.disabled = true;
+            setToast('Creating Odoo Sales Order...');
+            try {
+              const response = await fetch('/api/orders/create-odoo-sales-order', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ orderGid: button.dataset.odooOrderGid })
+              });
+              const payload = await response.json();
+              if (!response.ok) throw new Error(payload.message || 'Could not create Odoo Sales Order');
+              setToast(payload.created ? 'Odoo Sales Order created: ' + payload.saleOrderName : 'Already synced: ' + payload.saleOrderName);
               await loadOrders();
             } catch (error) {
               setToast(error.message, true);
@@ -168,7 +197,11 @@ const summarizeOrder = async () => {
       eligible: isOrderEligibleForShipment(order),
       shipmentStatus: record?.accurateStatus,
       shipmentCode: record?.accurateShipmentCode,
-      lastError: record?.lastError
+      lastError: record?.lastError,
+      odooSyncStatus: record?.odooSyncStatus,
+      odooSaleOrderName: record?.odooSaleOrderName,
+      odooInvoiceName: record?.odooInvoiceName,
+      odooLastError: record?.odooLastError
     };
   });
 };
@@ -210,6 +243,30 @@ const extractOrderIdFromQuery = (request: Request): string | undefined => {
   return undefined;
 };
 
+const extractOrderIdsFromQuery = (request: Request): string[] => {
+  const rawValues = [
+    request.query.selected,
+    request.query.ids,
+    request.query.id,
+    request.query.order_id,
+    request.query.orderId
+  ];
+  const ids = new Set<string>();
+
+  for (const rawValue of rawValues) {
+    const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+    for (const value of values) {
+      if (typeof value !== 'string') continue;
+      for (const entry of value.split(',')) {
+        const trimmed = entry.trim();
+        if (trimmed) ids.add(trimmed);
+      }
+    }
+  }
+
+  return [...ids];
+};
+
 const normalizeOrderIdForLookup = (orderId: string): { gid?: string; legacyId?: string } => {
   if (orderId.startsWith('gid://shopify/Order/')) {
     return { gid: orderId };
@@ -219,12 +276,21 @@ const normalizeOrderIdForLookup = (orderId: string): { gid?: string; legacyId?: 
   return numeric ? { legacyId: numeric } : {};
 };
 
+const getOrderByRawId = async (rawOrderId: string) => {
+  const lookup = normalizeOrderIdForLookup(rawOrderId);
+  return lookup.gid
+    ? await shopifyOrdersClient.getOrderByGid(lookup.gid)
+    : await shopifyOrdersClient.getOrderByLegacyId(lookup.legacyId as string);
+};
+
 const renderShipmentResult = (params: {
   title: string;
   message: string;
   orderName?: string;
   shipmentCode?: string | null;
   shipmentId?: number | null;
+  odooSaleOrderName?: string | null;
+  odooSaleOrderId?: number | null;
   telegraphDashboardUrl?: string | null;
   error?: boolean;
 }): string => `<!doctype html>
@@ -254,6 +320,8 @@ const renderShipmentResult = (params: {
           ${params.orderName ? `<div><strong>Shopify order:</strong> ${escapeHtml(params.orderName)}</div>` : ''}
           ${params.shipmentCode ? `<div><strong>Accurate shipment code:</strong> ${escapeHtml(params.shipmentCode)}</div>` : ''}
           ${params.shipmentId ? `<div><strong>Accurate shipment id:</strong> ${escapeHtml(params.shipmentId)}</div>` : ''}
+          ${params.odooSaleOrderName ? `<div><strong>Odoo Sales Order:</strong> ${escapeHtml(params.odooSaleOrderName)}</div>` : ''}
+          ${params.odooSaleOrderId ? `<div><strong>Odoo Sales Order id:</strong> ${escapeHtml(params.odooSaleOrderId)}</div>` : ''}
           ${params.telegraphDashboardUrl ? `<div><strong>Telegraph dashboard:</strong> <a href="${escapeHtml(params.telegraphDashboardUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(params.telegraphDashboardUrl)}</a></div>` : ''}
         </div>
       </div>
@@ -423,25 +491,231 @@ const renderLocationSelectionForm = (params: {
   </body>
 </html>`;
 
+const renderBulkShipmentReview = (params: {
+  title: string;
+  orderIds: string[];
+  rows: Array<{
+    orderId: string;
+    orderName?: string;
+    customerName?: string;
+    status: string;
+    detail: string;
+    shipmentCode?: string | null;
+  }>;
+  canExecute: boolean;
+  executed?: boolean;
+}): string => `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(params.title)}</title>
+    <style>
+      body { margin:0; font-family: Arial, sans-serif; color:#202223; background:#f6f6f7; }
+      main { max-width:980px; margin:0 auto; padding:40px 20px; }
+      .panel { background:#fff; border:1px solid #dfe3e8; border-radius:8px; padding:24px; }
+      h1 { margin:0 0 8px; font-size:26px; }
+      p { color:#6d7175; line-height:1.5; }
+      table { width:100%; border-collapse:collapse; border:1px solid #dfe3e8; margin-top:18px; }
+      th, td { padding:11px; border-bottom:1px solid #dfe3e8; text-align:left; vertical-align:top; }
+      th { background:#f6f6f7; color:#6d7175; font-size:13px; }
+      .badge { display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; font-weight:700; }
+      .ready { background:#dcfce7; color:#166534; }
+      .warn { background:#fff7ed; color:#9a3412; }
+      .done { background:#e0f2fe; color:#075985; }
+      .error { background:#fee2e2; color:#b42318; }
+      button { margin-top:18px; min-height:42px; border:1px solid #0b6b5d; border-radius:6px; padding:8px 14px; background:#0b6b5d; color:#fff; font-weight:700; cursor:pointer; }
+      button:disabled { cursor:not-allowed; opacity:.55; }
+      .hidden { display:none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="panel">
+        <h1>${escapeHtml(params.title)}</h1>
+        <p>${params.executed
+          ? 'Bulk shipment action finished.'
+          : 'Review selected orders before creating Telegraph shipments. Orders without Telegraph city and area will be skipped.'}</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Order</th>
+              <th>Customer</th>
+              <th>Status</th>
+              <th>Details</th>
+              <th>Shipment</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${params.rows.map((row) => `
+              <tr>
+                <td>${escapeHtml(row.orderName ?? row.orderId)}</td>
+                <td>${escapeHtml(row.customerName ?? '')}</td>
+                <td><span class="badge ${row.status === 'ready' ? 'ready' : row.status === 'created' ? 'done' : row.status === 'error' ? 'error' : 'warn'}">${escapeHtml(row.status)}</span></td>
+                <td>${escapeHtml(row.detail)}</td>
+                <td>${escapeHtml(row.shipmentCode ?? '')}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+        ${params.executed ? '' : `
+          <form method="post" action="/orders/make-telegraph/bulk">
+            ${params.orderIds.map((orderId) => `<input class="hidden" type="hidden" name="orderIds" value="${escapeHtml(orderId)}" />`).join('')}
+            <button type="submit" ${params.canExecute ? '' : 'disabled'}>Create ready Telegraph shipments</button>
+          </form>
+        `}
+      </div>
+    </main>
+  </body>
+</html>`;
+
+const renderBulkOdooReview = (params: {
+  title: string;
+  orderIds: string[];
+  rows: Array<{
+    orderId: string;
+    orderName?: string;
+    customerName?: string;
+    status: string;
+    detail: string;
+    saleOrderName?: string | null;
+  }>;
+  canExecute: boolean;
+  executed?: boolean;
+}): string => `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(params.title)}</title>
+    <style>
+      body { margin:0; font-family: Arial, sans-serif; color:#202223; background:#f6f6f7; }
+      main { max-width:980px; margin:0 auto; padding:40px 20px; }
+      .panel { background:#fff; border:1px solid #dfe3e8; border-radius:8px; padding:24px; }
+      h1 { margin:0 0 8px; font-size:26px; }
+      p { color:#6d7175; line-height:1.5; }
+      table { width:100%; border-collapse:collapse; border:1px solid #dfe3e8; margin-top:18px; }
+      th, td { padding:11px; border-bottom:1px solid #dfe3e8; text-align:left; vertical-align:top; }
+      th { background:#f6f6f7; color:#6d7175; font-size:13px; }
+      .badge { display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; font-weight:700; }
+      .ready { background:#dcfce7; color:#166534; }
+      .warn { background:#fff7ed; color:#9a3412; }
+      .done { background:#e0f2fe; color:#075985; }
+      .error { background:#fee2e2; color:#b42318; }
+      button { margin-top:18px; min-height:42px; border:1px solid #0b6b5d; border-radius:6px; padding:8px 14px; background:#0b6b5d; color:#fff; font-weight:700; cursor:pointer; }
+      button:disabled { cursor:not-allowed; opacity:.55; }
+      .hidden { display:none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="panel">
+        <h1>${escapeHtml(params.title)}</h1>
+        <p>${params.executed
+          ? 'Bulk Odoo Sales Order action finished.'
+          : 'Review selected orders before creating Odoo Sales Orders. Orders with missing SKU mapping will be skipped.'}</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Order</th>
+              <th>Customer</th>
+              <th>Status</th>
+              <th>Details</th>
+              <th>Odoo</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${params.rows.map((row) => `
+              <tr>
+                <td>${escapeHtml(row.orderName ?? row.orderId)}</td>
+                <td>${escapeHtml(row.customerName ?? '')}</td>
+                <td><span class="badge ${row.status === 'ready' ? 'ready' : row.status === 'created' ? 'done' : row.status === 'error' ? 'error' : 'warn'}">${escapeHtml(row.status)}</span></td>
+                <td>${escapeHtml(row.detail)}</td>
+                <td>${escapeHtml(row.saleOrderName ?? '')}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+        ${params.executed ? '' : `
+          <form method="post" action="/orders/create-odoo-sales-order/bulk">
+            ${params.orderIds.map((orderId) => `<input class="hidden" type="hidden" name="orderIds" value="${escapeHtml(orderId)}" />`).join('')}
+            <button type="submit" ${params.canExecute ? '' : 'disabled'}>Create ready Odoo Sales Orders</button>
+          </form>
+        `}
+      </div>
+    </main>
+  </body>
+</html>`;
+
 const shipmentResultMessage = (result: {
   skipped: boolean;
   reason?: string;
   fulfillment?: { skipped: boolean; reason?: string };
+  odoo?: { skipped: boolean; reason?: string; saleOrderName?: string; created?: boolean };
 }): string => {
-  const base = result.skipped
+  let message = result.skipped
     ? `Skipped: ${result.reason ?? 'already handled'}`
     : 'Shipment created successfully.';
 
-  if (!result.fulfillment?.reason || result.fulfillment.reason === 'already-fulfilled') {
-    return base;
+  if (result.fulfillment?.reason && result.fulfillment.reason !== 'already-fulfilled') {
+    message = `${message} Fulfillment: ${result.fulfillment.reason}`;
   }
 
-  return `${base} Fulfillment: ${result.fulfillment.reason}`;
+  if (result.odoo?.saleOrderName) {
+    return `${message} Odoo Sales Order: ${result.odoo.saleOrderName}`;
+  }
+
+  if (result.odoo?.reason && result.odoo.reason !== 'odoo-sync-not-configured') {
+    return `${message} Odoo needs attention: ${result.odoo.reason}`;
+  }
+
+  return message;
+};
+
+const validationDetailsMessage = (details: unknown): string | undefined => {
+  if (!Array.isArray(details)) return undefined;
+
+  const messages = details.flatMap((entry) => {
+    const validation = entry?.extensions?.validation;
+    if (!validation || typeof validation !== 'object') {
+      return typeof entry?.message === 'string' ? [entry.message] : [];
+    }
+
+    return Object.entries(validation).flatMap(([field, values]) => {
+      const text = Array.isArray(values) ? values.join(', ') : String(values);
+      return `${field}: ${text}`;
+    });
+  });
+
+  return messages.length > 0 ? messages.join(' | ') : undefined;
+};
+
+const actionErrorMessage = (error: unknown): string => {
+  if (error instanceof ValidationError) {
+    return validationDetailsMessage(error.details) ?? error.message;
+  }
+
+  return error instanceof Error ? error.message : 'Could not process this request.';
+};
+
+const telegraphAction = (
+  handler: (request: Request, response: Response) => Promise<void>
+) => async (request: Request, response: Response): Promise<void> => {
+  try {
+    await handler(request, response);
+  } catch (error) {
+    response.status(500).type('html').send(renderShipmentResult({
+      title: 'Make Telegraph shipment',
+      message: actionErrorMessage(error),
+      error: true
+    }));
+  }
 };
 
 export const createAdminAppRouter = (
   shopifyOrderProcessor: ShopifyOrderProcessor,
-  accurateClient: AccurateClient
+  accurateClient: AccurateClient,
+  odooSyncService: OdooSyncService
 ) => {
   const router = express.Router();
 
@@ -449,7 +723,150 @@ export const createAdminAppRouter = (
     response.type('html').send(renderAppShell());
   });
 
-  router.get('/orders/make-telegraph', async (request: Request, response: Response) => {
+  router.get('/orders/make-telegraph/bulk', async (request: Request, response: Response) => {
+    const orderIds = extractOrderIdsFromQuery(request);
+    if (orderIds.length === 0) {
+      response.status(400).type('html').send(renderBulkShipmentReview({
+        title: 'Make Telegraph shipments',
+        orderIds,
+        rows: [{
+          orderId: '',
+          status: 'error',
+          detail: 'Shopify did not pass selected order ids to this app action.'
+        }],
+        canExecute: false
+      }));
+      return;
+    }
+
+    const rows = [];
+    for (const rawOrderId of orderIds) {
+      try {
+        const order = await getOrderByRawId(rawOrderId);
+        const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+        const customerName = order.shipping_address?.name
+          ?? order.billing_address?.name
+          ?? [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ');
+
+        if (record?.accurateShipmentId) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'already-created',
+            detail: 'Telegraph shipment already exists for this order.',
+            shipmentCode: record.accurateShipmentCode
+          });
+          continue;
+        }
+
+        if (!getTelegraphLocationSelection(order)) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'needs-location',
+            detail: 'Telegraph governorate and area are missing. Use the single-order button first.'
+          });
+          continue;
+        }
+
+        rows.push({
+          orderId: rawOrderId,
+          orderName: order.name,
+          customerName,
+          status: 'ready',
+          detail: 'Ready to create Telegraph shipment.'
+        });
+      } catch (error) {
+        rows.push({
+          orderId: rawOrderId,
+          status: 'error',
+          detail: error instanceof Error ? error.message : 'Could not read this order.'
+        });
+      }
+    }
+
+    response.type('html').send(renderBulkShipmentReview({
+      title: 'Make Telegraph shipments',
+      orderIds,
+      rows,
+      canExecute: rows.some((row) => row.status === 'ready')
+    }));
+  });
+
+  router.post('/orders/make-telegraph/bulk', express.urlencoded({ extended: false }), async (request: Request, response: Response) => {
+    const rawOrderIds = request.body?.orderIds;
+    const orderIds = (Array.isArray(rawOrderIds) ? rawOrderIds : [rawOrderIds])
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+    const rows = [];
+    for (const rawOrderId of orderIds) {
+      try {
+        const order = await getOrderByRawId(rawOrderId);
+        const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+        const customerName = order.shipping_address?.name
+          ?? order.billing_address?.name
+          ?? [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ');
+
+        if (record?.accurateShipmentId) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'already-created',
+            detail: 'Telegraph shipment already exists for this order.',
+            shipmentCode: record.accurateShipmentCode
+          });
+          continue;
+        }
+
+        if (!getTelegraphLocationSelection(order)) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'needs-location',
+            detail: 'Telegraph governorate and area are missing. Use the single-order button first.'
+          });
+          continue;
+        }
+
+        const result = await shopifyOrderProcessor.process(order, {
+          source: 'shopify-admin-bulk-link',
+          rawOrderId,
+          skipEligibility: true,
+          requireTelegraphLocation: true
+        });
+        const updatedRecord = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+
+        rows.push({
+          orderId: rawOrderId,
+          orderName: order.name,
+          customerName,
+          status: result.skipped ? 'skipped' : 'created',
+          detail: shipmentResultMessage(result),
+          shipmentCode: updatedRecord?.accurateShipmentCode
+        });
+      } catch (error) {
+        rows.push({
+          orderId: rawOrderId,
+          status: 'error',
+          detail: error instanceof Error ? error.message : 'Could not process this order.'
+        });
+      }
+    }
+
+    response.type('html').send(renderBulkShipmentReview({
+      title: 'Make Telegraph shipments',
+      orderIds,
+      rows,
+      canExecute: false,
+      executed: true
+    }));
+  });
+
+  router.get('/orders/make-telegraph', telegraphAction(async (request: Request, response: Response) => {
     const rawOrderId = extractOrderIdFromQuery(request);
     if (!rawOrderId) {
       response.status(400).type('html').send(renderShipmentResult({
@@ -465,7 +882,7 @@ export const createAdminAppRouter = (
       ? await shopifyOrdersClient.getOrderByGid(lookup.gid)
       : await shopifyOrdersClient.getOrderByLegacyId(lookup.legacyId as string);
 
-    const existingRecord = await shipmentRepository.findByShopifyOrderId(String(order.id));
+    const existingRecord = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
     if (existingRecord?.accurateShipmentId) {
       const result = await shopifyOrderProcessor.process(order, {
         source: 'shopify-admin-link-duplicate-fulfillment',
@@ -478,6 +895,8 @@ export const createAdminAppRouter = (
         orderName: order.name,
         shipmentCode: existingRecord.accurateShipmentCode,
         shipmentId: existingRecord.accurateShipmentId,
+        odooSaleOrderName: result.odoo?.saleOrderName ?? existingRecord.odooSaleOrderName,
+        odooSaleOrderId: existingRecord.odooSaleOrderId,
         telegraphDashboardUrl: `https://system.telegraphex.com/admin/shipments/${existingRecord.accurateShipmentId}`
       }));
       return;
@@ -498,7 +917,7 @@ export const createAdminAppRouter = (
       skipEligibility: true,
       requireTelegraphLocation: true
     });
-    const record = await shipmentRepository.findByShopifyOrderId(String(order.id));
+    const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
 
     response.type('html').send(renderShipmentResult({
       title: 'Make Telegraph shipment',
@@ -506,13 +925,15 @@ export const createAdminAppRouter = (
       orderName: order.name,
       shipmentCode: record?.accurateShipmentCode,
       shipmentId: record?.accurateShipmentId,
+      odooSaleOrderName: result.odoo?.saleOrderName ?? record?.odooSaleOrderName,
+      odooSaleOrderId: record?.odooSaleOrderId,
       telegraphDashboardUrl: record?.accurateShipmentId
         ? `https://system.telegraphex.com/admin/shipments/${record.accurateShipmentId}`
         : undefined
     }));
-  });
+  }));
 
-  router.post('/orders/make-telegraph/select', express.urlencoded({ extended: false }), async (request: Request, response: Response) => {
+  router.post('/orders/make-telegraph/select', express.urlencoded({ extended: false }), telegraphAction(async (request: Request, response: Response) => {
     const orderId = typeof request.body?.orderId === 'string' ? request.body.orderId : '';
     const governorateId = Number.parseInt(String(request.body?.governorateId ?? ''), 10);
     const areaId = Number.parseInt(String(request.body?.areaId ?? ''), 10);
@@ -541,7 +962,7 @@ export const createAdminAppRouter = (
       skipEligibility: true,
       requireTelegraphLocation: true
     });
-    const record = await shipmentRepository.findByShopifyOrderId(String(order.id));
+    const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
 
     response.type('html').send(renderShipmentResult({
       title: 'Make Telegraph shipment',
@@ -549,11 +970,13 @@ export const createAdminAppRouter = (
       orderName: order.name,
       shipmentCode: record?.accurateShipmentCode,
       shipmentId: record?.accurateShipmentId,
+      odooSaleOrderName: result.odoo?.saleOrderName ?? record?.odooSaleOrderName,
+      odooSaleOrderId: record?.odooSaleOrderId,
       telegraphDashboardUrl: record?.accurateShipmentId
         ? `https://system.telegraphex.com/admin/shipments/${record.accurateShipmentId}`
         : undefined
     }));
-  });
+  }));
 
   router.get('/api/orders', async (_request: Request, response: Response) => {
     response.json({ orders: await summarizeOrder() });
@@ -574,7 +997,219 @@ export const createAdminAppRouter = (
     response.json({ ok: true, ...result });
   });
 
+  router.get('/orders/create-odoo-sales-order/bulk', async (request: Request, response: Response) => {
+    const orderIds = extractOrderIdsFromQuery(request);
+    if (orderIds.length === 0) {
+      response.status(400).type('html').send(renderBulkOdooReview({
+        title: 'Make Odoo Sales Orders',
+        orderIds,
+        rows: [{
+          orderId: '',
+          status: 'error',
+          detail: 'Shopify did not pass selected order ids to this app action.'
+        }],
+        canExecute: false
+      }));
+      return;
+    }
+
+    const rows = [];
+    for (const rawOrderId of orderIds) {
+      try {
+        const order = await getOrderByRawId(rawOrderId);
+        const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+        const customerName = order.shipping_address?.name
+          ?? order.billing_address?.name
+          ?? [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ');
+
+        if (record?.odooSaleOrderName) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'already-created',
+            detail: 'Odoo Sales Order already exists for this order.',
+            saleOrderName: record.odooSaleOrderName
+          });
+          continue;
+        }
+
+        const preview = await odooSyncService.previewOrder(order);
+        if (!preview.ready) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'not-ready',
+            detail: preview.products
+              .filter((product) => !product.ready)
+              .map((product) => `${product.title}: ${product.reason ?? 'not ready'}`)
+              .join('; ') || 'Order is not ready for Odoo.'
+          });
+          continue;
+        }
+
+        rows.push({
+          orderId: rawOrderId,
+          orderName: order.name,
+          customerName,
+          status: 'ready',
+          detail: `Ready. Reference: ${preview.reference}`
+        });
+      } catch (error) {
+        rows.push({
+          orderId: rawOrderId,
+          status: 'error',
+          detail: error instanceof Error ? error.message : 'Could not read this order.'
+        });
+      }
+    }
+
+    response.type('html').send(renderBulkOdooReview({
+      title: 'Make Odoo Sales Orders',
+      orderIds,
+      rows,
+      canExecute: rows.some((row) => row.status === 'ready')
+    }));
+  });
+
+  router.post('/orders/create-odoo-sales-order/bulk', express.urlencoded({ extended: false }), async (request: Request, response: Response) => {
+    const rawOrderIds = request.body?.orderIds;
+    const orderIds = (Array.isArray(rawOrderIds) ? rawOrderIds : [rawOrderIds])
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+    const rows = [];
+    for (const rawOrderId of orderIds) {
+      try {
+        const order = await getOrderByRawId(rawOrderId);
+        const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+        const customerName = order.shipping_address?.name
+          ?? order.billing_address?.name
+          ?? [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ');
+
+        if (record?.odooSaleOrderName) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'already-created',
+            detail: 'Odoo Sales Order already exists for this order.',
+            saleOrderName: record.odooSaleOrderName
+          });
+          continue;
+        }
+
+        const preview = await odooSyncService.previewOrder(order);
+        if (!preview.ready) {
+          rows.push({
+            orderId: rawOrderId,
+            orderName: order.name,
+            customerName,
+            status: 'not-ready',
+            detail: preview.products
+              .filter((product) => !product.ready)
+              .map((product) => `${product.title}: ${product.reason ?? 'not ready'}`)
+              .join('; ') || 'Order is not ready for Odoo.'
+          });
+          continue;
+        }
+
+        const result = await odooSyncService.ensureSalesOrder(order, record ?? undefined, {
+          prepareStock: false
+        });
+        rows.push({
+          orderId: rawOrderId,
+          orderName: order.name,
+          customerName,
+          status: result.created ? 'created' : 'already-created',
+          detail: result.created ? 'Odoo Sales Order created successfully.' : 'Odoo Sales Order already exists.',
+          saleOrderName: result.name
+        });
+      } catch (error) {
+        rows.push({
+          orderId: rawOrderId,
+          status: 'error',
+          detail: error instanceof Error ? error.message : 'Could not process this order.'
+        });
+      }
+    }
+
+    response.type('html').send(renderBulkOdooReview({
+      title: 'Make Odoo Sales Orders',
+      orderIds,
+      rows,
+      canExecute: false,
+      executed: true
+    }));
+  });
+
+  router.get('/orders/create-odoo-sales-order', async (request: Request, response: Response) => {
+    const rawOrderId = extractOrderIdFromQuery(request);
+    if (!rawOrderId) {
+      response.status(400).type('html').send(renderShipmentResult({
+        title: 'Create Odoo Sales Order',
+        message: 'Shopify did not pass an order id to this app action.',
+        error: true
+      }));
+      return;
+    }
+
+    const lookup = normalizeOrderIdForLookup(rawOrderId);
+    const order = lookup.gid
+      ? await shopifyOrdersClient.getOrderByGid(lookup.gid)
+      : await shopifyOrdersClient.getOrderByLegacyId(lookup.legacyId as string);
+    const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+    const result = await odooSyncService.ensureSalesOrder(order, record ?? undefined, {
+      prepareStock: false
+    });
+
+    response.type('html').send(renderShipmentResult({
+      title: 'Create Odoo Sales Order',
+      message: result.created ? 'Odoo Sales Order created successfully.' : 'Odoo Sales Order already exists.',
+      orderName: order.name,
+      odooSaleOrderId: result.id,
+      odooSaleOrderName: result.name
+    }));
+  });
+
+  router.post('/api/orders/create-odoo-sales-order', express.json({ limit: '100kb' }), async (request: Request, response: Response) => {
+    const orderGid = typeof request.body?.orderGid === 'string' ? request.body.orderGid : undefined;
+    const orderId = typeof request.body?.orderId === 'string' ? request.body.orderId : undefined;
+    if (!orderGid && !orderId) {
+      response.status(400).json({ ok: false, message: 'orderGid or orderId is required' });
+      return;
+    }
+
+    const order = orderGid
+      ? await shopifyOrdersClient.getOrderByGid(orderGid)
+      : await shopifyOrdersClient.getOrderByLegacyId(orderId as string);
+    const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+    const result = await odooSyncService.ensureSalesOrder(order, record ?? undefined, {
+      prepareStock: false
+    });
+    response.json({ ok: true, saleOrderId: result.id, saleOrderName: result.name, created: result.created });
+  });
+
+  router.post('/api/orders/odoo-preview', express.json({ limit: '100kb' }), async (request: Request, response: Response) => {
+    const orderGid = typeof request.body?.orderGid === 'string' ? request.body.orderGid : undefined;
+    const orderId = typeof request.body?.orderId === 'string' ? request.body.orderId : undefined;
+    if (!orderGid && !orderId) {
+      response.status(400).json({ ok: false, message: 'orderGid or orderId is required' });
+      return;
+    }
+
+    const order = orderGid
+      ? await shopifyOrdersClient.getOrderByGid(orderGid)
+      : await shopifyOrdersClient.getOrderByLegacyId(orderId as string);
+    response.json({ ok: true, preview: await odooSyncService.previewOrder(order) });
+  });
+
+  router.get('/api/odoo/journals', async (_request: Request, response: Response) => {
+    response.json({ journals: await odooSyncService.listPaymentJournals() });
+  });
+
   router.get('/api/accurate/locations', async (_request: Request, response: Response) => {
+    response.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800');
     response.json({ locations: await getLocations(accurateClient) });
   });
 

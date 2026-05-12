@@ -21,6 +21,9 @@ export interface ShopifyLineItem {
   current_quantity?: number | null;
   price: string;
   variant_title?: string | null;
+  discount_allocations?: Array<{
+    amount: string;
+  }>;
 }
 
 export interface ShopifyNoteAttribute {

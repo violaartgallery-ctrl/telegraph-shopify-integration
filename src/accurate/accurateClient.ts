@@ -37,6 +37,10 @@ interface ShipmentLookupResponse {
     collectedAmount: number;
     pendingCollectionAmount: number;
     returnedValue: number;
+    deliveryFees: number;
+    returnFees: number;
+    returningDueFees: number;
+    customerDue: number;
     status?: {
       code?: string | null;
       name?: string | null;

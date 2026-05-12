@@ -5,6 +5,22 @@ export const shipmentRepository = {
   findByShopifyOrderId: async (shopifyOrderId: string) =>
     await prisma.shipmentRecord.findUnique({ where: { shopifyOrderId } }),
 
+  findSummaryByShopifyOrderId: async (shopifyOrderId: string) =>
+    await prisma.shipmentRecord.findUnique({
+      where: { shopifyOrderId },
+      select: {
+        id: true,
+        shopifyOrderId: true,
+        accurateShipmentId: true,
+        accurateShipmentCode: true,
+        odooSaleOrderId: true,
+        odooSaleOrderName: true
+      }
+    }),
+
+  findById: async (id: number) =>
+    await prisma.shipmentRecord.findUnique({ where: { id } }),
+
   findByShopifyOrderIds: async (shopifyOrderIds: string[]) =>
     await prisma.shipmentRecord.findMany({
       where: {
@@ -23,16 +39,17 @@ export const shipmentRepository = {
       }
     }),
 
-  findOpenShipments: async () =>
+  findOpenShipments: async (limit?: number) =>
     await prisma.shipmentRecord.findMany({
       where: {
         accurateShipmentId: { not: null },
         OR: [
-          { accurateStatus: null },
-          { accurateStatus: { notIn: ['Delivered', 'Returned', 'Rejected', 'Cancelled', 'Delivered To Recipient'] } }
+          { accurateIsTerminal: null },
+          { accurateIsTerminal: false }
         ]
       },
-      orderBy: { updatedAt: 'asc' }
+      orderBy: { updatedAt: 'asc' },
+      ...(limit ? { take: limit } : {})
     }),
 
   createPending: async (order: ShopifyOrder) =>
@@ -41,7 +58,8 @@ export const shipmentRepository = {
       update: {
         shopifyOrderNumber: String(order.order_number),
         shopifyOrderName: order.name,
-        rawOrderJson: JSON.stringify(order)
+        rawOrderJson: JSON.stringify(order),
+        accurateStatus: 'PENDING'
       },
       create: {
         shopifyOrderId: String(order.id),
@@ -64,6 +82,20 @@ export const shipmentRepository = {
       }
     }),
 
+  clearDeletedShipment: async (shopifyOrderId: string, reason: string) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        accurateShipmentId: null,
+        accurateShipmentCode: null,
+        plannedShipmentCode: null,
+        accurateStatus: 'DELETED_ON_TELEGRAPH',
+        trackingUrl: null,
+        lastError: reason,
+        lastSyncedAt: new Date()
+      }
+    }),
+
   assignPlannedShipmentCode: async (shopifyOrderId: string, code: string) =>
     await prisma.shipmentRecord.update({
       where: { shopifyOrderId },
@@ -72,24 +104,38 @@ export const shipmentRepository = {
 
   updateAccurateSnapshot: async (id: number, data: {
     accurateStatus: string;
+    accurateStatusCode?: string | null;
     accurateReturnStatus?: string | null;
+    accurateReturnStatusCode?: string | null;
+    accurateIsTerminal?: boolean | null;
     collectionStatus?: string | null;
     trackingUrl?: string | null;
     collectedAmount?: number | null;
     pendingCollectionAmount?: number | null;
     returnedValue?: number | null;
+    deliveryFees?: number | null;
+    returnFees?: number | null;
+    returningDueFees?: number | null;
+    customerDue?: number | null;
     deliveredAt?: Date | null;
   }) =>
     await prisma.shipmentRecord.update({
       where: { id },
       data: {
         accurateStatus: data.accurateStatus,
+        accurateStatusCode: data.accurateStatusCode,
         accurateReturnStatus: data.accurateReturnStatus,
+        accurateReturnStatusCode: data.accurateReturnStatusCode,
+        accurateIsTerminal: data.accurateIsTerminal,
         collectionStatus: data.collectionStatus,
         trackingUrl: data.trackingUrl,
         collectedAmount: data.collectedAmount,
         pendingCollectionAmount: data.pendingCollectionAmount,
         returnedValue: data.returnedValue,
+        deliveryFees: data.deliveryFees,
+        returnFees: data.returnFees,
+        returningDueFees: data.returningDueFees,
+        customerDue: data.customerDue,
         deliveredAt: data.deliveredAt,
         lastSyncedAt: new Date()
       }
@@ -108,5 +154,117 @@ export const shipmentRepository = {
     await prisma.shipmentRecord.update({
       where: { id },
       data: { accurateStatus: status }
+    }),
+
+  updateOdooSalesOrder: async (shopifyOrderId: string, data: {
+    saleOrderId: number;
+    saleOrderName: string;
+    status: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooSaleOrderId: data.saleOrderId,
+        odooSaleOrderName: data.saleOrderName,
+        odooSyncStatus: data.status,
+        odooLastError: null,
+        odooSyncedAt: new Date()
+      }
+    }),
+
+  claimOdooSalesOrderCreation: async (shopifyOrderId: string) => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        shopifyOrderId,
+        odooSaleOrderId: null,
+        OR: [
+          { odooSyncStatus: null },
+          { odooSyncStatus: { not: 'sales-order-creating' } }
+        ]
+      },
+      data: {
+        odooSyncStatus: 'sales-order-creating',
+        odooLastError: null,
+        odooSyncedAt: new Date()
+      }
+    });
+    return result.count === 1;
+  },
+
+  updateOdooInvoice: async (shopifyOrderId: string, data: {
+    invoiceId: number;
+    invoiceName: string;
+    status: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooInvoiceId: data.invoiceId,
+        odooInvoiceName: data.invoiceName,
+        odooSyncStatus: data.status,
+        odooLastError: null,
+        odooSyncedAt: new Date()
+      }
+    }),
+
+  updateOdooPayment: async (shopifyOrderId: string, data: {
+    paymentId: number;
+    status: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooPaymentId: data.paymentId,
+        odooSalePaymentId: data.paymentId,
+        odooSyncStatus: data.status,
+        odooLastError: null,
+        odooSyncedAt: new Date()
+      }
+    }),
+
+  markOdooInvoicePaid: async (shopifyOrderId: string, data: {
+    invoiceId: number;
+    invoiceName: string;
+    paymentId?: number | null;
+    status: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooInvoiceId: data.invoiceId,
+        odooInvoiceName: data.invoiceName,
+        odooPaymentId: data.paymentId ?? undefined,
+        odooSalePaymentId: data.paymentId ?? undefined,
+        odooSyncStatus: data.status,
+        odooLastError: null,
+        odooSyncedAt: new Date()
+      }
+    }),
+
+  updateOdooReturnCharge: async (shopifyOrderId: string, data: {
+    billId: number;
+    paymentId?: number | null;
+    status: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooPaymentId: data.paymentId,
+        odooReturnBillId: data.billId,
+        odooReturnPaymentId: data.paymentId,
+        odooSyncStatus: data.status,
+        odooLastError: null,
+        odooSyncedAt: new Date()
+      }
+    }),
+
+  markOdooFailed: async (shopifyOrderId: string, error: string) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooSyncStatus: 'failed',
+        odooLastError: error,
+        odooSyncedAt: new Date()
+      }
     })
 };
