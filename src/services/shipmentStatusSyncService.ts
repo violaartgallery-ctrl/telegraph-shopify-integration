@@ -174,11 +174,32 @@ export class ShipmentStatusSyncService {
     }
   }
 
-  async syncOpenShipments(): Promise<{ processed: number; failed: number }> {
+  async syncOpenShipments(): Promise<{ processed: number; failed: number; skipped: number }> {
+    // T-1 FIX: Add time-budget guard to avoid Netlify 26 s function timeout mid-run.
+    // Records that are not reached this run remain open and will be retried next scheduled run.
+    // Records are NOT marked as failed solely because the budget ran out.
+    const budgetMs = env.syncTimeBudgetMs;
+    const startTime = Date.now();
+
     const openShipments = await shipmentRepository.findOpenShipments(env.syncOpenShipmentsBatchSize);
     let processed = 0;
     let failed = 0;
+    let skipped = 0;
+
     for (const record of openShipments) {
+      const elapsedMs = Date.now() - startTime;
+      if (elapsedMs >= budgetMs) {
+        skipped = openShipments.length - processed - failed;
+        logger.warn('syncOpenShipments time budget exhausted — stopping early; skipped records will retry next run', {
+          processed,
+          failed,
+          skipped,
+          elapsedMs,
+          budgetMs
+        });
+        break;
+      }
+
       try {
         await this.syncRecord(record);
         processed += 1;
@@ -197,6 +218,8 @@ export class ShipmentStatusSyncService {
         });
       }
     }
-    return { processed, failed };
+
+    logger.info('syncOpenShipments complete', { processed, failed, skipped, elapsedMs: Date.now() - startTime });
+    return { processed, failed, skipped };
   }
 }

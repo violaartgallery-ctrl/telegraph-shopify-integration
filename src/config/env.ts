@@ -35,6 +35,8 @@ const optionalBool = (name: string): boolean => {
   return ['1', 'true', 'yes', 'on'].includes((value ?? '').trim().toLowerCase());
 };
 
+const optionalString = (name: string): string => process.env[name] ?? '';
+
 const productIdMap = (() => {
   const raw = process.env.ACCURATE_PRODUCT_ID_MAP_JSON;
   if (!raw) return {} as Record<string, number>;
@@ -48,6 +50,12 @@ export const env = {
   databaseUrl: required('DATABASE_URL'),
   syncOpenShipmentsIntervalMs: optionalInt('SYNC_OPEN_SHIPMENTS_INTERVAL_MS') ?? 600_000,
   syncOpenShipmentsBatchSize: optionalInt('SYNC_OPEN_SHIPMENTS_BATCH_SIZE') ?? 10,
+  // Time budget (ms) for a single sync-open-shipments run before Netlify timeout.
+  // Default 20 000 ms leaves ~6 s buffer from the Netlify 26 s function limit.
+  syncTimeBudgetMs: optionalInt('SYNC_TIME_BUDGET_MS') ?? 20_000,
+  // Admin UI protection — required to call sensitive admin routes.
+  // If empty the routes remain open with a startup warning (backward compat).
+  adminSecretToken: optionalString('ADMIN_SECRET_TOKEN'),
   shipmentCodePrefix: process.env.SHIPMENT_CODE_PREFIX,
   shipmentCodeStart: optionalInt('SHIPMENT_CODE_START') ?? 1,
   orderReferencePrefix: process.env.ORDER_REFERENCE_PREFIX ?? 'Loomlac',
@@ -66,6 +74,9 @@ export const env = {
     syncSummaryMetafieldKey: process.env.SHOPIFY_SYNC_SUMMARY_METAFIELD_KEY ?? 'sync_summary'
   },
   accurate: {
+    // Shared secret for incoming Accurate/Telegraph webhook calls.
+    // If empty the endpoint accepts any caller with a startup warning (backward compat).
+    webhookSecret: optionalString('ACCURATE_WEBHOOK_SECRET'),
     endpoint: required('ACCURATE_GRAPHQL_ENDPOINT'),
     username: required('ACCURATE_USERNAME'),
     password: required('ACCURATE_PASSWORD'),
@@ -96,7 +107,11 @@ export const env = {
     db: process.env.ODOO_DB,
     username: process.env.ODOO_USERNAME,
     password: process.env.ODOO_PASSWORD,
-    paymentJournalId: optionalInt('ODOO_PAYMENT_JOURNAL_ID')
+    paymentJournalId: optionalInt('ODOO_PAYMENT_JOURNAL_ID'),
+    // Odoo account ID for the expense line on Telegraph return-charge vendor bills.
+    // REQUIRED when Odoo sync is enabled and returns are expected.
+    // Run: Settings → Chart of Accounts, find the appropriate expense account, note its ID.
+    returnChargeAccountId: optionalInt('ODOO_RETURN_CHARGE_ACCOUNT_ID')
   }
 };
 

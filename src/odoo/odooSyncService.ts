@@ -384,8 +384,16 @@ export class OdooSyncService {
       return;
     }
 
+    // BUG-1 FIX: Use net merchant due (collectedAmount - deliveryFees) NOT gross collectedAmount.
+    // Telegraph retains the delivery fee from cash collected on behalf of the merchant.
+    // Only the net amount reaches the merchant and should be registered as invoice payment.
+    // Example: collectedAmount=1270, deliveryFees=71 → netMerchantDue=1199 EGP registered.
     const collectedAmount = Number(record.collectedAmount ?? Number.parseFloat(order.current_total_price ?? order.total_price));
-    const amount = Math.min(residual, Number.isFinite(collectedAmount) && collectedAmount > 0 ? collectedAmount : residual);
+    const deliveryFees = Number(record.deliveryFees ?? 0);
+    const netMerchantDue = Number.isFinite(collectedAmount) && collectedAmount > 0
+      ? Math.max(0, collectedAmount - deliveryFees)
+      : 0;
+    const amount = Math.min(residual, netMerchantDue > 0 ? netMerchantDue : residual);
     if (amount <= 0) {
       await shipmentRepository.updateOdooInvoice(String(order.id), {
         invoiceId: invoice.id,
@@ -404,7 +412,11 @@ export class OdooSyncService {
       shopifyOrderId: order.id,
       saleOrderId: saleOrder.id,
       invoiceId: invoice.id,
-      paymentId: payment.id
+      paymentId: payment.id,
+      collectedAmount,
+      deliveryFees,
+      netMerchantDue,
+      registeredAmount: amount
     });
   }
 
@@ -744,6 +756,19 @@ export class OdooSyncService {
   }
 
   private async createReturnShippingBill(reference: string, amount: number): Promise<InvoiceRecord> {
+    // BUG-4 FIX: account_id was hardcoded as 101 — not portable across Odoo instances.
+    // Now reads from ODOO_RETURN_CHARGE_ACCOUNT_ID env var.
+    // To find the right value: Odoo → Accounting → Configuration → Chart of Accounts →
+    // find the expense account for return shipping charges and note its integer ID.
+    const accountId = env.odoo.returnChargeAccountId;
+    if (!accountId) {
+      throw new Error(
+        'ODOO_RETURN_CHARGE_ACCOUNT_ID is not configured. ' +
+        'Set this env var to the Odoo account ID (integer) for Telegraph return-charge vendor bill lines. ' +
+        'Go to Accounting → Configuration → Chart of Accounts to find the appropriate expense account ID.'
+      );
+    }
+
     const partnerId = await this.findOrCreateTelegraphPartner();
     const billId = await this.odooClient.create('account.move', {
       move_type: 'in_invoice',
@@ -754,7 +779,7 @@ export class OdooSyncService {
         name: reference,
         quantity: 1,
         price_unit: amount,
-        account_id: 101
+        account_id: accountId
       }]]
     });
     await this.odooClient.call('account.move', 'action_post', [[billId]]);

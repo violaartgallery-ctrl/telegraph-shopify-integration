@@ -11,6 +11,7 @@ import { createShopifyWebhookHandler } from './routes/shopifyWebhookRoute.js';
 import { ShipmentStatusSyncService } from './services/shipmentStatusSyncService.js';
 import { OdooClient } from './odoo/odooClient.js';
 import { OdooSyncService } from './odoo/odooSyncService.js';
+import { adminAuth } from './middleware/adminAuth.js';
 
 export const createAppServices = () => {
   const accurateClient = new AccurateClient();
@@ -35,7 +36,8 @@ export const createApp = () => {
   app.use((request, response, next) => {
     response.setHeader('Access-Control-Allow-Origin', '*');
     response.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    response.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Shopify-Hmac-Sha256');
+    // x-admin-secret is included so browser-based Shopify App Extension calls work
+    response.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Shopify-Hmac-Sha256,x-admin-secret');
     if (request.method === 'OPTIONS') {
       response.status(204).end();
       return;
@@ -46,6 +48,12 @@ export const createApp = () => {
   app.get('/health', (_request, response) => {
     response.status(200).json({ ok: true });
   });
+
+  // BUG-SEC-4 FIX: Protect all admin routes under /orders/* and /api/* with adminAuth.
+  // Shopify webhook routes (/webhooks/*) are intentionally NOT protected here —
+  // they use their own HMAC signature verification.
+  app.use('/orders', adminAuth);
+  app.use('/api', adminAuth);
 
   app.use(createAdminAppRouter(services.shopifyOrderProcessor, services.accurateClient, services.odooSyncService));
 
