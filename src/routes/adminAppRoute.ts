@@ -615,14 +615,22 @@ const renderBulkShipmentJsPage = (params: {
               headers: { ...adminHeaders, 'Content-Type': 'application/json' },
               body: JSON.stringify(body)
             });
-            // Gateway timeout (502/503/504) — server-side timeout, safe to retry
+            // HTTP gateway timeouts — safe to retry
             if ((resp.status === 502 || resp.status === 503 || resp.status === 504) && attempt < MAX_RETRIES) {
               await new Promise(r => setTimeout(r, 2000));
               continue;
             }
             const result = await resp.json();
+            // Netlify Lambda timeout returns HTTP 200 with { errorType: 'Sandbox.Timedout' }
+            const isLambdaTimeout = result.errorType === 'Sandbox.Timedout'
+              || (typeof result.errorMessage === 'string' && /timed? ?out/i.test(result.errorMessage));
+            if (isLambdaTimeout && attempt < MAX_RETRIES) {
+              await new Promise(r => setTimeout(r, 2000));
+              continue;
+            }
             if (!resp.ok || !result.ok) {
-              updateRow(order.index, 'error', result.message || ('Server error ' + resp.status));
+              const msg = result.message || result.errorMessage || ('Server error ' + resp.status);
+              updateRow(order.index, 'error', msg);
             } else if (result.skipped) {
               updateRow(order.index, 'already-created', 'Shipment already exists.', result.shipmentCode);
             } else {
