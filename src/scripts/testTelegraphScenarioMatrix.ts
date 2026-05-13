@@ -1,5 +1,5 @@
 import { projectAccurateStatusToShopify } from '../services/accurateStatusMapper.js';
-import { calculateTelegraphReturnCharge } from '../odoo/odooSyncService.js';
+import { calculateTelegraphMerchantPaymentAmount, calculateTelegraphReturnCharge } from '../odoo/odooSyncService.js';
 
 interface Scenario {
   name: string;
@@ -156,8 +156,25 @@ for (const testCase of returnChargeCases) {
   assert(actual === testCase.expected, `${testCase.name}: expected ${testCase.expected}, got ${actual}`);
 }
 
+const paymentAmountCases = [
+  { name: 'net merchant due after delivery fees', input: { residual: 1200, collectedAmount: 1270, deliveryFees: 71 }, expected: 1199 },
+  { name: 'delivery fees exceed collected amount', input: { residual: 1200, collectedAmount: 50, deliveryFees: 71 }, expected: 0 },
+  { name: 'zero delivery fees', input: { residual: 1200, collectedAmount: 1200, deliveryFees: 0 }, expected: 1200 },
+  { name: 'missing delivery fees does not overpay', input: { residual: 1200, collectedAmount: 1270, deliveryFees: null }, expected: 0 },
+  { name: 'missing collected amount does not overpay', input: { residual: 1200, collectedAmount: null, deliveryFees: 71 }, expected: 0 },
+  { name: 'already smaller residual caps payment', input: { residual: 500, collectedAmount: 1270, deliveryFees: 71 }, expected: 500 },
+  { name: 'explicit positive customer due wins', input: { residual: 1200, collectedAmount: 1270, deliveryFees: 71, customerDue: 1199 }, expected: 1199 },
+  { name: 'negative customer due without safe collected data does not pay', input: { residual: 1200, collectedAmount: null, deliveryFees: 71, customerDue: -67 }, expected: 0 }
+];
+
+for (const testCase of paymentAmountCases) {
+  const actual = calculateTelegraphMerchantPaymentAmount(testCase.input);
+  assert(actual === testCase.expected, `${testCase.name}: expected ${testCase.expected}, got ${actual}`);
+}
+
 console.log(JSON.stringify({
   ok: true,
   statusScenarios: scenarios.length,
-  returnChargeScenarios: returnChargeCases.length
+  returnChargeScenarios: returnChargeCases.length,
+  paymentAmountScenarios: paymentAmountCases.length
 }, null, 2));

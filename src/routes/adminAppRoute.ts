@@ -25,7 +25,26 @@ const escapeHtml = (value: unknown): string =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-const renderAppShell = (): string => `<!doctype html>
+const extractAdminToken = (request: Request): string =>
+  typeof request.query.adminToken === 'string' ? request.query.adminToken : '';
+
+const adminPath = (path: string, adminToken?: string): string => {
+  if (!adminToken) return path;
+  return `${path}${path.includes('?') ? '&' : '?'}adminToken=${encodeURIComponent(adminToken)}`;
+};
+
+const adminHiddenInput = (adminToken?: string): string =>
+  adminToken ? `<input type="hidden" name="adminToken" value="${escapeHtml(adminToken)}" />` : '';
+
+const renderAdminScriptContext = (adminToken?: string): string => `
+      const adminToken = ${JSON.stringify(adminToken ?? '')};
+      const adminHeaders = adminToken ? { 'x-admin-secret': adminToken } : {};
+      const adminUrl = (path) => adminToken
+        ? path + (path.includes('?') ? '&' : '?') + 'adminToken=' + encodeURIComponent(adminToken)
+        : path;
+`;
+
+const renderAppShell = (adminToken?: string): string => `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -83,6 +102,7 @@ const renderAppShell = (): string => `<!doctype html>
       </section>
     </main>
     <script>
+      ${renderAdminScriptContext(adminToken)}
       const toast = document.getElementById('toast');
       const setToast = (message, error = false) => {
         toast.textContent = message || '';
@@ -97,7 +117,7 @@ const renderAppShell = (): string => `<!doctype html>
       async function loadOrders() {
         const target = document.getElementById('orders');
         target.textContent = 'Loading orders...';
-        const response = await fetch('/api/orders');
+        const response = await fetch(adminUrl('/api/orders'), { headers: adminHeaders });
         const data = await response.json();
         if (!response.ok) throw new Error(data.message || 'Could not load orders');
         target.innerHTML = '<table><thead><tr><th>Order</th><th>Customer</th><th>Address</th><th>Payment</th><th>Shipment</th><th>Odoo</th><th>Action</th></tr></thead><tbody>' +
@@ -116,9 +136,9 @@ const renderAppShell = (): string => `<!doctype html>
             button.disabled = true;
             setToast('Creating shipment...');
             try {
-              const response = await fetch('/api/orders/create-shipment', {
+              const response = await fetch(adminUrl('/api/orders/create-shipment'), {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ orderGid: button.dataset.orderGid })
               });
               const payload = await response.json();
@@ -141,9 +161,9 @@ const renderAppShell = (): string => `<!doctype html>
             button.disabled = true;
             setToast('Creating Odoo Sales Order...');
             try {
-              const response = await fetch('/api/orders/create-odoo-sales-order', {
+              const response = await fetch(adminUrl('/api/orders/create-odoo-sales-order'), {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ orderGid: button.dataset.odooOrderGid })
               });
               const payload = await response.json();
@@ -160,7 +180,7 @@ const renderAppShell = (): string => `<!doctype html>
       async function loadLocations() {
         const target = document.getElementById('locations');
         target.textContent = 'Loading locations...';
-        const response = await fetch('/api/accurate/locations');
+        const response = await fetch(adminUrl('/api/accurate/locations'), { headers: adminHeaders });
         const data = await response.json();
         if (!response.ok) throw new Error(data.message || 'Could not load locations');
         target.innerHTML = data.locations.map((zone) => '<details>' +
@@ -334,6 +354,7 @@ const renderLocationSelectionForm = (params: {
   orderName: string;
   locations: Array<ZoneEntry & { subzones: ZoneEntry[] }>;
   message?: string;
+  adminToken?: string;
 }): string => `<!doctype html>
 <html lang="en">
   <head>
@@ -362,13 +383,14 @@ const renderLocationSelectionForm = (params: {
   </head>
   <body>
     <main>
-      <form method="post" action="/orders/make-telegraph/select">
+      <form method="post" action="${escapeHtml(adminPath('/orders/make-telegraph/select', params.adminToken))}">
         <div>
           <h1>Select Telegraph location</h1>
           <p class="muted">Order ${escapeHtml(params.orderName)} is missing Telegraph governorate and area. Choose them to create the shipment safely.</p>
           ${params.message ? `<p class="error">${escapeHtml(params.message)}</p>` : ''}
         </div>
         <input type="hidden" name="orderId" value="${escapeHtml(params.orderId)}" />
+        ${adminHiddenInput(params.adminToken)}
         <div class="field">
           <label for="telegraph-admin-governorate-search">Governorate</label>
           <div class="picker">
@@ -504,6 +526,7 @@ const renderBulkShipmentReview = (params: {
   }>;
   canExecute: boolean;
   executed?: boolean;
+  adminToken?: string;
 }): string => `<!doctype html>
 <html lang="en">
   <head>
@@ -559,7 +582,8 @@ const renderBulkShipmentReview = (params: {
           </tbody>
         </table>
         ${params.executed ? '' : `
-          <form method="post" action="/orders/make-telegraph/bulk">
+          <form method="post" action="${escapeHtml(adminPath('/orders/make-telegraph/bulk', params.adminToken))}">
+            ${adminHiddenInput(params.adminToken)}
             ${params.orderIds.map((orderId) => `<input class="hidden" type="hidden" name="orderIds" value="${escapeHtml(orderId)}" />`).join('')}
             <button type="submit" ${params.canExecute ? '' : 'disabled'}>Create ready Telegraph shipments</button>
           </form>
@@ -582,6 +606,7 @@ const renderBulkOdooReview = (params: {
   }>;
   canExecute: boolean;
   executed?: boolean;
+  adminToken?: string;
 }): string => `<!doctype html>
 <html lang="en">
   <head>
@@ -637,7 +662,8 @@ const renderBulkOdooReview = (params: {
           </tbody>
         </table>
         ${params.executed ? '' : `
-          <form method="post" action="/orders/create-odoo-sales-order/bulk">
+          <form method="post" action="${escapeHtml(adminPath('/orders/create-odoo-sales-order/bulk', params.adminToken))}">
+            ${adminHiddenInput(params.adminToken)}
             ${params.orderIds.map((orderId) => `<input class="hidden" type="hidden" name="orderIds" value="${escapeHtml(orderId)}" />`).join('')}
             <button type="submit" ${params.canExecute ? '' : 'disabled'}>Create ready Odoo Sales Orders</button>
           </form>
@@ -719,8 +745,8 @@ export const createAdminAppRouter = (
 ) => {
   const router = express.Router();
 
-  router.get('/', (_request: Request, response: Response) => {
-    response.type('html').send(renderAppShell());
+  router.get('/', (request: Request, response: Response) => {
+    response.type('html').send(renderAppShell(extractAdminToken(request)));
   });
 
   router.get('/orders/make-telegraph/bulk', async (request: Request, response: Response) => {
@@ -734,7 +760,8 @@ export const createAdminAppRouter = (
           status: 'error',
           detail: 'Shopify did not pass selected order ids to this app action.'
         }],
-        canExecute: false
+        canExecute: false,
+        adminToken: extractAdminToken(request)
       }));
       return;
     }
@@ -791,7 +818,8 @@ export const createAdminAppRouter = (
       title: 'Make Telegraph shipments',
       orderIds,
       rows,
-      canExecute: rows.some((row) => row.status === 'ready')
+      canExecute: rows.some((row) => row.status === 'ready'),
+      adminToken: extractAdminToken(request)
     }));
   });
 
@@ -862,7 +890,8 @@ export const createAdminAppRouter = (
       orderIds,
       rows,
       canExecute: false,
-      executed: true
+      executed: true,
+      adminToken: extractAdminToken(request)
     }));
   });
 
@@ -906,7 +935,8 @@ export const createAdminAppRouter = (
       response.type('html').send(renderLocationSelectionForm({
         orderId: String(order.id),
         orderName: order.name,
-        locations: await getLocations(accurateClient)
+        locations: await getLocations(accurateClient),
+        adminToken: extractAdminToken(request)
       }));
       return;
     }
@@ -1008,7 +1038,8 @@ export const createAdminAppRouter = (
           status: 'error',
           detail: 'Shopify did not pass selected order ids to this app action.'
         }],
-        canExecute: false
+        canExecute: false,
+        adminToken: extractAdminToken(request)
       }));
       return;
     }
@@ -1069,7 +1100,8 @@ export const createAdminAppRouter = (
       title: 'Make Odoo Sales Orders',
       orderIds,
       rows,
-      canExecute: rows.some((row) => row.status === 'ready')
+      canExecute: rows.some((row) => row.status === 'ready'),
+      adminToken: extractAdminToken(request)
     }));
   });
 
@@ -1139,7 +1171,8 @@ export const createAdminAppRouter = (
       orderIds,
       rows,
       canExecute: false,
-      executed: true
+      executed: true,
+      adminToken: extractAdminToken(request)
     }));
   });
 

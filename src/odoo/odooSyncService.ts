@@ -90,6 +90,36 @@ export const calculateTelegraphReturnCharge = (shipment: {
   return returnedValue < 0 ? Math.abs(returnedValue) : 0;
 };
 
+export const calculateTelegraphMerchantPaymentAmount = (params: {
+  residual: number;
+  collectedAmount?: number | null;
+  deliveryFees?: number | null;
+  customerDue?: number | null;
+}): number => {
+  const residual = Number(params.residual);
+  if (!Number.isFinite(residual) || residual <= 0) {
+    return 0;
+  }
+
+  const customerDue = Number(params.customerDue);
+  if (Number.isFinite(customerDue) && customerDue > 0) {
+    return Math.min(residual, customerDue);
+  }
+
+  if (params.collectedAmount === undefined || params.collectedAmount === null || params.deliveryFees === undefined || params.deliveryFees === null) {
+    return 0;
+  }
+
+  const collectedAmount = Number(params.collectedAmount);
+  const deliveryFees = Number(params.deliveryFees);
+  if (!Number.isFinite(collectedAmount) || collectedAmount <= 0 || !Number.isFinite(deliveryFees) || deliveryFees < 0) {
+    return 0;
+  }
+
+  const netMerchantDue = collectedAmount - deliveryFees;
+  return netMerchantDue > 0 ? Math.min(residual, netMerchantDue) : 0;
+};
+
 const activeLineItems = (order: ShopifyOrder): ShopifyLineItem[] =>
   order.line_items.filter((line) => (line.current_quantity ?? line.quantity) > 0);
 
@@ -388,12 +418,12 @@ export class OdooSyncService {
     // Telegraph retains the delivery fee from cash collected on behalf of the merchant.
     // Only the net amount reaches the merchant and should be registered as invoice payment.
     // Example: collectedAmount=1270, deliveryFees=71 → netMerchantDue=1199 EGP registered.
-    const collectedAmount = Number(record.collectedAmount ?? Number.parseFloat(order.current_total_price ?? order.total_price));
-    const deliveryFees = Number(record.deliveryFees ?? 0);
-    const netMerchantDue = Number.isFinite(collectedAmount) && collectedAmount > 0
-      ? Math.max(0, collectedAmount - deliveryFees)
-      : 0;
-    const amount = Math.min(residual, netMerchantDue > 0 ? netMerchantDue : residual);
+    const amount = calculateTelegraphMerchantPaymentAmount({
+      residual,
+      collectedAmount: record.collectedAmount,
+      deliveryFees: record.deliveryFees,
+      customerDue: record.customerDue
+    });
     if (amount <= 0) {
       await shipmentRepository.updateOdooInvoice(String(order.id), {
         invoiceId: invoice.id,
@@ -413,9 +443,9 @@ export class OdooSyncService {
       saleOrderId: saleOrder.id,
       invoiceId: invoice.id,
       paymentId: payment.id,
-      collectedAmount,
-      deliveryFees,
-      netMerchantDue,
+      collectedAmount: record.collectedAmount,
+      deliveryFees: record.deliveryFees,
+      customerDue: record.customerDue,
       registeredAmount: amount
     });
   }
