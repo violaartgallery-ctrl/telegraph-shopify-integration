@@ -513,6 +513,148 @@ const renderLocationSelectionForm = (params: {
   </body>
 </html>`;
 
+const renderBulkShipmentJsPage = (params: {
+  rows: Array<{
+    index: number;
+    rawOrderId: string;
+    orderName: string;
+    customerName: string;
+    status: 'pending' | 'already-created' | 'needs-location' | 'error';
+    shipmentCode?: string | null;
+    detail?: string;
+    needsProcessing: boolean;
+  }>;
+  adminToken?: string;
+}): string => {
+  const pendingOrders = params.rows
+    .filter((r) => r.needsProcessing)
+    .map((r) => ({ index: r.index, rawId: r.rawOrderId }));
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Make Telegraph shipments</title>
+    <style>
+      body { margin:0; font-family: Arial, sans-serif; color:#202223; background:#f6f6f7; }
+      main { max-width:980px; margin:0 auto; padding:40px 20px; }
+      .panel { background:#fff; border:1px solid #dfe3e8; border-radius:8px; padding:24px; }
+      h1 { margin:0 0 8px; font-size:26px; }
+      p.sub { color:#6d7175; line-height:1.5; }
+      table { width:100%; border-collapse:collapse; border:1px solid #dfe3e8; margin-top:18px; }
+      th, td { padding:11px; border-bottom:1px solid #dfe3e8; text-align:left; vertical-align:top; }
+      th { background:#f6f6f7; color:#6d7175; font-size:13px; }
+      .badge { display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; font-weight:700; }
+      .pending  { background:#f3f4f6; color:#374151; }
+      .processing { background:#fff7ed; color:#9a3412; animation:pulse 1.2s infinite; }
+      .created  { background:#e0f2fe; color:#075985; }
+      .already-created { background:#f3f4f6; color:#374151; }
+      .needs-location { background:#fff7ed; color:#9a3412; }
+      .error    { background:#fee2e2; color:#b42318; }
+      #status-bar { margin-top:14px; color:#6d7175; font-size:14px; }
+      @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="panel">
+        <h1>Make Telegraph shipments</h1>
+        <p class="sub">Creating shipments — please wait while each order is processed with Odoo.</p>
+        <table>
+          <thead><tr><th>Order</th><th>Customer</th><th>Status</th><th>Details</th><th>Shipment</th></tr></thead>
+          <tbody>
+            ${params.rows.map((row) => `
+              <tr>
+                <td>${escapeHtml(row.orderName)}</td>
+                <td>${escapeHtml(row.customerName)}</td>
+                <td><span id="badge-${row.index}" class="badge ${escapeHtml(row.status)}">${escapeHtml(row.status)}</span></td>
+                <td id="detail-${row.index}">${escapeHtml(
+                  row.status === 'already-created' ? 'Telegraph shipment already exists.' :
+                  row.status === 'needs-location'  ? 'Telegraph city/area missing. Use the single-order button first.' :
+                  row.status === 'error'            ? (row.detail ?? 'Could not read order.') :
+                  'Waiting to process...'
+                )}</td>
+                <td id="code-${row.index}">${escapeHtml(row.shipmentCode ?? '')}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+        <p id="status-bar">${pendingOrders.length === 0 ? 'No orders needed processing.' : 'Starting...'}</p>
+      </div>
+    </main>
+    <script>
+      const adminToken = ${JSON.stringify(params.adminToken ?? '')};
+      const adminHeaders = adminToken ? { 'x-admin-secret': adminToken } : {};
+      const adminUrl = (p) => adminToken ? p + (p.includes('?') ? '&' : '?') + 'adminToken=' + encodeURIComponent(adminToken) : p;
+      const pendingOrders = ${JSON.stringify(pendingOrders)};
+
+      function updateRow(idx, status, detail, code) {
+        const b = document.getElementById('badge-' + idx);
+        const d = document.getElementById('detail-' + idx);
+        const c = document.getElementById('code-' + idx);
+        if (b) { b.className = 'badge ' + status; b.textContent = status; }
+        if (d) d.textContent = detail || '';
+        if (c && code) c.textContent = code;
+      }
+
+      async function processOne(order) {
+        const isGid = order.rawId.startsWith('gid://shopify/Order/');
+        const body  = isGid ? { orderGid: order.rawId } : { orderId: order.rawId.replace(/\\D/g, '') };
+        const MAX_RETRIES = 2;
+
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+          const isRetry = attempt > 0;
+          updateRow(order.index, 'processing',
+            isRetry
+              ? 'Retry ' + attempt + '/' + MAX_RETRIES + ' — picking up where we left off...'
+              : 'Creating Telegraph shipment + Odoo record...'
+          );
+          try {
+            const resp = await fetch(adminUrl('/api/orders/create-shipment'), {
+              method: 'POST',
+              headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+              body: JSON.stringify(body)
+            });
+            // Gateway timeout (502/503/504) — server-side timeout, safe to retry
+            if ((resp.status === 502 || resp.status === 503 || resp.status === 504) && attempt < MAX_RETRIES) {
+              await new Promise(r => setTimeout(r, 2000));
+              continue;
+            }
+            const result = await resp.json();
+            if (!resp.ok || !result.ok) {
+              updateRow(order.index, 'error', result.message || ('Server error ' + resp.status));
+            } else if (result.skipped) {
+              updateRow(order.index, 'already-created', 'Shipment already exists.', result.shipmentCode);
+            } else {
+              const odooNote = result.odoo && !result.odoo.skipped ? ' | Odoo: ' + (result.odoo.saleOrderName || 'synced') : '';
+              updateRow(order.index, 'created', 'Created successfully' + odooNote + '.', result.shipmentCode);
+            }
+            return; // success or non-retryable error — stop retrying
+          } catch (e) {
+            // Network error (e.g. connection reset by Netlify timeout)
+            if (attempt < MAX_RETRIES) {
+              await new Promise(r => setTimeout(r, 2000));
+              continue;
+            }
+            updateRow(order.index, 'error', 'Network error: ' + (e.message || 'unknown'));
+          }
+        }
+      }
+
+      (async () => {
+        if (!pendingOrders.length) return;
+        const bar = document.getElementById('status-bar');
+        for (let i = 0; i < pendingOrders.length; i++) {
+          if (bar) bar.textContent = 'Processing ' + (i + 1) + ' of ' + pendingOrders.length + ' orders...';
+          await processOne(pendingOrders[i]);
+        }
+        if (bar) bar.textContent = 'Done — ' + pendingOrders.length + ' order(s) processed.';
+      })();
+    </script>
+  </body>
+</html>`;
+};
+
 const renderBulkShipmentReview = (params: {
   title: string;
   orderIds: string[];
@@ -828,9 +970,13 @@ export const createAdminAppRouter = (
     const orderIds = (Array.isArray(rawOrderIds) ? rawOrderIds : [rawOrderIds])
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
 
-    // Process all orders in parallel to avoid Netlify function timeout on large selections.
+    const adminToken = extractAdminToken(request);
+
+    // Quickly resolve order names + existing status in parallel (Shopify + DB only — fast).
+    // Returns the page immediately; JS in the page processes each "pending" order one-at-a-time
+    // via /api/orders/create-shipment so every order gets Telegraph + Odoo sync without timeout.
     const settled = await Promise.allSettled(
-      orderIds.map(async (rawOrderId) => {
+      orderIds.map(async (rawOrderId, index) => {
         const order = await getOrderByRawId(rawOrderId);
         const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
         const customerName = order.shipping_address?.name
@@ -838,63 +984,22 @@ export const createAdminAppRouter = (
           ?? [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ');
 
         if (record?.accurateShipmentId) {
-          return {
-            orderId: rawOrderId,
-            orderName: order.name,
-            customerName,
-            status: 'already-created' as const,
-            detail: 'Telegraph shipment already exists for this order.',
-            shipmentCode: record.accurateShipmentCode
-          };
+          return { index, rawOrderId, orderName: order.name, customerName, status: 'already-created' as const, shipmentCode: record.accurateShipmentCode, needsProcessing: false };
         }
-
         if (!getTelegraphLocationSelection(order)) {
-          return {
-            orderId: rawOrderId,
-            orderName: order.name,
-            customerName,
-            status: 'needs-location' as const,
-            detail: 'Telegraph governorate and area are missing. Use the single-order button first.'
-          };
+          return { index, rawOrderId, orderName: order.name, customerName, status: 'needs-location' as const, needsProcessing: false };
         }
-
-        const result = await shopifyOrderProcessor.process(order, {
-          source: 'shopify-admin-bulk-link',
-          rawOrderId,
-          skipEligibility: true,
-          requireTelegraphLocation: true
-        });
-        const updatedRecord = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
-
-        return {
-          orderId: rawOrderId,
-          orderName: order.name,
-          customerName,
-          status: (result.skipped ? 'skipped' : 'created') as 'skipped' | 'created',
-          detail: shipmentResultMessage(result),
-          shipmentCode: updatedRecord?.accurateShipmentCode
-        };
+        return { index, rawOrderId, orderName: order.name, customerName, status: 'pending' as const, needsProcessing: true };
       })
     );
 
     const rows = settled.map((outcome, i) =>
       outcome.status === 'fulfilled'
         ? outcome.value
-        : {
-            orderId: orderIds[i],
-            status: 'error' as const,
-            detail: outcome.reason instanceof Error ? outcome.reason.message : 'Could not process this order.'
-          }
+        : { index: i, rawOrderId: orderIds[i], orderName: orderIds[i], customerName: '', status: 'error' as const, detail: outcome.reason instanceof Error ? outcome.reason.message : 'Could not read order.', needsProcessing: false }
     );
 
-    response.type('html').send(renderBulkShipmentReview({
-      title: 'Make Telegraph shipments',
-      orderIds,
-      rows,
-      canExecute: false,
-      executed: true,
-      adminToken: extractAdminToken(request)
-    }));
+    response.type('html').send(renderBulkShipmentJsPage({ rows, adminToken }));
   });
 
   router.get('/orders/make-telegraph', telegraphAction(async (request: Request, response: Response) => {
@@ -1026,7 +1131,8 @@ export const createAdminAppRouter = (
       ? await shopifyOrdersClient.getOrderByGid(orderGid)
       : await shopifyOrdersClient.getOrderByLegacyId(orderId as string);
     const result = await shopifyOrderProcessor.process(order, { source: 'manual-admin-app' });
-    response.json({ ok: true, ...result });
+    const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
+    response.json({ ok: true, ...result, orderName: order.name, shipmentCode: record?.accurateShipmentCode ?? null });
   });
 
   router.get('/orders/create-odoo-sales-order/bulk', async (request: Request, response: Response) => {

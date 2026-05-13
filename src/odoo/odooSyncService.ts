@@ -308,8 +308,10 @@ export class OdooSyncService {
         };
       }
 
-      const partnerId = await this.findOrCreatePartner(order);
-      const orderLines = await this.buildSaleOrderLines(order);
+      const [partnerId, orderLines] = await Promise.all([
+        this.findOrCreatePartner(order),
+        this.buildSaleOrderLines(order)
+      ]);
       const saleOrderId = await this.odooClient.create('sale.order', {
         partner_id: partnerId,
         client_order_ref: orderReference(order),
@@ -380,6 +382,20 @@ export class OdooSyncService {
   async confirmSalesOrderDelivery(saleOrderId: number): Promise<void> {
     this.assertEnabled();
     const saleOrder = await this.getSaleOrderForOperations(saleOrderId);
+    await this.validatePickingsForSaleOrder(saleOrder, 'customer');
+  }
+
+  /**
+   * Optimized combined: fetches the SO once then completes manufacturing,
+   * validates internal pickings, and validates customer pickings in one pass.
+   * Saves one extra getSaleOrderForOperations round-trip vs calling
+   * prepareSalesOrderStock + confirmSalesOrderDelivery separately.
+   */
+  async prepareSalesOrderAndConfirmDelivery(saleOrderId: number): Promise<void> {
+    this.assertEnabled();
+    const saleOrder = await this.getSaleOrderForOperations(saleOrderId);
+    await this.completeManufacturingForSaleOrder(saleOrder);
+    await this.validatePickingsForSaleOrder(saleOrder, 'internal');
     await this.validatePickingsForSaleOrder(saleOrder, 'customer');
   }
 
@@ -586,10 +602,10 @@ export class OdooSyncService {
         { limit: 100, order: 'id asc' }
       );
 
-    const visited = new Set<number>();
-    for (const mo of rootMos) {
-      await this.completeManufacturingTree(mo, visited);
-    }
+    // Process root MOs in parallel — each gets its own visited set so independent trees
+    // don't block each other. Shared sub-MOs may be processed twice but the
+    // ['done','cancel'] guard in completeManufacturingOrder makes that safe.
+    await Promise.all(rootMos.map((mo) => this.completeManufacturingTree(mo, new Set<number>())));
   }
 
   private async completeManufacturingTree(mo: ManufacturingOrderRecord, visited: Set<number>): Promise<void> {
@@ -656,9 +672,8 @@ export class OdooSyncService {
       return !/customers/i.test(destination) && /stock/i.test(source);
     });
 
-    for (const picking of filtered) {
-      await this.validatePicking(picking);
-    }
+    // Pickings of the same phase are independent — validate them in parallel
+    await Promise.all(filtered.map((picking) => this.validatePicking(picking)));
   }
 
   private async validatePicking(picking: StockPickingRecord): Promise<void> {
@@ -673,14 +688,15 @@ export class OdooSyncService {
       { limit: 100 }
     );
 
-    for (const move of moves) {
+    // Process each move in parallel — they are independent within the same picking
+    await Promise.all(moves.map(async (move) => {
       const quantity = Number(move.quantity || move.product_uom_qty || 0);
-      if (quantity <= 0) continue;
+      if (quantity <= 0) return;
       if (!move.move_line_ids?.length) {
         await this.createMoveLineForMove(picking.id, move, quantity);
       }
       await this.odooClient.call('stock.move', 'write', [[move.id], { quantity, picked: true }]);
-    }
+    }));
 
     const result = await this.odooClient.call<unknown>('stock.picking', 'button_validate', [[picking.id]]);
     await this.processOdooWizardResult(result);

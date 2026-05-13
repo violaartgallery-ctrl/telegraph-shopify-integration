@@ -59,19 +59,10 @@ export class ShopifyOrderProcessor {
           shipmentCode: existing.accurateShipmentCode,
           context
         });
-        if (existing.odooSaleOrderId && existing.odooSaleOrderName) {
-          return {
-            skipped: true,
-            reason: 'duplicate-order',
-            fulfillment,
-            odoo: {
-              skipped: true,
-              reason: 'odoo-sales-order-already-synced',
-              saleOrderName: existing.odooSaleOrderName,
-              created: false
-            }
-          };
-        }
+        // Always call syncOdooSalesOrder even when SO is already in DB.
+        // prepareSalesOrderAndConfirmDelivery is idempotent (skips 'done' states),
+        // so this safely handles retries where a previous attempt timed out during
+        // manufacturing / picking validation after saving the SO to the database.
         const odoo = await this.syncOdooSalesOrder(order, {
           shipmentId: existing.accurateShipmentId,
           shipmentCode: existing.accurateShipmentCode,
@@ -245,11 +236,15 @@ export class ShopifyOrderProcessor {
     }
 
     try {
-      const saleOrder = await this.odooSyncService.ensureSalesOrder(order, {
-        accurateShipmentCode: params.shipmentCode,
-        trackingUrl: telegraphDashboardUrl(params.shipmentId)
-      });
-      await this.odooSyncService.confirmSalesOrderDelivery(saleOrder.id);
+      // Use prepareStock:false so ensureSalesOrder doesn't call getSaleOrderForOperations,
+      // then call prepareSalesOrderAndConfirmDelivery which fetches the SO once and does
+      // manufacturing + internal pickings + customer delivery in a single combined pass.
+      const saleOrder = await this.odooSyncService.ensureSalesOrder(
+        order,
+        { accurateShipmentCode: params.shipmentCode, trackingUrl: telegraphDashboardUrl(params.shipmentId) },
+        { prepareStock: false }
+      );
+      await this.odooSyncService.prepareSalesOrderAndConfirmDelivery(saleOrder.id);
 
       logger.info('Odoo sales order delivery confirmed after Telegraph shipment', {
         shopifyOrderId: String(order.id),
