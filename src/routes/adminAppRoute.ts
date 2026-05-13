@@ -828,9 +828,9 @@ export const createAdminAppRouter = (
     const orderIds = (Array.isArray(rawOrderIds) ? rawOrderIds : [rawOrderIds])
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
 
-    const rows = [];
-    for (const rawOrderId of orderIds) {
-      try {
+    // Process all orders in parallel to avoid Netlify function timeout on large selections.
+    const settled = await Promise.allSettled(
+      orderIds.map(async (rawOrderId) => {
         const order = await getOrderByRawId(rawOrderId);
         const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
         const customerName = order.shipping_address?.name
@@ -838,26 +838,24 @@ export const createAdminAppRouter = (
           ?? [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ');
 
         if (record?.accurateShipmentId) {
-          rows.push({
+          return {
             orderId: rawOrderId,
             orderName: order.name,
             customerName,
-            status: 'already-created',
+            status: 'already-created' as const,
             detail: 'Telegraph shipment already exists for this order.',
             shipmentCode: record.accurateShipmentCode
-          });
-          continue;
+          };
         }
 
         if (!getTelegraphLocationSelection(order)) {
-          rows.push({
+          return {
             orderId: rawOrderId,
             orderName: order.name,
             customerName,
-            status: 'needs-location',
+            status: 'needs-location' as const,
             detail: 'Telegraph governorate and area are missing. Use the single-order button first.'
-          });
-          continue;
+          };
         }
 
         const result = await shopifyOrderProcessor.process(order, {
@@ -868,22 +866,26 @@ export const createAdminAppRouter = (
         });
         const updatedRecord = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
 
-        rows.push({
+        return {
           orderId: rawOrderId,
           orderName: order.name,
           customerName,
-          status: result.skipped ? 'skipped' : 'created',
+          status: (result.skipped ? 'skipped' : 'created') as 'skipped' | 'created',
           detail: shipmentResultMessage(result),
           shipmentCode: updatedRecord?.accurateShipmentCode
-        });
-      } catch (error) {
-        rows.push({
-          orderId: rawOrderId,
-          status: 'error',
-          detail: error instanceof Error ? error.message : 'Could not process this order.'
-        });
-      }
-    }
+        };
+      })
+    );
+
+    const rows = settled.map((outcome, i) =>
+      outcome.status === 'fulfilled'
+        ? outcome.value
+        : {
+            orderId: orderIds[i],
+            status: 'error' as const,
+            detail: outcome.reason instanceof Error ? outcome.reason.message : 'Could not process this order.'
+          }
+    );
 
     response.type('html').send(renderBulkShipmentReview({
       title: 'Make Telegraph shipments',
@@ -1110,9 +1112,9 @@ export const createAdminAppRouter = (
     const orderIds = (Array.isArray(rawOrderIds) ? rawOrderIds : [rawOrderIds])
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
 
-    const rows = [];
-    for (const rawOrderId of orderIds) {
-      try {
+    // Process all orders in parallel to avoid Netlify function timeout on large selections.
+    const settled = await Promise.allSettled(
+      orderIds.map(async (rawOrderId) => {
         const order = await getOrderByRawId(rawOrderId);
         const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
         const customerName = order.shipping_address?.name
@@ -1120,51 +1122,54 @@ export const createAdminAppRouter = (
           ?? [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ');
 
         if (record?.odooSaleOrderName) {
-          rows.push({
+          return {
             orderId: rawOrderId,
             orderName: order.name,
             customerName,
-            status: 'already-created',
+            status: 'already-created' as const,
             detail: 'Odoo Sales Order already exists for this order.',
             saleOrderName: record.odooSaleOrderName
-          });
-          continue;
+          };
         }
 
         const preview = await odooSyncService.previewOrder(order);
         if (!preview.ready) {
-          rows.push({
+          return {
             orderId: rawOrderId,
             orderName: order.name,
             customerName,
-            status: 'not-ready',
-            detail: preview.products
-              .filter((product) => !product.ready)
-              .map((product) => `${product.title}: ${product.reason ?? 'not ready'}`)
-              .join('; ') || 'Order is not ready for Odoo.'
-          });
-          continue;
+            status: 'not-ready' as const,
+            detail:
+              preview.products
+                .filter((product) => !product.ready)
+                .map((product) => `${product.title}: ${product.reason ?? 'not ready'}`)
+                .join('; ') || 'Order is not ready for Odoo.'
+          };
         }
 
         const result = await odooSyncService.ensureSalesOrder(order, record ?? undefined, {
           prepareStock: false
         });
-        rows.push({
+        return {
           orderId: rawOrderId,
           orderName: order.name,
           customerName,
-          status: result.created ? 'created' : 'already-created',
+          status: (result.created ? 'created' : 'already-created') as 'created' | 'already-created',
           detail: result.created ? 'Odoo Sales Order created successfully.' : 'Odoo Sales Order already exists.',
           saleOrderName: result.name
-        });
-      } catch (error) {
-        rows.push({
-          orderId: rawOrderId,
-          status: 'error',
-          detail: error instanceof Error ? error.message : 'Could not process this order.'
-        });
-      }
-    }
+        };
+      })
+    );
+
+    const rows = settled.map((outcome, i) =>
+      outcome.status === 'fulfilled'
+        ? outcome.value
+        : {
+            orderId: orderIds[i],
+            status: 'error' as const,
+            detail: outcome.reason instanceof Error ? outcome.reason.message : 'Could not process this order.'
+          }
+    );
 
     response.type('html').send(renderBulkOdooReview({
       title: 'Make Odoo Sales Orders',
