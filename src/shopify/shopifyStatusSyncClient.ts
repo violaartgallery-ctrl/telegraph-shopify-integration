@@ -34,6 +34,21 @@ const TAGS_REMOVE_MUTATION = `
   }
 `;
 
+const ORDER_MARK_AS_PAID_MUTATION = `
+  mutation TelegraphOrderMarkAsPaid($input: OrderMarkAsPaidInput!) {
+    orderMarkAsPaid(input: $input) {
+      order {
+        id
+        displayFinancialStatus
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
 const toOrderGid = (id: string | number): string => `gid://shopify/Order/${id}`;
 
 const statusTagsToReplace = [
@@ -67,6 +82,12 @@ const statusTagsToReplace = [
   'accurate-rjct',
   'accurate-unknown'
 ];
+
+export interface MarkOrderAsPaidResult {
+  skipped: boolean;
+  reason?: string;
+  financialStatus?: string;
+}
 
 export interface ShopifyStatusUpdateInput {
   orderId: string | number;
@@ -153,5 +174,31 @@ export const shopifyStatusSyncClient = {
     if (tagsResponse.tagsAdd.userErrors.length > 0) {
       throw new Error(tagsResponse.tagsAdd.userErrors.map((entry) => entry.message).join('; '));
     }
+  },
+
+  markOrderAsPaid: async (orderId: string | number): Promise<MarkOrderAsPaidResult> => {
+    const ownerId = toOrderGid(orderId);
+
+    const response = await requestShopifyAdmin<{
+      orderMarkAsPaid: {
+        order: { id: string; displayFinancialStatus: string } | null;
+        userErrors: Array<{ field?: string[] | null; message: string }>;
+      };
+    }>(ORDER_MARK_AS_PAID_MUTATION, { input: { id: ownerId } });
+
+    const userErrors = response.orderMarkAsPaid.userErrors;
+    if (userErrors.length > 0) {
+      const messages = userErrors.map((entry) => entry.message).join('; ');
+      // Idempotent: already paid is not a failure — it means we are safe
+      if (/already paid/i.test(messages)) {
+        return { skipped: true, reason: 'already-paid' };
+      }
+      throw new Error(`Shopify orderMarkAsPaid failed: ${messages}`);
+    }
+
+    return {
+      skipped: false,
+      financialStatus: response.orderMarkAsPaid.order?.displayFinancialStatus
+    };
   }
 };

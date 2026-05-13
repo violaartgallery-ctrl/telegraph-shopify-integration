@@ -154,6 +154,36 @@ export class ShipmentStatusSyncService {
       }
     }
 
+    if (projection.collectionStatus === 'collected') {
+      try {
+        const markResult = await shopifyStatusSyncClient.markOrderAsPaid(record.shopifyOrderId);
+        if (markResult.skipped) {
+          logger.info('Shopify order already paid — mark-as-paid skipped', {
+            shopifyOrderId: record.shopifyOrderId,
+            reason: markResult.reason
+          });
+        } else {
+          logger.info('Shopify order marked as paid', {
+            shopifyOrderId: record.shopifyOrderId,
+            financialStatus: markResult.financialStatus
+          });
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'Unknown Shopify mark-as-paid error';
+        logger.error('Failed to mark Shopify order as paid', {
+          recordId: record.id,
+          shopifyOrderId: record.shopifyOrderId,
+          reason
+        });
+        await failedPayloadService.save({
+          source: 'shopify-mark-as-paid',
+          externalId: record.shopifyOrderId,
+          reason,
+          payload: record
+        });
+      }
+    }
+
     if ((projection.collectionStatus === 'returned' || projection.collectionStatus === 'returned-settled') && this.odooSyncService) {
       try {
         await this.odooSyncService.syncReturnedShipmentCharge(record.id);
