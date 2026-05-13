@@ -59,10 +59,24 @@ export class ShopifyOrderProcessor {
           shipmentCode: existing.accurateShipmentCode,
           context
         });
-        // Always call syncOdooSalesOrder even when SO is already in DB.
-        // prepareSalesOrderAndConfirmDelivery is idempotent (skips 'done' states),
-        // so this safely handles retries where a previous attempt timed out during
-        // manufacturing / picking validation after saving the SO to the database.
+        // If delivery was already fully confirmed (manufacturing + pickings all done),
+        // skip Odoo entirely — just return the cached result instantly.
+        if (existing.odooSyncStatus === 'delivery-confirmed' && existing.odooSaleOrderName) {
+          return {
+            skipped: true,
+            reason: 'duplicate-order',
+            fulfillment,
+            odoo: {
+              skipped: true,
+              reason: 'odoo-sales-order-already-synced',
+              saleOrderName: existing.odooSaleOrderName,
+              created: false
+            }
+          };
+        }
+        // SO exists in DB but delivery not yet confirmed — call syncOdooSalesOrder
+        // which runs prepareSalesOrderAndConfirmDelivery (idempotent: skips 'done' states).
+        // This handles retries where a previous attempt timed out mid-manufacturing/picking.
         const odoo = await this.syncOdooSalesOrder(order, {
           shipmentId: existing.accurateShipmentId,
           shipmentCode: existing.accurateShipmentCode,
@@ -245,6 +259,9 @@ export class ShopifyOrderProcessor {
         { prepareStock: false }
       );
       await this.odooSyncService.prepareSalesOrderAndConfirmDelivery(saleOrder.id);
+
+      // Mark delivery fully confirmed so future retries skip Odoo entirely
+      await shipmentRepository.markOdooDeliveryConfirmed(String(order.id));
 
       logger.info('Odoo sales order delivery confirmed after Telegraph shipment', {
         shopifyOrderId: String(order.id),

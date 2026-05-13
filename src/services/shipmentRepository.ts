@@ -266,5 +266,19 @@ export const shipmentRepository = {
         odooLastError: error,
         odooSyncedAt: new Date()
       }
+    }),
+
+  /**
+   * Mark that manufacturing + internal + customer delivery pickings are all confirmed.
+   * After this status is set the retry path skips Odoo entirely (returns cached result).
+   */
+  markOdooDeliveryConfirmed: async (shopifyOrderId: string) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooSyncStatus: 'delivery-confirmed',
+        odooLastError: null,
+        odooSyncedAt: new Date()
+      }
     })
 };
