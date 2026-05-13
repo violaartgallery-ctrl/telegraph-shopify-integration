@@ -3,9 +3,6 @@ command = "npm run build && npm run prisma:deploy"
 publish = "public"
 functions = "dist/netlify/functions"
 
-[functions]
-  timeout = 26
-
 [[redirects]]
 from = "/*"
 to = "/.netlify/functions/api/:splat"
