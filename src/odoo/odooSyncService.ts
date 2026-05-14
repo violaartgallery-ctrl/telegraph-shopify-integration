@@ -411,7 +411,9 @@ export class OdooSyncService {
     }
 
     const order = JSON.parse(record.rawOrderJson) as ShopifyOrder;
-    const saleOrder = await this.ensureSalesOrder(order, record);
+    // prepareStock: false — delivery is already confirmed by the time a shipment is collected.
+    // Skips manufacturing + picking validation (already done) saving ~5-8 s of Odoo calls.
+    const saleOrder = await this.ensureSalesOrder(order, record, { prepareStock: false });
     const invoice = await this.findOrCreatePostedSaleInvoice(String(order.id), saleOrder.id);
 
     if (!env.odoo.paymentJournalId) {

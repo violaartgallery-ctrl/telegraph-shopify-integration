@@ -205,18 +205,23 @@ export class ShipmentStatusSyncService {
   }
 
   async syncOpenShipments(): Promise<{ processed: number; failed: number; skipped: number }> {
-    // T-1 FIX: Add time-budget guard to avoid Netlify 26 s function timeout mid-run.
-    // Records that are not reached this run remain open and will be retried next scheduled run.
-    // Records are NOT marked as failed solely because the budget ran out.
+    // Time-budget guard: stop before Netlify cuts us off.
+    // Records not reached this run remain open and retry next scheduled run.
     const budgetMs = env.syncTimeBudgetMs;
     const startTime = Date.now();
+
+    // Concurrency: process up to 3 shipments in parallel per batch.
+    // Each syncRecord is independent (separate SO / invoice / payment) so parallel is safe.
+    // Running in parallel means 3 shipments complete in the time of the slowest one (~11s)
+    // instead of ~27s sequentially — safely within the 20s budget.
+    const CONCURRENCY = 3;
 
     const openShipments = await shipmentRepository.findOpenShipments(env.syncOpenShipmentsBatchSize);
     let processed = 0;
     let failed = 0;
     let skipped = 0;
 
-    for (const record of openShipments) {
+    for (let i = 0; i < openShipments.length; i += CONCURRENCY) {
       const elapsedMs = Date.now() - startTime;
       if (elapsedMs >= budgetMs) {
         skipped = openShipments.length - processed - failed;
@@ -230,22 +235,28 @@ export class ShipmentStatusSyncService {
         break;
       }
 
-      try {
-        await this.syncRecord(record);
-        processed += 1;
-      } catch (error) {
-        failed += 1;
-        const reason = error instanceof Error ? error.message : 'Unknown sync error';
-        logger.error('Failed to sync shipment record', { recordId: record.id, reason });
-        if (/shipment not found/i.test(reason)) {
-          await shipmentRepository.clearDeletedShipment(record.shopifyOrderId, reason);
+      const batch = openShipments.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(batch.map((record) => this.syncRecord(record)));
+
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        const record = batch[j];
+        if (result.status === 'fulfilled') {
+          processed += 1;
+        } else {
+          failed += 1;
+          const reason = result.reason instanceof Error ? result.reason.message : 'Unknown sync error';
+          logger.error('Failed to sync shipment record', { recordId: record.id, reason });
+          if (/shipment not found/i.test(reason)) {
+            await shipmentRepository.clearDeletedShipment(record.shopifyOrderId, reason);
+          }
+          await failedPayloadService.save({
+            source: 'accurate-polling-sync',
+            externalId: record.accurateShipmentCode ?? String(record.accurateShipmentId ?? record.id),
+            reason,
+            payload: record
+          });
         }
-        await failedPayloadService.save({
-          source: 'accurate-polling-sync',
-          externalId: record.accurateShipmentCode ?? String(record.accurateShipmentId ?? record.id),
-          reason,
-          payload: record
-        });
       }
     }
 

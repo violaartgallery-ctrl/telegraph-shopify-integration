@@ -7,6 +7,7 @@ import { ShopifyOrderProcessor } from '../services/shopifyOrderProcessor.js';
 import { getTelegraphLocationSelection, withTelegraphLocationSelection } from '../services/telegraphLocation.js';
 import { shopifyOrdersClient } from '../shopify/shopifyOrdersClient.js';
 import { OdooSyncService } from '../odoo/odooSyncService.js';
+import { ShipmentStatusSyncService } from '../services/shipmentStatusSyncService.js';
 import { ValidationError } from '../lib/errors.js';
 
 interface ZoneEntry {
@@ -891,7 +892,8 @@ const telegraphAction = (
 export const createAdminAppRouter = (
   shopifyOrderProcessor: ShopifyOrderProcessor,
   accurateClient: AccurateClient,
-  odooSyncService: OdooSyncService
+  odooSyncService: OdooSyncService,
+  shipmentStatusSyncService?: ShipmentStatusSyncService
 ) => {
   const router = express.Router();
 
@@ -1376,6 +1378,46 @@ export const createAdminAppRouter = (
         parentId: Number.parseInt(request.params.parentId, 10)
       })
     });
+  });
+
+  // Manual sync trigger — accepts a list of shipment codes or shopify order IDs.
+  // Used for testing and ad-hoc recovery. Returns per-record timing so we can spot timeouts.
+  router.post('/api/sync-shipments', express.json({ limit: '10kb' }), async (request: Request, response: Response) => {
+    if (!shipmentStatusSyncService) {
+      response.status(503).json({ ok: false, message: 'Sync service not available' });
+      return;
+    }
+    const codes: string[] = Array.isArray(request.body?.codes) ? request.body.codes : [];
+    if (codes.length === 0) {
+      // No codes provided → run the full scheduled sync (same as the cron job)
+      const start = Date.now();
+      const result = await shipmentStatusSyncService.syncOpenShipments();
+      response.json({ ok: true, mode: 'full', elapsedMs: Date.now() - start, ...result });
+      return;
+    }
+
+    // Sync only the specified codes
+    const results: Array<{ code: string; status: string; elapsedMs: number; error?: string }> = [];
+    for (const code of codes) {
+      const start = Date.now();
+      try {
+        const record = await shipmentRepository.findByReference(code);
+        if (!record) {
+          results.push({ code, status: 'not-found', elapsedMs: Date.now() - start });
+          continue;
+        }
+        await shipmentStatusSyncService.syncRecord(record);
+        results.push({ code, status: 'ok', elapsedMs: Date.now() - start });
+      } catch (error) {
+        results.push({
+          code,
+          status: 'error',
+          elapsedMs: Date.now() - start,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    response.json({ ok: true, mode: 'selective', results });
   });
 
   return router;

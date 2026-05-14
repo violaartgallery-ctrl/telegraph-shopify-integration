@@ -55,7 +55,7 @@ export const createApp = () => {
   app.use('/orders', adminAuth);
   app.use('/api', adminAuth);
 
-  app.use(createAdminAppRouter(services.shopifyOrderProcessor, services.accurateClient, services.odooSyncService));
+  app.use(createAdminAppRouter(services.shopifyOrderProcessor, services.accurateClient, services.odooSyncService, services.shipmentStatusSyncService));
 
   app.post(
     '/webhooks/shopify/orders-create',

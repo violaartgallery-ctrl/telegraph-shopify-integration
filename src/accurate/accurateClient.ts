@@ -160,6 +160,9 @@ const isTransientError = (error: unknown): boolean => {
 export class AccurateClient {
   private token?: string;
   private tokenExpiresAt?: number;
+  // Shared login promise — prevents multiple concurrent calls from each triggering
+  // a separate login request (race condition when syncRecord runs in parallel).
+  private loginPromise?: Promise<void>;
 
   private async login(): Promise<void> {
     logger.info('Authenticating with Accurate API');
@@ -176,9 +179,16 @@ export class AccurateClient {
   }
 
   private async ensureAuthenticated(): Promise<void> {
-    if (!this.token || !this.tokenExpiresAt || Date.now() >= this.tokenExpiresAt) {
-      await this.login();
+    if (this.token && this.tokenExpiresAt && Date.now() < this.tokenExpiresAt) {
+      return;
     }
+    // If a login is already in flight, wait for it instead of starting a second one.
+    if (!this.loginPromise) {
+      this.loginPromise = this.login().finally(() => {
+        this.loginPromise = undefined;
+      });
+    }
+    await this.loginPromise;
   }
 
   private async requestWithAuth<T>(document: string, variables?: Record<string, unknown>): Promise<T> {
@@ -204,7 +214,14 @@ export class AccurateClient {
       return await retry(run, isTransientError, 3, 500);
     } catch (error) {
       if (isUnauthorized(error)) {
-        await this.login();
+        // Re-use loginPromise mutex here too so parallel requests don't each
+        // trigger a separate re-login after a shared 401.
+        if (!this.loginPromise) {
+          this.loginPromise = this.login().finally(() => {
+            this.loginPromise = undefined;
+          });
+        }
+        await this.loginPromise;
         return await retry(run, isTransientError, 2, 300);
       }
       logger.error('Accurate GraphQL request failed', error);
