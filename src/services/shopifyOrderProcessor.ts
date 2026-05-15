@@ -8,6 +8,7 @@ import { shopifyFulfillmentClient } from '../shopify/shopifyFulfillmentClient.js
 import { shipmentCodeService } from './shipmentCodeService.js';
 import { ValidationError } from '../lib/errors.js';
 import type { ShopifyOrder } from '../types/shopify.js';
+// OdooSyncService kept for constructor type — no longer called synchronously here.
 import type { OdooSyncService } from '../odoo/odooSyncService.js';
 
 interface ProcessResult {
@@ -59,8 +60,7 @@ export class ShopifyOrderProcessor {
           shipmentCode: existing.accurateShipmentCode,
           context
         });
-        // If delivery was already fully confirmed (manufacturing + pickings all done),
-        // skip Odoo entirely — just return the cached result instantly.
+        // If delivery was already fully confirmed, skip Odoo entirely.
         if (existing.odooSyncStatus === 'delivery-confirmed' && existing.odooSaleOrderName) {
           return {
             skipped: true,
@@ -74,14 +74,28 @@ export class ShopifyOrderProcessor {
             }
           };
         }
-        // SO exists in DB but delivery not yet confirmed — call syncOdooSalesOrder
-        // which runs prepareSalesOrderAndConfirmDelivery (idempotent: skips 'done' states).
-        // This handles retries where a previous attempt timed out mid-manufacturing/picking.
-        const odoo = await this.syncOdooSalesOrder(order, {
-          shipmentId: existing.accurateShipmentId,
-          shipmentCode: existing.accurateShipmentCode,
-          context
-        });
+
+        // Odoo is handled asynchronously by the background queue.
+        // Determine correct response based on current queue status.
+        const ACTIVE_STATUSES = [
+          'odoo-so-pending', 'odoo-so-creating',
+          'odoo-stock-pending', 'odoo-stock-preparing',
+          'odoo-delivery-pending', 'odoo-delivery-confirming',
+          'odoo-failed-retryable'
+        ];
+        const currentOdooStatus = existing.odooSyncStatus ?? null;
+        let odoo: NonNullable<ProcessResult['odoo']>;
+        if (currentOdooStatus !== null && ACTIVE_STATUSES.includes(currentOdooStatus)) {
+          // Already queued, processing, or scheduled for retry — don't touch
+          odoo = { skipped: true, reason: 'queued-for-background' };
+        } else if (currentOdooStatus === 'failed') {
+          // Permanent failure — requires explicit Manual Retry from the dashboard
+          odoo = { skipped: true, reason: 'odoo-failed-needs-manual-retry' };
+        } else {
+          // null status — queue it for the first time
+          await shipmentRepository.markOdooSoPending(orderId);
+          odoo = { skipped: true, reason: 'queued-for-background' };
+        }
         return { skipped: true, reason: 'duplicate-order', fulfillment, odoo };
       }
     }
@@ -122,11 +136,10 @@ export class ShopifyOrderProcessor {
         context
       });
 
-      const odoo = await this.syncOdooSalesOrder(order, {
-        shipmentId: shipment.id,
-        shipmentCode: shipment.code,
-        context
-      });
+      // Queue Odoo processing asynchronously — do not block the button response.
+      // The background cron (process-odoo-queue) picks this up every 5 minutes.
+      await shipmentRepository.markOdooSoPending(orderId);
+      const odoo: NonNullable<ProcessResult['odoo']> = { skipped: true, reason: 'queued-for-background' };
 
       return { skipped: false, fulfillment, odoo };
     } catch (error) {
@@ -237,65 +250,5 @@ export class ShopifyOrderProcessor {
     }
   }
 
-  private async syncOdooSalesOrder(
-    order: ShopifyOrder,
-    params: {
-      shipmentId?: number | null;
-      shipmentCode?: string | null;
-      context?: Record<string, unknown>;
-    }
-  ): Promise<NonNullable<ProcessResult['odoo']>> {
-    if (!this.odooSyncService) {
-      return { skipped: true, reason: 'odoo-sync-not-configured' };
-    }
-
-    try {
-      // Use prepareStock:false so ensureSalesOrder doesn't call getSaleOrderForOperations,
-      // then call prepareSalesOrderAndConfirmDelivery which fetches the SO once and does
-      // manufacturing + internal pickings + customer delivery in a single combined pass.
-      const saleOrder = await this.odooSyncService.ensureSalesOrder(
-        order,
-        { accurateShipmentCode: params.shipmentCode, trackingUrl: telegraphDashboardUrl(params.shipmentId) },
-        { prepareStock: false }
-      );
-      await this.odooSyncService.prepareSalesOrderAndConfirmDelivery(saleOrder.id);
-
-      // Mark delivery fully confirmed so future retries skip Odoo entirely
-      await shipmentRepository.markOdooDeliveryConfirmed(String(order.id));
-
-      logger.info('Odoo sales order delivery confirmed after Telegraph shipment', {
-        shopifyOrderId: String(order.id),
-        saleOrderId: saleOrder.id,
-        saleOrderName: saleOrder.name,
-        created: saleOrder.created
-      });
-
-      return {
-        skipped: false,
-        saleOrderName: saleOrder.name,
-        created: saleOrder.created
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown Odoo sales order error';
-      logger.error('Failed to sync Odoo sales order after Telegraph shipment', {
-        shopifyOrderId: String(order.id),
-        reason: message
-      });
-
-      await failedPayloadService.save({
-        source: 'odoo-sales-order-after-shipment',
-        externalId: String(order.id),
-        reason: message,
-        payload: {
-          orderId: order.id,
-          orderName: order.name,
-          shipmentId: params.shipmentId,
-          shipmentCode: params.shipmentCode
-        },
-        headers: params.context
-      });
-
-      return { skipped: true, reason: `odoo-error: ${message}` };
-    }
-  }
 }
+

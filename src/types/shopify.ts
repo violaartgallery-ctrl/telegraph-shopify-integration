@@ -9,6 +9,7 @@ export interface ShopifyAddress {
   province_code?: string | null;
   zip?: string | null;
   country?: string | null;
+  country_code?: string | null;
   phone?: string | null;
   company?: string | null;
 }
@@ -21,9 +22,11 @@ export interface ShopifyLineItem {
   current_quantity?: number | null;
   price: string;
   variant_title?: string | null;
+  product_id?: number | null;
   discount_allocations?: Array<{
     amount: string;
   }>;
+  properties?: Array<{ name: string; value: string }> | null;
 }
 
 export interface ShopifyNoteAttribute {
@@ -45,6 +48,9 @@ export interface ShopifyOrder {
   total_price: string;
   total_outstanding?: string;
   current_total_price?: string;
+  total_discounts?: string | null;
+  currency?: string | null;
+  discount_codes?: Array<{ code: string; amount: string; type: string }> | null;
   gateway?: string | null;
   payment_gateway_names?: string[];
   test?: boolean;

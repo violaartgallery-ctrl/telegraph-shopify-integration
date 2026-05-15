@@ -44,6 +44,8 @@ model ShipmentRecord {
   odooSyncStatus       String?
   odooLastError        String?
   odooSyncedAt         DateTime?
+  odooAttemptCount     Int       @default(0)
+  odooRetryAt          DateTime?
   rawOrderJson         String?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt

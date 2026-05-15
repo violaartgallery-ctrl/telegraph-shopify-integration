@@ -46,96 +46,242 @@ const renderAdminScriptContext = (adminToken?: string): string => `
 `;
 
 const renderAppShell = (adminToken?: string): string => `<!doctype html>
-<html lang="en">
+<html lang="ar" dir="rtl">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Telegraph Shipments</title>
+    <title>Viola — Telegraph Shipments</title>
     <style>
-      :root { color-scheme: light; --ink:#202223; --muted:#6d7175; --line:#dfe3e8; --soft:#f6f6f7; --brand:#0b6b5d; --danger:#b42318; }
-      body { margin:0; font-family: Arial, sans-serif; color:var(--ink); background:#fff; }
-      main { max-width:1180px; margin:0 auto; padding:28px 20px 48px; }
-      header { display:flex; gap:16px; align-items:center; justify-content:space-between; margin-bottom:22px; }
-      h1 { font-size:28px; margin:0; }
-      .muted { color:var(--muted); }
-      .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-      button, a.button { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; min-height:38px; padding:8px 13px; font-weight:700; cursor:pointer; text-decoration:none; }
+      :root {
+        color-scheme: light;
+        --ink: #202223; --muted: #6d7175; --line: #dfe3e8; --soft: #f6f6f7;
+        --brand: #0b6b5d; --danger: #b42318;
+        --c-complete: #166534; --bg-complete: #dcfce7;
+        --c-processing: #1e40af; --bg-processing: #dbeafe;
+        --c-pending: #854d0e; --bg-pending: #fef9c3;
+        --c-retry: #9a3412; --bg-retry: #ffedd5;
+        --c-failed: #b42318; --bg-failed: #fee2e2;
+        --c-muted: #374151; --bg-muted: #f3f4f6;
+      }
+      *, *::before, *::after { box-sizing: border-box; }
+      body { margin:0; font-family: Arial, sans-serif; font-size:14px; color:var(--ink); background:#f9fafb; }
+      main { max-width:1280px; margin:0 auto; padding:24px 16px 60px; }
+      header { display:flex; gap:16px; align-items:center; justify-content:space-between; margin-bottom:20px; flex-wrap:wrap; }
+      h1 { font-size:24px; margin:0; }
+      h2 { font-size:17px; margin:0 0 14px; }
+      .muted { color:var(--muted); font-size:13px; }
+      .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+      button, a.button { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; min-height:36px; padding:6px 12px; font-weight:700; font-size:13px; cursor:pointer; text-decoration:none; }
       button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
-      button:disabled { cursor:not-allowed; opacity:.55; }
-      section { border-top:1px solid var(--line); padding-top:18px; margin-top:22px; }
-      table { width:100%; border-collapse:collapse; border:1px solid var(--line); }
-      th, td { padding:12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
-      th { background:var(--soft); font-size:13px; color:var(--muted); }
-      .badge { display:inline-block; padding:3px 8px; border-radius:999px; background:var(--soft); font-size:12px; font-weight:700; }
-      .badge.ok { background:#dcfce7; color:#166534; }
-      .badge.warn { background:#fff7ed; color:#9a3412; }
-      .badge.fail { background:#fee2e2; color:var(--danger); }
-      .stack { display:grid; gap:4px; }
-      .locations { max-height:360px; overflow:auto; border:1px solid var(--line); padding:12px; }
-      details { border-bottom:1px solid var(--line); padding:8px 0; }
+      button:disabled { cursor:not-allowed; opacity:.5; }
+      section { background:#fff; border:1px solid var(--line); border-radius:8px; padding:20px; margin-top:20px; }
+      table { width:100%; border-collapse:collapse; }
+      th, td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:right; vertical-align:top; font-size:13px; }
+      th { background:var(--soft); font-size:12px; color:var(--muted); font-weight:700; white-space:nowrap; }
+      tr:last-child td { border-bottom:0; }
+      .stack { display:grid; gap:3px; }
+      .locations { max-height:340px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:12px; }
+      details { border-bottom:1px solid var(--line); padding:6px 0; }
       details:last-child { border-bottom:0; }
-      summary { cursor:pointer; font-weight:700; }
-      .subzones { display:flex; gap:6px; flex-wrap:wrap; padding:8px 0 4px; }
-      .toast { min-height:22px; font-weight:700; }
+      summary { cursor:pointer; font-weight:700; font-size:13px; }
+      .subzones { display:flex; gap:6px; flex-wrap:wrap; padding:6px 0 2px; }
+      .toast { min-height:20px; font-weight:700; font-size:13px; margin-bottom:4px; }
+
+      /* ── Summary cards ─────────────────────────────────── */
+      .summary-grid { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+      .summary-card {
+        flex:1; min-width:110px; max-width:180px;
+        border:1px solid var(--line); border-radius:8px;
+        padding:14px 16px; background:#fff; text-align:center;
+      }
+      .summary-card .card-count { font-size:26px; font-weight:700; line-height:1.1; }
+      .summary-card .card-label { font-size:12px; color:var(--muted); margin-top:4px; }
+      .summary-card.complete  { border-color:var(--bg-complete);  background:#f0fdf4; }
+      .summary-card.complete  .card-count { color:var(--c-complete); }
+      .summary-card.processing{ border-color:#bfdbfe; background:#eff6ff; }
+      .summary-card.processing .card-count { color:var(--c-processing); }
+      .summary-card.pending   { border-color:#fde68a; background:#fefce8; }
+      .summary-card.pending   .card-count { color:var(--c-pending); }
+      .summary-card.retry     { border-color:#fed7aa; background:#fff7ed; }
+      .summary-card.retry     .card-count { color:var(--c-retry); }
+      .summary-card.failed    { border-color:#fecaca; background:#fff5f5; }
+      .summary-card.failed    .card-count { color:var(--c-failed); }
+      .summary-card.muted-card { border-color:var(--line); }
+      .summary-card.muted-card .card-count { color:var(--muted); }
+
+      /* ── Status badges ─────────────────────────────────── */
+      .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; white-space:nowrap; }
+      .badge.ok, .badge.status-complete   { background:var(--bg-complete);   color:var(--c-complete); }
+      .badge.status-processing             { background:var(--bg-processing); color:var(--c-processing); }
+      .badge.status-pending                { background:var(--bg-pending);    color:var(--c-pending); }
+      .badge.warn, .badge.status-retry    { background:var(--bg-retry);      color:var(--c-retry); }
+      .badge.fail, .badge.status-failed   { background:var(--bg-failed);     color:var(--c-failed); }
+      .badge.status-muted                  { background:var(--bg-muted);      color:var(--c-muted); }
+
+      /* ── Error text ────────────────────────────────────── */
+      .error-text {
+        display:block; max-width:200px; overflow:hidden;
+        text-overflow:ellipsis; white-space:nowrap;
+        color:var(--c-failed); font-size:11px; cursor:help;
+      }
     </style>
   </head>
   <body>
     <main>
       <header>
         <div>
-          <h1>Telegraph Shipments</h1>
-          <div class="muted">Create Accurate shipments manually and verify location values.</div>
+          <h1>🚚 Viola — Telegraph Shipments</h1>
+          <div class="muted">إنشاء بوالص Accurate يدويًا ومتابعة حالة Odoo في الخلفية</div>
         </div>
         <div class="toolbar">
-          <button id="refresh" type="button">Refresh orders</button>
-          <button id="locations-refresh" type="button">Refresh locations</button>
+          <button id="refresh" type="button">🔄 تحديث الأوردرات</button>
+          <button id="locations-refresh" type="button">📍 تحديث المناطق</button>
         </div>
       </header>
       <div id="toast" class="toast"></div>
       <section>
-        <h2>Orders</h2>
-        <div id="orders">Loading orders...</div>
+        <h2>الأوردرات الأخيرة</h2>
+        <div id="summary-cards" class="summary-grid"></div>
+        <div id="orders">جاري التحميل...</div>
       </section>
       <section>
-        <h2>Accurate locations</h2>
-        <p class="muted">These governorates and areas come directly from Accurate in the same dropdown order.</p>
-        <div id="locations" class="locations">Loading locations...</div>
+        <h2>مناطق Accurate</h2>
+        <p class="muted">المحافظات والمناطق مباشرةً من Accurate بنفس ترتيب الـ dropdown.</p>
+        <div id="locations" class="locations">جاري التحميل...</div>
       </section>
     </main>
     <script>
       ${renderAdminScriptContext(adminToken)}
+
+      // ── Utilities ──────────────────────────────────────────────────────────
       const toast = document.getElementById('toast');
       const setToast = (message, error = false) => {
         toast.textContent = message || '';
         toast.style.color = error ? '#b42318' : '#0b6b5d';
       };
-      const html = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-      const statusBadge = (status) => {
-        const value = status || 'not-created';
-        const cls = /created|delivered|pending/i.test(value) ? 'ok' : /failed/i.test(value) ? 'fail' : 'warn';
-        return '<span class="badge ' + cls + '">' + html(value) + '</span>';
+      const html = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+      // ── Odoo status → Arabic label ─────────────────────────────────────────
+      const ODOO_LABELS = {
+        'odoo-so-pending':          'في انتظار إنشاء Sales Order',
+        'odoo-so-creating':         'جاري إنشاء Sales Order',
+        'odoo-stock-pending':       'في انتظار التصنيع والمخزون',
+        'odoo-stock-preparing':     'جاري التصنيع والمخزون',
+        'odoo-delivery-pending':    'في انتظار تأكيد الدليفري',
+        'odoo-delivery-confirming': 'جاري تأكيد الدليفري',
+        'delivery-confirmed':       'مكتمل ✅',
+        'odoo-failed-retryable':    'فشل — سيُعاد تلقائياً',
+        'failed':                   'فشل نهائي ⛔',
       };
+      const odooLabel = (status) => ODOO_LABELS[status] ?? status ?? 'لم يبدأ';
+
+      // ── Status → badge CSS class ───────────────────────────────────────────
+      const odooBadgeClass = (status) => {
+        if (!status) return 'status-muted';
+        if (status === 'delivery-confirmed') return 'status-complete';
+        if (['odoo-so-creating','odoo-stock-preparing','odoo-delivery-confirming'].includes(status)) return 'status-processing';
+        if (['odoo-so-pending','odoo-stock-pending','odoo-delivery-pending'].includes(status)) return 'status-pending';
+        if (status === 'odoo-failed-retryable') return 'status-retry';
+        if (status === 'failed') return 'status-failed';
+        return 'status-muted';
+      };
+      const shipmentBadgeClass = (status) => {
+        if (!status) return 'status-muted';
+        if (/delivered|created/i.test(status)) return 'ok';
+        if (/failed|cancel/i.test(status)) return 'fail';
+        return 'warn';
+      };
+
+      // ── Clean RETRY_FROM prefix from error text ────────────────────────────
+      const cleanError = (err) => err ? err.replace(/^RETRY_FROM:[^|]+\|/, '') : '';
+
+      // ── Format retry time ──────────────────────────────────────────────────
+      const formatRetryAt = (iso) => {
+        if (!iso) return '';
+        const d = new Date(iso);
+        const now = new Date();
+        const diffMin = Math.round((d - now) / 60000);
+        if (diffMin <= 0) return 'الآن';
+        if (diffMin < 60) return 'بعد ' + diffMin + ' د';
+        return 'بعد ' + Math.round(diffMin/60) + ' س';
+      };
+
+      // ── Build summary cards ────────────────────────────────────────────────
+      function renderSummaryCards(orders) {
+        const counts = { complete:0, processing:0, pending:0, retry:0, failed:0, none:0 };
+        for (const o of orders) {
+          const s = o.odooSyncStatus;
+          if (s === 'delivery-confirmed') counts.complete++;
+          else if (['odoo-so-creating','odoo-stock-preparing','odoo-delivery-confirming'].includes(s)) counts.processing++;
+          else if (['odoo-so-pending','odoo-stock-pending','odoo-delivery-pending'].includes(s)) counts.pending++;
+          else if (s === 'odoo-failed-retryable') counts.retry++;
+          else if (s === 'failed') counts.failed++;
+          else counts.none++;
+        }
+        return [
+          { cls:'complete',   label:'مكتمل',         count: counts.complete },
+          { cls:'processing', label:'جاري المعالجة', count: counts.processing },
+          { cls:'pending',    label:'في الانتظار',   count: counts.pending },
+          { cls:'retry',      label:'إعادة محاولة',  count: counts.retry },
+          { cls:'failed',     label:'فشل نهائي',     count: counts.failed },
+          { cls:'muted-card', label:'بدون Odoo',     count: counts.none },
+        ].map((c) =>
+          '<div class="summary-card ' + c.cls + '">' +
+            '<div class="card-count">' + c.count + '</div>' +
+            '<div class="card-label">' + c.label + '</div>' +
+          '</div>'
+        ).join('');
+      }
+
+      // ── Build orders table ─────────────────────────────────────────────────
+      function renderOrdersTable(orders) {
+        if (!orders.length) return '<p class="muted">لا توجد أوردرات.</p>';
+        return '<table><thead><tr>' +
+          '<th>الأوردر</th><th>العميل</th><th>الدفع</th>' +
+          '<th>بوليصة Telegraph</th>' +
+          '<th>حالة Odoo</th><th>Sales Order</th>' +
+          '<th>محاولات</th><th>إعادة المحاولة</th><th>آخر خطأ</th>' +
+          '<th>إجراء</th>' +
+        '</tr></thead><tbody>' +
+        orders.map((o) => {
+          const oodooErr = cleanError(o.odooLastError);
+          return '<tr>' +
+            '<td><div class="stack"><strong>' + html(o.name) + '</strong><span class="muted">' + html(String(o.id)) + '</span></div></td>' +
+            '<td><div class="stack">' + html(o.customerName || '—') + '<span class="muted">' + html(o.phone || '—') + '</span></div></td>' +
+            '<td><div class="stack">' + html(o.financialStatus || '—') + '<span class="muted">' + html(o.gateway || '—') + '</span></div></td>' +
+            '<td><div class="stack">' +
+              '<span class="badge ' + shipmentBadgeClass(o.shipmentStatus) + '">' + html(o.shipmentStatus || 'لم تُنشأ') + '</span>' +
+              (o.shipmentCode ? '<span class="muted">' + html(o.shipmentCode) + '</span>' : '') +
+            '</div></td>' +
+            '<td><span class="badge ' + odooBadgeClass(o.odooSyncStatus) + '">' + html(odooLabel(o.odooSyncStatus)) + '</span></td>' +
+            '<td>' + (o.odooSaleOrderName ? '<span class="muted">' + html(o.odooSaleOrderName) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+            '<td>' + (o.odooAttemptCount > 0 ? o.odooAttemptCount + '/5' : '—') + '</td>' +
+            '<td>' + (o.odooRetryAt ? '<span class="muted" title="' + html(new Date(o.odooRetryAt).toLocaleString('ar')) + '">' + html(formatRetryAt(o.odooRetryAt)) + '</span>' : '—') + '</td>' +
+            '<td>' + (oodooErr ? '<span class="error-text" title="' + html(oodooErr) + '">' + html(oodooErr.slice(0, 55)) + '</span>' : '—') + '</td>' +
+            '<td><div class="stack">' +
+              '<button class="primary" data-order-gid="' + html(o.gid) + '" ' + (o.shipmentCode ? 'disabled' : '') + '>📦 إنشاء بوليصة</button>' +
+              '<button data-odoo-order-gid="' + html(o.gid) + '" ' + (o.odooSaleOrderName ? 'disabled' : '') + '>🔁 Odoo</button>' +
+            '</div></td>' +
+          '</tr>';
+        }).join('') + '</tbody></table>';
+      }
+
+      // ── Load orders ────────────────────────────────────────────────────────
       async function loadOrders() {
         const target = document.getElementById('orders');
-        target.textContent = 'Loading orders...';
+        const cardsEl = document.getElementById('summary-cards');
+        target.textContent = 'جاري التحميل...';
         const response = await fetch(adminUrl('/api/orders'), { headers: adminHeaders });
         const data = await response.json();
         if (!response.ok) throw new Error(data.message || 'Could not load orders');
-        target.innerHTML = '<table><thead><tr><th>Order</th><th>Customer</th><th>Address</th><th>Payment</th><th>Shipment</th><th>Odoo</th><th>Action</th></tr></thead><tbody>' +
-          data.orders.map((order) => '<tr>' +
-            '<td><div class="stack"><strong>' + html(order.name) + '</strong><span class="muted">' + html(order.id) + '</span></div></td>' +
-            '<td>' + html(order.customerName || '-') + '<br><span class="muted">' + html(order.phone || '-') + '</span></td>' +
-            '<td>' + html(order.city || '-') + '<br><span class="muted">' + html(order.province || '-') + '</span></td>' +
-            '<td>' + html(order.financialStatus || '-') + '<br><span class="muted">' + html(order.gateway || '-') + '</span></td>' +
-            '<td>' + statusBadge(order.shipmentStatus) + (order.shipmentCode ? '<br><span class="muted">' + html(order.shipmentCode) + '</span>' : '') + '</td>' +
-            '<td>' + statusBadge(order.odooSyncStatus) + (order.odooSaleOrderName ? '<br><span class="muted">' + html(order.odooSaleOrderName) + '</span>' : '') + (order.odooLastError ? '<br><span class="muted">' + html(order.odooLastError) + '</span>' : '') + '</td>' +
-            '<td><div class="stack"><button class="primary" data-order-gid="' + html(order.gid) + '" ' + (order.shipmentCode ? 'disabled' : '') + '>Make Telegraph shipment</button>' +
-            '<button data-odoo-order-gid="' + html(order.gid) + '" ' + (order.odooSaleOrderName ? 'disabled' : '') + '>Retry Odoo Sales Order</button></div></td>' +
-          '</tr>').join('') + '</tbody></table>';
+        cardsEl.innerHTML = renderSummaryCards(data.orders);
+        target.innerHTML = renderOrdersTable(data.orders);
+
+        // Make Telegraph shipment button
         target.querySelectorAll('button[data-order-gid]').forEach((button) => {
           button.addEventListener('click', async () => {
             button.disabled = true;
-            setToast('Creating shipment...');
+            setToast('جاري إنشاء البوليصة...');
             try {
               const response = await fetch(adminUrl('/api/orders/create-shipment'), {
                 method: 'POST',
@@ -146,10 +292,14 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
               if (!response.ok) throw new Error(payload.message || 'Could not create shipment');
               const odooMessage = payload.odoo?.saleOrderName
                 ? ' Odoo Sales Order: ' + payload.odoo.saleOrderName + '.'
-                : payload.odoo?.reason
-                  ? ' Odoo needs attention: ' + payload.odoo.reason
-                  : '';
-              setToast((payload.skipped ? 'Skipped: ' + payload.reason : 'Shipment created successfully.') + odooMessage);
+                : payload.odoo?.reason === 'queued-for-background'
+                  ? ' Odoo قيد المعالجة في الخلفية.'
+                  : payload.odoo?.reason === 'odoo-failed-needs-manual-retry'
+                    ? ' Odoo فشل سابقًا — يحتاج Manual Retry من الـ Dashboard.'
+                    : payload.odoo?.reason
+                      ? ' Odoo: ' + payload.odoo.reason
+                      : '';
+              setToast((payload.skipped ? 'تخطي: ' + payload.reason : '✅ تم إنشاء البوليصة بنجاح.') + odooMessage);
               await loadOrders();
             } catch (error) {
               setToast(error.message, true);
@@ -157,10 +307,12 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
             }
           });
         });
+
+        // Retry Odoo button
         target.querySelectorAll('button[data-odoo-order-gid]').forEach((button) => {
           button.addEventListener('click', async () => {
             button.disabled = true;
-            setToast('Creating Odoo Sales Order...');
+            setToast('جاري إنشاء Odoo Sales Order...');
             try {
               const response = await fetch(adminUrl('/api/orders/create-odoo-sales-order'), {
                 method: 'POST',
@@ -169,7 +321,7 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
               });
               const payload = await response.json();
               if (!response.ok) throw new Error(payload.message || 'Could not create Odoo Sales Order');
-              setToast(payload.created ? 'Odoo Sales Order created: ' + payload.saleOrderName : 'Already synced: ' + payload.saleOrderName);
+              setToast(payload.created ? '✅ Odoo Sales Order: ' + payload.saleOrderName : 'موجود بالفعل: ' + payload.saleOrderName);
               await loadOrders();
             } catch (error) {
               setToast(error.message, true);
@@ -178,21 +330,25 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
           });
         });
       }
+
+      // ── Load locations ─────────────────────────────────────────────────────
       async function loadLocations() {
         const target = document.getElementById('locations');
-        target.textContent = 'Loading locations...';
+        target.textContent = 'جاري التحميل...';
         const response = await fetch(adminUrl('/api/accurate/locations'), { headers: adminHeaders });
         const data = await response.json();
         if (!response.ok) throw new Error(data.message || 'Could not load locations');
-        target.innerHTML = data.locations.map((zone) => '<details>' +
-          '<summary>' + html(zone.name) + ' <span class="muted">#' + html(zone.id) + '</span></summary>' +
-          '<div class="subzones">' + zone.subzones.map((subzone) => '<span class="badge">' + html(subzone.name) + ' #' + html(subzone.id) + '</span>').join('') + '</div>' +
-        '</details>').join('');
+        target.innerHTML = data.locations.map((zone) =>
+          '<details><summary>' + html(zone.name) + ' <span class="muted">#' + html(zone.id) + '</span></summary>' +
+          '<div class="subzones">' + zone.subzones.map((s) => '<span class="badge status-muted">' + html(s.name) + ' #' + html(s.id) + '</span>').join('') + '</div></details>'
+        ).join('');
       }
-      document.getElementById('refresh').addEventListener('click', () => loadOrders().catch((error) => setToast(error.message, true)));
-      document.getElementById('locations-refresh').addEventListener('click', () => loadLocations().catch((error) => setToast(error.message, true)));
-      loadOrders().catch((error) => setToast(error.message, true));
-      loadLocations().catch((error) => setToast(error.message, true));
+
+      // ── Event listeners ────────────────────────────────────────────────────
+      document.getElementById('refresh').addEventListener('click', () => loadOrders().catch((e) => setToast(e.message, true)));
+      document.getElementById('locations-refresh').addEventListener('click', () => loadLocations().catch((e) => setToast(e.message, true)));
+      loadOrders().catch((e) => setToast(e.message, true));
+      loadLocations().catch((e) => setToast(e.message, true));
     </script>
   </body>
 </html>`;
@@ -222,7 +378,11 @@ const summarizeOrder = async () => {
       odooSyncStatus: record?.odooSyncStatus,
       odooSaleOrderName: record?.odooSaleOrderName,
       odooInvoiceName: record?.odooInvoiceName,
-      odooLastError: record?.odooLastError
+      odooLastError: record?.odooLastError,
+      // Queue tracking fields (added for V7 dashboard)
+      odooAttemptCount: record?.odooAttemptCount ?? 0,
+      odooRetryAt: record?.odooRetryAt ?? null,
+      updatedAt: record?.updatedAt ?? null
     };
   });
 };

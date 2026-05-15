@@ -280,5 +280,219 @@ export const shipmentRepository = {
         odooLastError: null,
         odooSyncedAt: new Date()
       }
-    })
+    }),
+
+  // ─── Background queue methods ─────────────────────────────────────
+
+  /**
+   * Queue Odoo Sales Order creation after Telegraph shipment is created.
+   * SAFE: only queues records where odooSyncStatus IS NULL.
+   * Does NOT requeue 'failed', does NOT downgrade 'delivery-confirmed',
+   * does NOT overwrite any pending/processing/retryable status.
+   * Uses atomic updateMany so concurrent calls are harmless.
+   * Returns true if the record was successfully queued.
+   */
+  markOdooSoPending: async (shopifyOrderId: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        shopifyOrderId,
+        OR: [{ odooSyncStatus: null }]
+      },
+      data: {
+        odooSyncStatus: 'odoo-so-pending',
+        odooLastError: null,
+        odooRetryAt: null,
+        odooSyncedAt: new Date()
+      }
+    });
+    return result.count === 1;
+  },
+
+  /**
+   * Find orders waiting for Odoo processing (any pending stage).
+   * Ordered by odooRetryAt (retries first, nulls last) then createdAt (oldest first).
+   * Only picks orders where accurateShipmentId and rawOrderJson exist.
+   * Failed-retryable entries are only returned once their odooRetryAt has elapsed.
+   */
+  findPendingOdooQueue: async (limit: number) =>
+    await prisma.shipmentRecord.findMany({
+      where: {
+        accurateShipmentId: { not: null },
+        rawOrderJson: { not: null },
+        OR: [
+          { odooSyncStatus: 'odoo-so-pending' },
+          { odooSyncStatus: 'odoo-stock-pending' },
+          { odooSyncStatus: 'odoo-delivery-pending' },
+          {
+            odooSyncStatus: 'odoo-failed-retryable',
+            OR: [
+              { odooRetryAt: null },
+              { odooRetryAt: { lte: new Date() } }
+            ]
+          }
+        ]
+      },
+      orderBy: [
+        { odooRetryAt: 'asc' },
+        { createdAt: 'asc' }
+      ],
+      take: limit
+    }),
+
+  /**
+   * Atomically claim an order for a specific stage transition.
+   * Returns true if this worker successfully claimed it (no other worker did).
+   * Prevents duplicate processing when cron overlaps or user clicks twice.
+   */
+  claimOdooStage: async (recordId: number, fromStatus: string, toStatus: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: { id: recordId, odooSyncStatus: fromStatus },
+      data: {
+        odooSyncStatus: toStatus,
+        odooSyncedAt: new Date()
+      }
+    });
+    return result.count === 1;
+  },
+
+  /**
+   * Mark a stage as successfully completed and advance to next status.
+   * Resets retry fields (attempt count, retryAt, lastError) on every success.
+   * Optionally saves Sales Order ID/name when Stage 1 completes.
+   */
+  markOdooStageSuccess: async (
+    recordId: number,
+    nextStatus: string,
+    data?: { saleOrderId?: number; saleOrderName?: string }
+  ) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        odooSyncStatus: nextStatus,
+        odooLastError: null,
+        odooAttemptCount: 0,
+        odooRetryAt: null,
+        odooSyncedAt: new Date(),
+        ...(data?.saleOrderId ? { odooSaleOrderId: data.saleOrderId } : {}),
+        ...(data?.saleOrderName ? { odooSaleOrderName: data.saleOrderName } : {})
+      }
+    }),
+
+  /**
+   * Mark a stage as failed and schedule retry from the SAME stage.
+   * Retries from the failed stage, not from the beginning.
+   * Backs off with exponential delay: attempt 1→5m, 2→15m, 3→60m, 4→240m.
+   * On attempt 5+, marks permanently as 'failed' (no more auto-retries).
+   * Always stores RETRY_FROM:<stage>|<error> so dashboard can show the failing stage.
+   */
+  markOdooStageFailure: async (recordId: number, retryFromStatus: string, error: string) => {
+    const record = await prisma.shipmentRecord.findUnique({
+      where: { id: recordId },
+      select: { odooAttemptCount: true }
+    });
+
+    const attempt = (record?.odooAttemptCount ?? 0) + 1;
+    const lastError = `RETRY_FROM:${retryFromStatus}|${error}`;
+
+    if (attempt >= 5) {
+      // Permanent failure — store RETRY_FROM so dashboard shows which stage failed finally
+      return await prisma.shipmentRecord.update({
+        where: { id: recordId },
+        data: {
+          odooSyncStatus: 'failed',
+          odooLastError: lastError,
+          odooAttemptCount: attempt,
+          odooRetryAt: null,
+          odooSyncedAt: new Date()
+        }
+      });
+    }
+
+    const backoffMinutes = attempt === 1 ? 5 : attempt === 2 ? 15 : attempt === 3 ? 60 : 240;
+    const retryAt = new Date(Date.now() + backoffMinutes * 60_000);
+
+    return await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        odooSyncStatus: 'odoo-failed-retryable',
+        odooLastError: lastError,
+        odooAttemptCount: attempt,
+        odooRetryAt: retryAt,
+        odooSyncedAt: new Date()
+      }
+    });
+  },
+
+  /**
+   * Save the Odoo Sales Order ID/name onto a record without changing odooSyncStatus.
+   * Used in Stage 2/3 recovery when odooSaleOrderId was missing due to a crash
+   * that happened after SO creation but before the DB was updated.
+   */
+  updateOdooSaleOrderLink: async (recordId: number, data: {
+    saleOrderId: number;
+    saleOrderName: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        odooSaleOrderId: data.saleOrderId,
+        odooSaleOrderName: data.saleOrderName,
+        odooSyncedAt: new Date()
+        // odooSyncStatus intentionally unchanged
+      }
+    }),
+
+  /**
+   * Permanently mark an order as failed (too many attempts or unrecoverable error).
+   * Used as a safety guard when attempt count is already >= 5 at queue-pick time.
+   */
+  markOdooQueueFailed: async (shopifyOrderId: string, error: string) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooSyncStatus: 'failed',
+        odooLastError: error,
+        odooSyncedAt: new Date()
+      }
+    }),
+
+  /**
+   * Recover records stuck in a processing status due to a hard function kill
+   * (e.g. Netlify 26s timeout during a long Odoo call).
+   *
+   * If a record has been in an intermediate "…-creating / …-preparing / …-confirming"
+   * status for longer than `stuckThresholdMinutes` without being updated, it means
+   * the worker that claimed it died without writing a success or failure.
+   *
+   * Recovery rolls the status back to the matching pending stage so the next
+   * queue run picks it up cleanly:
+   *   odoo-so-creating        → odoo-so-pending
+   *   odoo-stock-preparing    → odoo-stock-pending
+   *   odoo-delivery-confirming → odoo-delivery-pending
+   *
+   * Uses odooSyncedAt as the timestamp because claimOdooStage sets it when
+   * transitioning to the processing status.
+   *
+   * Returns the total count of records that were recovered.
+   */
+  recoverStuckProcessingRecords: async (stuckThresholdMinutes = 10): Promise<number> => {
+    const stuckBefore = new Date(Date.now() - stuckThresholdMinutes * 60_000);
+
+    const [r1, r2, r3] = await Promise.all([
+      prisma.shipmentRecord.updateMany({
+        where: { odooSyncStatus: 'odoo-so-creating',        odooSyncedAt: { lt: stuckBefore } },
+        data:  { odooSyncStatus: 'odoo-so-pending' }
+      }),
+      prisma.shipmentRecord.updateMany({
+        where: { odooSyncStatus: 'odoo-stock-preparing',    odooSyncedAt: { lt: stuckBefore } },
+        data:  { odooSyncStatus: 'odoo-stock-pending' }
+      }),
+      prisma.shipmentRecord.updateMany({
+        where: { odooSyncStatus: 'odoo-delivery-confirming', odooSyncedAt: { lt: stuckBefore } },
+        data:  { odooSyncStatus: 'odoo-delivery-pending' }
+      })
+    ]);
+
+    return r1.count + r2.count + r3.count;
+  }
 };
