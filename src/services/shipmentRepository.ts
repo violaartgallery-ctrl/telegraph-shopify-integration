@@ -39,8 +39,60 @@ export const shipmentRepository = {
       }
     }),
 
-  findOpenShipments: async (limit?: number) =>
-    await prisma.shipmentRecord.findMany({
+  findOpenShipments: async (limit?: number) => {
+    const collectedSyncWhere = {
+      accurateShipmentId: { not: null },
+      accurateIsTerminal: true,
+      collectionStatus: 'collected',
+      odooSyncStatus: {
+        in: [
+          'sales-order-created',
+          'sales-order-existing',
+          'delivery-confirmed',
+          'invoice-posted'
+        ]
+      }
+    };
+
+    const collectedRecords = await prisma.shipmentRecord.findMany({
+      where: collectedSyncWhere,
+      orderBy: { updatedAt: 'asc' },
+      ...(limit ? { take: limit } : {})
+    });
+
+    let remaining = limit ? limit - collectedRecords.length : undefined;
+    if (remaining !== undefined && remaining <= 0) {
+      return collectedRecords;
+    }
+
+    const returnedRecords = await prisma.shipmentRecord.findMany({
+      where: {
+        accurateShipmentId: { not: null },
+        accurateIsTerminal: true,
+        collectionStatus: { in: ['returned', 'returned-settled'] },
+        odooSyncStatus: {
+          in: [
+            'sales-order-created',
+            'sales-order-existing',
+            'delivery-confirmed',
+            'invoice-posted'
+          ]
+        },
+        OR: [
+          { returnFees: { gt: 0 } },
+          { returningDueFees: { gt: 0 } }
+        ]
+      },
+      orderBy: { updatedAt: 'asc' },
+      ...(remaining ? { take: remaining } : {})
+    });
+
+    remaining = limit ? limit - collectedRecords.length - returnedRecords.length : undefined;
+    if (remaining !== undefined && remaining <= 0) {
+      return [...collectedRecords, ...returnedRecords];
+    }
+
+    const openRecords = await prisma.shipmentRecord.findMany({
       where: {
         accurateShipmentId: { not: null },
         OR: [
@@ -49,8 +101,11 @@ export const shipmentRepository = {
         ]
       },
       orderBy: { updatedAt: 'asc' },
-      ...(limit ? { take: limit } : {})
-    }),
+      ...(remaining ? { take: remaining } : {})
+    });
+
+    return [...collectedRecords, ...returnedRecords, ...openRecords];
+  },
 
   createPending: async (order: ShopifyOrder) =>
     await prisma.shipmentRecord.upsert({

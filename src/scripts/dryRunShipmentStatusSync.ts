@@ -3,6 +3,7 @@ import { env } from '../config/env.js';
 import { prisma } from '../lib/prisma.js';
 import { OdooClient } from '../odoo/odooClient.js';
 import { projectAccurateStatusToShopify } from '../services/accurateStatusMapper.js';
+import { shipmentRepository } from '../services/shipmentRepository.js';
 
 type OpenShipment = {
   id: number;
@@ -55,30 +56,7 @@ const main = async () => {
   const accurateClient = new AccurateClient();
   const odoo = new OdooClient();
 
-  const rows = await prisma.shipmentRecord.findMany({
-    where: {
-      accurateShipmentId: { not: null },
-      OR: [
-        { accurateIsTerminal: null },
-        { accurateIsTerminal: false }
-      ]
-    },
-    orderBy: { updatedAt: 'asc' },
-    take: limit,
-    select: {
-      id: true,
-      shopifyOrderId: true,
-      shopifyOrderName: true,
-      accurateShipmentId: true,
-      accurateShipmentCode: true,
-      accurateStatus: true,
-      accurateStatusCode: true,
-      collectionStatus: true,
-      odooSaleOrderName: true,
-      odooInvoiceName: true,
-      odooSalePaymentId: true
-    }
-  }) as OpenShipment[];
+  const rows = await shipmentRepository.findOpenShipments(limit) as OpenShipment[];
 
   const report = [];
   for (const row of rows) {

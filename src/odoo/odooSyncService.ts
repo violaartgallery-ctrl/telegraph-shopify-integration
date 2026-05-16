@@ -911,20 +911,28 @@ export class OdooSyncService {
 
   private async createSaleInvoiceFromWizard(saleOrderId: number): Promise<InvoiceRecord> {
     const context = { active_model: 'sale.order', active_ids: [saleOrderId], active_id: saleOrderId };
-    const wizardId = await this.odooClient.create(
-      'sale.advance.payment.inv',
-      { advance_payment_method: 'delivered' },
-      context
-    );
-    const result = await this.odooClient.call<{ res_id?: number; res_ids?: number[] }>(
-      'sale.advance.payment.inv',
-      'create_invoices',
-      [[wizardId]],
-      { context }
-    );
-    const invoiceId = result?.res_id ?? result?.res_ids?.[0];
-    if (invoiceId) {
-      return await this.getInvoice(invoiceId);
+    try {
+      const wizardId = await this.odooClient.create(
+        'sale.advance.payment.inv',
+        { advance_payment_method: 'delivered' },
+        context
+      );
+      const result = await this.odooClient.call<{ res_id?: number; res_ids?: number[] }>(
+        'sale.advance.payment.inv',
+        'create_invoices',
+        [[wizardId]],
+        { context }
+      );
+      const invoiceId = result?.res_id ?? result?.res_ids?.[0];
+      if (invoiceId) {
+        return await this.getInvoice(invoiceId);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      logger.warn('Odoo invoice wizard failed; falling back to sale order lines', {
+        saleOrderId,
+        reason
+      });
     }
 
     const [saleOrder] = await this.odooClient.searchRead<OdooRecord & { name?: string; invoice_ids?: number[] }>(
@@ -938,7 +946,7 @@ export class OdooSyncService {
     }
     const [invoice] = await this.findSaleOrderInvoices(saleOrder);
     if (!invoice) {
-      throw new Error(`Odoo did not create an invoice for sale order ${saleOrder?.name ?? saleOrderId}`);
+      return await this.createManualSaleInvoiceFromOrderLines(saleOrderId);
     }
     return invoice;
   }
@@ -956,10 +964,9 @@ export class OdooSyncService {
     return invoice;
   }
 
-  private async createAndPostInvoice(
-    shopifyOrderId: string,
+  private async createManualSaleInvoiceFromOrderLines(
     saleOrderId: number
-  ): Promise<{ id: number; name: string; created: boolean }> {
+  ): Promise<InvoiceRecord> {
     const [saleOrder] = await this.odooClient.searchRead<OdooRecord & {
       name?: string;
       partner_id?: [number, string] | number;
@@ -1011,18 +1018,7 @@ export class OdooSyncService {
     });
 
     await this.odooClient.call('account.move', 'action_post', [[invoiceId]]);
-    const [invoice] = await this.odooClient.searchRead<InvoiceRecord>(
-      'account.move',
-      [['id', '=', invoiceId]],
-      ['name'],
-      { limit: 1 }
-    );
-    await shipmentRepository.updateOdooInvoice(shopifyOrderId, {
-      invoiceId,
-      invoiceName: invoice.name ?? String(invoice.id),
-      status: 'invoice-posted'
-    });
-    return { id: invoiceId, name: invoice.name ?? String(invoiceId), created: true };
+    return await this.getInvoice(invoiceId);
   }
 
   private async registerPayment(
