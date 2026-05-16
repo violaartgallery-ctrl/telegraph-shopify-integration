@@ -6,7 +6,7 @@ import { shipmentRepository } from './shipmentRepository.js';
 import { isOrderEligibleForShipment } from './orderEligibility.js';
 import { shopifyFulfillmentClient } from '../shopify/shopifyFulfillmentClient.js';
 import { shipmentCodeService } from './shipmentCodeService.js';
-import { ValidationError } from '../lib/errors.js';
+import { UnauthorizedError, ValidationError } from '../lib/errors.js';
 import type { ShopifyOrder } from '../types/shopify.js';
 // OdooSyncService kept for constructor type — no longer called synchronously here.
 import type { OdooSyncService } from '../odoo/odooSyncService.js';
@@ -245,6 +245,16 @@ export class ShopifyOrderProcessor {
       const message = error instanceof Error ? error.message : 'Unknown Telegraph shipment lookup error';
       if (/not found|404|cannot query field|does not exist|no shipment/i.test(message)) {
         return null;
+      }
+      // If the account lacks read permission for shipments, fall back to the
+      // DB-cached shipment data rather than crashing. The shipment still exists —
+      // we just cannot verify it via the API with this account's permissions.
+      if (error instanceof UnauthorizedError && shipmentId && shipmentCode) {
+        logger.warn('Telegraph getShipment unauthorized — using cached shipment data from DB', {
+          shipmentId,
+          shipmentCode
+        });
+        return { id: shipmentId, code: shipmentCode };
       }
       throw error;
     }
