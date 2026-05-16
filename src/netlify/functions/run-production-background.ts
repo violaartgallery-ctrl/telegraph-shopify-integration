@@ -205,13 +205,13 @@ async function runPipeline(chatId: number, execute: boolean): Promise<void> {
   const { shopifyOrdersClient } = await import('../../shopify/shopifyOrdersClient.js');
   let allOrders: ShopifyOrder[];
   try {
-    allOrders = await shopifyOrdersClient.listRecentOrders(50);
+    allOrders = await shopifyOrdersClient.listRecentOrders(250, 'tag:confirmed fulfillment_status:unfulfilled');
   } catch (err) {
     await sendMessage(chatId, `❌ فشل في جلب الأوردرات للشحن: ${String(err).slice(0, 200)}`);
     return;
   }
 
-  const orders = allOrders.filter((o) => hasConfirmedTag(o) && !o.test);
+  const orders = allOrders.filter((o) => !o.test);
   if (!orders.length) {
     await sendMessage(chatId, '✅ مفيش أوردرات confirmed للشحن دلوقتي.');
     return;

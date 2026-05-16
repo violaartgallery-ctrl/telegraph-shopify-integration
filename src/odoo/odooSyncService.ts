@@ -754,8 +754,8 @@ export class OdooSyncService {
   private async findExistingSaleOrder(order: ShopifyOrder): Promise<(OdooRecord & { name?: string }) | undefined> {
     const [saleOrder] = await this.odooClient.searchRead<OdooRecord & { name?: string }>(
       'sale.order',
-      ['|', ['client_order_ref', '=', orderReference(order)], ['origin', '=', order.name]],
-      ['name'],
+      ['&', ['state', '!=', 'cancel'], '|', ['client_order_ref', '=', orderReference(order)], ['origin', '=', order.name]],
+      ['name', 'state'],
       { limit: 1, order: 'id desc' }
     );
     return saleOrder;

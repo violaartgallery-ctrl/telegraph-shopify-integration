@@ -282,10 +282,10 @@ const mapOrder = (order: ShopifyGraphqlOrder): ShopifyOrder => ({
 });
 
 export const shopifyOrdersClient = {
-  listRecentOrders: async (first = 25): Promise<ShopifyOrder[]> => {
+  listRecentOrders: async (first = 25, query = 'fulfillment_status:unfulfilled'): Promise<ShopifyOrder[]> => {
     const response = await requestShopifyAdmin<ListOrdersResponse>(LIST_ORDERS_QUERY, {
       first,
-      query: 'fulfillment_status:unfulfilled'
+      query
     });
     return response.orders.nodes.map(mapOrder);
   },
