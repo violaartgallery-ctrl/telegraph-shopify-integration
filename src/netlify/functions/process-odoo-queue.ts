@@ -1,7 +1,7 @@
 /**
  * Netlify Scheduled Function — runs every 5 minutes.
- * Processes up to 2 queued Odoo Sales Order creation jobs per run.
- * Budget: 20s total (well within the 26s Netlify sync function limit).
+ * Processes up to 5 queued Odoo Sales Order creation jobs per run.
+ * Budget: 23s total (3s buffer from the 26s Netlify sync function limit).
  *
  * Stages per order:
  *   Stage 1 (odoo-so-pending)       → ensureSalesOrder()
@@ -19,8 +19,8 @@ import { shipmentRepository } from '../../services/shipmentRepository.js';
 import { logger } from '../../lib/logger.js';
 import type { ShopifyOrder } from '../../types/shopify.js';
 
-const MAX_ORDERS = 2;
-const BUDGET_MS = 20_000;
+const MAX_ORDERS = 5;
+const BUDGET_MS = 23_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
