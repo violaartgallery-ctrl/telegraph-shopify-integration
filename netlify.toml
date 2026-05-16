@@ -12,7 +12,7 @@ status = 200
 schedule = "0 * * * *"
 
 [functions."process-odoo-queue"]
-schedule = "*/5 * * * *"
+schedule = "* * * * *"
 
 [functions."run-production-background"]
 background = true

@@ -19,8 +19,8 @@ import { shipmentRepository } from '../../services/shipmentRepository.js';
 import { logger } from '../../lib/logger.js';
 import type { ShopifyOrder } from '../../types/shopify.js';
 
-const MAX_ORDERS = 5;
-const BUDGET_MS = 23_000;
+const MAX_ORDERS = 1;
+const BUDGET_MS = 55_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
