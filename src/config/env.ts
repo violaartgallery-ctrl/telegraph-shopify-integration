@@ -49,10 +49,11 @@ export const env = {
   logLevel: process.env.LOG_LEVEL ?? 'info',
   databaseUrl: required('DATABASE_URL'),
   syncOpenShipmentsIntervalMs: optionalInt('SYNC_OPEN_SHIPMENTS_INTERVAL_MS') ?? 600_000,
-  syncOpenShipmentsBatchSize: optionalInt('SYNC_OPEN_SHIPMENTS_BATCH_SIZE') ?? 10,
+  syncOpenShipmentsBatchSize: optionalInt('SYNC_OPEN_SHIPMENTS_BATCH_SIZE') ?? 30,
   // Time budget (ms) for a single sync-open-shipments run before Netlify timeout.
-  // Default 20 000 ms leaves ~6 s buffer from the Netlify 26 s function limit.
-  syncTimeBudgetMs: optionalInt('SYNC_TIME_BUDGET_MS') ?? 20_000,
+  // Default 23 000 ms leaves ~3 s buffer from the Netlify 26 s function limit.
+  // With CONCURRENCY=5 and ~4s per API call, ~15-20 records can be processed per run.
+  syncTimeBudgetMs: optionalInt('SYNC_TIME_BUDGET_MS') ?? 23_000,
   // Admin UI protection — required to call sensitive admin routes.
   // If empty the routes remain open with a startup warning (backward compat).
   adminSecretToken: optionalString('ADMIN_SECRET_TOKEN'),

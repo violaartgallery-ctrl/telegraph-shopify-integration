@@ -96,6 +96,16 @@ export const shipmentRepository = {
       }
     }),
 
+  markTerminal: async (shopifyOrderId: string, reason: string) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        accurateIsTerminal: true,
+        lastError: reason,
+        lastSyncedAt: new Date()
+      }
+    }),
+
   assignPlannedShipmentCode: async (shopifyOrderId: string, code: string) =>
     await prisma.shipmentRecord.update({
       where: { shopifyOrderId },

@@ -1,6 +1,7 @@
 import { AccurateClient } from '../accurate/accurateClient.js';
 import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
+import { UnauthorizedError } from '../lib/errors.js';
 import { shopifyStatusSyncClient } from '../shopify/shopifyStatusSyncClient.js';
 import { projectAccurateStatusToShopify } from './accurateStatusMapper.js';
 import { failedPayloadService } from './failedPayloadService.js';
@@ -53,10 +54,28 @@ export class ShipmentStatusSyncService {
       return;
     }
 
-    const shipment = await this.accurateClient.getShipment({
-      id: record.accurateShipmentId ?? undefined,
-      code: record.accurateShipmentCode ?? undefined
-    });
+    let shipment: Awaited<ReturnType<typeof this.accurateClient.getShipment>>;
+    try {
+      shipment = await this.accurateClient.getShipment({
+        id: record.accurateShipmentId ?? undefined,
+        code: record.accurateShipmentCode ?? undefined
+      });
+    } catch (error) {
+      if (error instanceof UnauthorizedError) {
+        // The current Telegraph account cannot read this shipment's status.
+        // This happens when the account has write-only API permissions.
+        // Log a warning and skip — do NOT mark terminal, because the shipment
+        // is still active and may be collected in the future (via webhook).
+        logger.warn('syncRecord: Telegraph account cannot read shipment status — skipping this run', {
+          recordId: record.id,
+          shipmentCode: record.accurateShipmentCode,
+          shipmentId: record.accurateShipmentId,
+          hint: 'Contact Telegraph support to enable read permissions for this account, or configure webhooks'
+        });
+        return;
+      }
+      throw error;
+    }
 
     if (!shipment) {
       throw new Error(`Accurate shipment not found for record ${record.id}`);
@@ -210,11 +229,11 @@ export class ShipmentStatusSyncService {
     const budgetMs = env.syncTimeBudgetMs;
     const startTime = Date.now();
 
-    // Concurrency: process up to 3 shipments in parallel per batch.
+    // Concurrency: process up to 5 shipments in parallel per batch.
     // Each syncRecord is independent (separate SO / invoice / payment) so parallel is safe.
-    // Running in parallel means 3 shipments complete in the time of the slowest one (~11s)
-    // instead of ~27s sequentially — safely within the 20s budget.
-    const CONCURRENCY = 3;
+    // Running in parallel means 5 shipments complete in the time of the slowest one (~4s)
+    // instead of ~20s sequentially — safely within the 23s budget.
+    const CONCURRENCY = 5;
 
     const openShipments = await shipmentRepository.findOpenShipments(env.syncOpenShipmentsBatchSize);
     let processed = 0;
