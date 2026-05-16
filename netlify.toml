@@ -8,13 +8,11 @@ from = "/*"
 to = "/.netlify/functions/api/:splat"
 status = 200
 
-[[scheduled.functions]]
-name = "sync-open-shipments"
-cron = "0 * * * *"
+[functions."sync-open-shipments"]
+schedule = "0 * * * *"
 
-[[scheduled.functions]]
-name = "process-odoo-queue"
-cron = "*/5 * * * *"
+[functions."process-odoo-queue"]
+schedule = "*/5 * * * *"
 
 [functions."run-production-background"]
 background = true
