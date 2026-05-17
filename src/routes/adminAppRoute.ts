@@ -1302,7 +1302,13 @@ export const createAdminAppRouter = (
       : await shopifyOrdersClient.getOrderByLegacyId(orderId as string);
     const result = await shopifyOrderProcessor.process(order, { source: 'manual-admin-app' });
     const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
-    response.json({ ok: true, ...result, orderName: order.name, shipmentCode: record?.accurateShipmentCode ?? null });
+    response.json({
+      ok: true,
+      ...result,
+      orderName: order.name,
+      shipmentCode: record?.accurateShipmentCode ?? null,
+      shipmentId: record?.accurateShipmentId ?? null
+    });
   });
 
   router.get('/orders/create-odoo-sales-order/bulk', async (request: Request, response: Response) => {
