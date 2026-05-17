@@ -508,6 +508,28 @@ export const shipmentRepository = {
     }),
 
   /**
+   * Same as updateOdooSaleOrderLink but looked up by shopifyOrderId.
+   * Used by ensureSalesOrder when called from V7 queue with skipDbStatusUpdate:
+   * the queue itself owns status transitions, so we must NOT write the legacy
+   * `sales-order-created` / `sales-order-existing` status here — otherwise a
+   * Lambda timeout between this write and markOdooStageSuccess orphans the
+   * record outside the V7 queue filter.
+   */
+  updateOdooSaleOrderLinkByShopifyId: async (shopifyOrderId: string, data: {
+    saleOrderId: number;
+    saleOrderName: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooSaleOrderId: data.saleOrderId,
+        odooSaleOrderName: data.saleOrderName,
+        odooSyncedAt: new Date()
+        // odooSyncStatus intentionally unchanged
+      }
+    }),
+
+  /**
    * Permanently mark an order as failed (too many attempts or unrecoverable error).
    * Used as a safety guard when attempt count is already >= 5 at queue-pick time.
    */

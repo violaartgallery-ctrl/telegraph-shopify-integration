@@ -270,10 +270,25 @@ export class OdooSyncService {
   async ensureSalesOrder(
     order: ShopifyOrder,
     shipment?: { accurateShipmentCode?: string | null; trackingUrl?: string | null },
-    options: { prepareStock?: boolean } = {}
+    options: { prepareStock?: boolean; skipDbStatusUpdate?: boolean } = {}
   ): Promise<{ id: number; name: string; created: boolean }> {
     this.assertEnabled();
     const shouldPrepareStock = options.prepareStock ?? true;
+    // When the V7 background queue calls this, it must own DB state transitions itself.
+    // Writing the legacy `sales-order-created` / `sales-order-existing` status here
+    // would orphan the record outside the V7 queue filter if the Lambda is killed
+    // between this write and markOdooStageSuccess.
+    const writeSaleOrderLink = async (data: { saleOrderId: number; saleOrderName: string; status: string }): Promise<void> => {
+      if (options.skipDbStatusUpdate) {
+        await shipmentRepository.updateOdooSaleOrderLinkByShopifyId(String(order.id), {
+          saleOrderId: data.saleOrderId,
+          saleOrderName: data.saleOrderName
+        });
+        return;
+      }
+      await shipmentRepository.updateOdooSalesOrder(String(order.id), data);
+    };
+
     const record = await shipmentRepository.findByShopifyOrderId(String(order.id));
     if (record?.odooSaleOrderId && record.odooSaleOrderName) {
       if (shouldPrepareStock) {
@@ -285,7 +300,7 @@ export class OdooSyncService {
     await shipmentRepository.createPending(order);
     const existingSaleOrder = await this.findExistingSaleOrder(order);
     if (existingSaleOrder?.name) {
-      await shipmentRepository.updateOdooSalesOrder(String(order.id), {
+      await writeSaleOrderLink({
         saleOrderId: existingSaleOrder.id,
         saleOrderName: existingSaleOrder.name,
         status: 'sales-order-existing'
@@ -316,7 +331,7 @@ export class OdooSyncService {
     try {
       const existingSaleOrderAfterClaim = await this.findExistingSaleOrder(order);
       if (existingSaleOrderAfterClaim?.name) {
-        await shipmentRepository.updateOdooSalesOrder(String(order.id), {
+        await writeSaleOrderLink({
           saleOrderId: existingSaleOrderAfterClaim.id,
           saleOrderName: existingSaleOrderAfterClaim.name,
           status: 'sales-order-existing'
@@ -352,7 +367,7 @@ export class OdooSyncService {
       );
       const saleOrderName = saleOrder?.name ?? String(saleOrderId);
 
-      await shipmentRepository.updateOdooSalesOrder(String(order.id), {
+      await writeSaleOrderLink({
         saleOrderId,
         saleOrderName,
         status: 'sales-order-created'

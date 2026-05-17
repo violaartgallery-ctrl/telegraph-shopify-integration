@@ -154,7 +154,7 @@ async function runStage(record: QueueRecord, stageToRun: string, odooSyncService
     const saleOrder = await odooSyncService.ensureSalesOrder(
       order,
       { accurateShipmentCode: record.accurateShipmentCode, trackingUrl: null },
-      { prepareStock: false }
+      { prepareStock: false, skipDbStatusUpdate: true }
     );
     await shipmentRepository.markOdooStageSuccess(record.id, 'odoo-stock-pending', {
       saleOrderId: saleOrder.id,
@@ -179,7 +179,7 @@ async function runStage(record: QueueRecord, stageToRun: string, odooSyncService
       const saleOrder = await odooSyncService.ensureSalesOrder(
         order,
         { accurateShipmentCode: record.accurateShipmentCode, trackingUrl: null },
-        { prepareStock: false }
+        { prepareStock: false, skipDbStatusUpdate: true }
       );
       saleOrderId = saleOrder.id;
       await shipmentRepository.updateOdooSaleOrderLink(record.id, {
@@ -202,7 +202,7 @@ async function runStage(record: QueueRecord, stageToRun: string, odooSyncService
       const saleOrder = await odooSyncService.ensureSalesOrder(
         order,
         { accurateShipmentCode: record.accurateShipmentCode, trackingUrl: null },
-        { prepareStock: false }
+        { prepareStock: false, skipDbStatusUpdate: true }
       );
       saleOrderId = saleOrder.id;
       await shipmentRepository.updateOdooSaleOrderLink(record.id, {
