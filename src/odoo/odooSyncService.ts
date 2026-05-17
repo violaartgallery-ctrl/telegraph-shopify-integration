@@ -90,6 +90,29 @@ export const calculateTelegraphReturnCharge = (shipment: {
   return returnedValue < 0 ? Math.abs(returnedValue) : 0;
 };
 
+/**
+ * Compute the net amount the merchant actually receives from Telegraph after the
+ * delivery fee is deducted. Returns null when inputs are missing/invalid so the
+ * caller can defer invoice creation rather than producing a wrong total.
+ *
+ *   netMerchantDue = collectedAmount - deliveryFees
+ */
+export const calculateNetMerchantDue = (params: {
+  collectedAmount?: number | null;
+  deliveryFees?: number | null;
+}): number | null => {
+  if (params.collectedAmount === undefined || params.collectedAmount === null) return null;
+  if (params.deliveryFees === undefined || params.deliveryFees === null) return null;
+
+  const collected = Number(params.collectedAmount);
+  const fees = Number(params.deliveryFees);
+  if (!Number.isFinite(collected) || collected <= 0) return null;
+  if (!Number.isFinite(fees) || fees < 0) return null;
+
+  const net = Number((collected - fees).toFixed(2));
+  return net > 0 ? net : null;
+};
+
 export const calculateTelegraphMerchantPaymentAmount = (params: {
   residual: number;
   collectedAmount?: number | null;
@@ -414,7 +437,28 @@ export class OdooSyncService {
     // prepareStock: false — delivery is already confirmed by the time a shipment is collected.
     // Skips manufacturing + picking validation (already done) saving ~5-8 s of Odoo calls.
     const saleOrder = await this.ensureSalesOrder(order, record, { prepareStock: false });
-    const invoice = await this.findOrCreatePostedSaleInvoice(String(order.id), saleOrder.id);
+
+    // Business rule: the customer invoice in Odoo must equal the net merchant due
+    // (collectedAmount − deliveryFees). When the inputs are missing we defer rather
+    // than book a wrong total — the next sync cycle will retry once Telegraph reports.
+    const netMerchantDue = calculateNetMerchantDue({
+      collectedAmount: record.collectedAmount,
+      deliveryFees: record.deliveryFees
+    });
+    if (netMerchantDue === null) {
+      logger.info('Skipping collected sync: net merchant due not computable yet', {
+        shopifyOrderId: order.id,
+        collectedAmount: record.collectedAmount,
+        deliveryFees: record.deliveryFees
+      });
+      return;
+    }
+
+    const invoice = await this.findOrCreatePostedSaleInvoice(
+      String(order.id),
+      saleOrder.id,
+      { targetInvoiceTotal: netMerchantDue }
+    );
 
     if (!env.odoo.paymentJournalId) {
       await shipmentRepository.markOdooFailed(String(order.id), 'ODOO_PAYMENT_JOURNAL_ID is required to register payment');
@@ -842,7 +886,8 @@ export class OdooSyncService {
 
   private async findOrCreatePostedSaleInvoice(
     shopifyOrderId: string,
-    saleOrderId: number
+    saleOrderId: number,
+    options?: { targetInvoiceTotal?: number | null }
   ): Promise<InvoiceRecord> {
     const [saleOrder] = await this.odooClient.searchRead<OdooRecord & {
       name?: string;
@@ -864,9 +909,29 @@ export class OdooSyncService {
       invoice = await this.createSaleInvoiceFromWizard(saleOrderId);
     }
 
+    const target = options?.targetInvoiceTotal;
+    const hasTarget = typeof target === 'number' && Number.isFinite(target) && target > 0;
+
     if (invoice.state === 'draft') {
+      // Before posting, align invoice total with the net merchant due (collected − deliveryFees).
+      // Existing posted invoices are NEVER mutated here — they go through the manual-review path below.
+      if (hasTarget) {
+        await this.adjustDraftInvoiceLinesToTotal(invoice.id, target as number);
+        invoice = await this.getInvoice(invoice.id);
+      }
       await this.odooClient.call('account.move', 'action_post', [[invoice.id]]);
       invoice = await this.getInvoice(invoice.id);
+    } else if (hasTarget) {
+      const currentTotal = Number(invoice.amount_total ?? 0);
+      if (Math.abs(currentTotal - (target as number)) > 0.01) {
+        logger.warn('Existing posted invoice total differs from net merchant due — leaving for manual review', {
+          shopifyOrderId,
+          invoiceId: invoice.id,
+          invoiceName: invoice.name,
+          currentTotal,
+          targetInvoiceTotal: target
+        });
+      }
     }
 
     await shipmentRepository.updateOdooInvoice(shopifyOrderId, {
@@ -875,6 +940,85 @@ export class OdooSyncService {
       status: invoice.payment_state === 'paid' ? 'paid-existing' : 'invoice-posted'
     });
     return invoice;
+  }
+
+  /**
+   * Scale the product lines of a DRAFT invoice so the new total matches `targetTotal`.
+   * - Single product line: set price_unit = targetTotal (quantity preserved if non-zero, else 1).
+   * - Multiple product lines: scale each line's price_unit proportionally, with the final line
+   *   absorbing any rounding remainder so the sum is exact.
+   * - Lines flagged as section/note (display_type set) are left untouched.
+   * - No-op if the invoice is not draft, has no product lines, or already matches the target.
+   */
+  private async adjustDraftInvoiceLinesToTotal(invoiceId: number, targetTotal: number): Promise<void> {
+    const target = Number(Number(targetTotal).toFixed(2));
+    if (!Number.isFinite(target) || target <= 0) return;
+
+    const [invoice] = await this.odooClient.searchRead<InvoiceRecord & { invoice_line_ids?: number[] }>(
+      'account.move',
+      [['id', '=', invoiceId]],
+      ['state', 'amount_total', 'invoice_line_ids'],
+      { limit: 1 }
+    );
+    if (!invoice || invoice.state !== 'draft') return;
+
+    const currentTotal = Number(Number(invoice.amount_total ?? 0).toFixed(2));
+    if (Math.abs(currentTotal - target) <= 0.01) return;
+
+    const lineIds = invoice.invoice_line_ids ?? [];
+    if (lineIds.length === 0) return;
+
+    const lines = await this.odooClient.searchRead<OdooRecord & {
+      price_unit?: number;
+      quantity?: number;
+      price_subtotal?: number;
+      display_type?: string | false;
+    }>(
+      'account.move.line',
+      [['id', 'in', lineIds]],
+      ['price_unit', 'quantity', 'price_subtotal', 'display_type'],
+      { limit: 200 }
+    );
+
+    const productLines = lines.filter((line) => !line.display_type);
+    if (productLines.length === 0) return;
+
+    if (productLines.length === 1) {
+      const only = productLines[0];
+      const qty = Number(only.quantity ?? 0) > 0 ? Number(only.quantity) : 1;
+      const newUnit = Number((target / qty).toFixed(2));
+      await this.odooClient.executeKw('account.move.line', 'write', [[only.id], {
+        price_unit: newUnit,
+        quantity: qty
+      }]);
+      return;
+    }
+
+    const subtotals = productLines.map((line) => Number(line.price_subtotal ?? Number(line.price_unit ?? 0) * Number(line.quantity ?? 1)));
+    const currentSubtotal = subtotals.reduce((sum, value) => sum + value, 0);
+    if (!Number.isFinite(currentSubtotal) || currentSubtotal <= 0) return;
+
+    const factor = target / currentSubtotal;
+    let runningTotal = 0;
+    const updates: Array<{ id: number; price_unit: number }> = [];
+    for (let i = 0; i < productLines.length; i += 1) {
+      const line = productLines[i];
+      const qty = Number(line.quantity ?? 1) || 1;
+      let scaledSubtotal = Number((subtotals[i] * factor).toFixed(2));
+      // Absorb rounding remainder into the last product line so totals match exactly.
+      if (i === productLines.length - 1) {
+        scaledSubtotal = Number((target - runningTotal).toFixed(2));
+      }
+      runningTotal = Number((runningTotal + scaledSubtotal).toFixed(2));
+      const newUnit = Number((scaledSubtotal / qty).toFixed(2));
+      updates.push({ id: line.id, price_unit: newUnit });
+    }
+
+    for (const update of updates) {
+      await this.odooClient.executeKw('account.move.line', 'write', [[update.id], {
+        price_unit: update.price_unit
+      }]);
+    }
   }
 
   private async findSaleOrderInvoices(saleOrder: { name?: string; invoice_ids?: number[] }): Promise<InvoiceRecord[]> {
