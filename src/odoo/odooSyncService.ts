@@ -929,7 +929,6 @@ export class OdooSyncService {
 
     if (invoice.state === 'draft') {
       // Before posting, align invoice total with the net merchant due (collected − deliveryFees).
-      // Existing posted invoices are NEVER mutated here — they go through the manual-review path below.
       if (hasTarget) {
         await this.adjustDraftInvoiceLinesToTotal(invoice.id, target as number);
         invoice = await this.getInvoice(invoice.id);
@@ -937,15 +936,44 @@ export class OdooSyncService {
       await this.odooClient.call('account.move', 'action_post', [[invoice.id]]);
       invoice = await this.getInvoice(invoice.id);
     } else if (hasTarget) {
+      // The Odoo wizard posts the invoice immediately, so most invoices come back already-posted.
+      // If no payments have been reconciled yet, reset to draft → adjust → re-post.
+      // If reset fails (linked payments, locked period) keep the warning + manual review.
       const currentTotal = Number(invoice.amount_total ?? 0);
-      if (Math.abs(currentTotal - (target as number)) > 0.01) {
-        logger.warn('Existing posted invoice total differs from net merchant due — leaving for manual review', {
-          shopifyOrderId,
-          invoiceId: invoice.id,
-          invoiceName: invoice.name,
-          currentTotal,
-          targetInvoiceTotal: target
-        });
+      const targetTotal = target as number;
+      if (Math.abs(currentTotal - targetTotal) > 0.01) {
+        const residual = Number(invoice.amount_residual ?? 0);
+        const looksUnpaid = invoice.payment_state !== 'paid' && residual >= currentTotal - 0.01;
+        if (looksUnpaid) {
+          try {
+            await this.odooClient.call('account.move', 'button_draft', [[invoice.id]]);
+            invoice = await this.getInvoice(invoice.id);
+            if (invoice.state === 'draft') {
+              await this.adjustDraftInvoiceLinesToTotal(invoice.id, targetTotal);
+              await this.odooClient.call('account.move', 'action_post', [[invoice.id]]);
+              invoice = await this.getInvoice(invoice.id);
+              logger.info('Posted invoice was reset/adjusted/re-posted to match net merchant due', {
+                shopifyOrderId, invoiceId: invoice.id, invoiceName: invoice.name,
+                previousTotal: currentTotal, targetInvoiceTotal: targetTotal, newTotal: invoice.amount_total
+              });
+            } else {
+              logger.warn('button_draft did not move invoice to draft — manual review', {
+                shopifyOrderId, invoiceId: invoice.id, state: invoice.state
+              });
+            }
+          } catch (resetError) {
+            const reason = resetError instanceof Error ? resetError.message : String(resetError);
+            logger.warn('Could not reset posted invoice to draft for net-due adjustment — manual review', {
+              shopifyOrderId, invoiceId: invoice.id, invoiceName: invoice.name,
+              currentTotal, targetInvoiceTotal: targetTotal, reason
+            });
+          }
+        } else {
+          logger.warn('Existing posted invoice total differs from net merchant due — has payments, leaving for manual review', {
+            shopifyOrderId, invoiceId: invoice.id, invoiceName: invoice.name,
+            currentTotal, targetInvoiceTotal: targetTotal, residual, paymentState: invoice.payment_state
+          });
+        }
       }
     }
 
