@@ -16,6 +16,13 @@ export type OdooRecord = Record<string, unknown> & { id: number };
 
 export class OdooConfigError extends Error {}
 
+const TRANSIENT_PATTERN = /fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET|socket hang up|ESOCKETTIMEDOUT|Gateway|HTTP 5(0[234]|99)/i;
+const isTransientRpcError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return TRANSIENT_PATTERN.test(message);
+};
+const wait = async (ms: number): Promise<void> => await new Promise((r) => setTimeout(r, ms));
+
 export class OdooClient {
   private uid?: number;
 
@@ -47,7 +54,7 @@ export class OdooClient {
     return env.odoo.password;
   }
 
-  private async rpc<T>(service: string, method: string, args: unknown[]): Promise<T> {
+  private async rpcOnce<T>(service: string, method: string, args: unknown[]): Promise<T> {
     const response = await fetch(this.endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -64,6 +71,23 @@ export class OdooClient {
       throw new Error(body.error?.data?.message ?? body.error?.message ?? `Odoo HTTP ${response.status}`);
     }
     return body.result as T;
+  }
+
+  // Retry transient network/gateway errors twice with exponential backoff before giving up.
+  // Non-transient Odoo business errors (validation, missing record, etc.) propagate immediately.
+  private async rpc<T>(service: string, method: string, args: unknown[]): Promise<T> {
+    const attempts = 3;
+    let lastError: unknown;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await this.rpcOnce<T>(service, method, args);
+      } catch (err) {
+        lastError = err;
+        if (i === attempts - 1 || !isTransientRpcError(err)) throw err;
+        await wait(300 * Math.pow(2, i)); // 300 ms, 600 ms
+      }
+    }
+    throw lastError;
   }
 
   async login(): Promise<number> {

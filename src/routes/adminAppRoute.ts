@@ -1424,7 +1424,8 @@ export const createAdminAppRouter = (
         }
 
         const result = await odooSyncService.ensureSalesOrder(order, record ?? undefined, {
-          prepareStock: false
+          prepareStock: false,
+          skipDbStatusUpdate: true
         });
         return {
           orderId: rawOrderId,
@@ -1474,7 +1475,8 @@ export const createAdminAppRouter = (
       : await shopifyOrdersClient.getOrderByLegacyId(lookup.legacyId as string);
     const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
     const result = await odooSyncService.ensureSalesOrder(order, record ?? undefined, {
-      prepareStock: false
+      prepareStock: false,
+      skipDbStatusUpdate: true
     });
 
     response.type('html').send(renderShipmentResult({
@@ -1499,7 +1501,8 @@ export const createAdminAppRouter = (
       : await shopifyOrdersClient.getOrderByLegacyId(orderId as string);
     const record = await shipmentRepository.findSummaryByShopifyOrderId(String(order.id));
     const result = await odooSyncService.ensureSalesOrder(order, record ?? undefined, {
-      prepareStock: false
+      prepareStock: false,
+      skipDbStatusUpdate: true
     });
     response.json({ ok: true, saleOrderId: result.id, saleOrderName: result.name, created: result.created });
   });

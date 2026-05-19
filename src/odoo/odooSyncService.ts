@@ -91,6 +91,14 @@ export const calculateTelegraphReturnCharge = (shipment: {
 };
 
 /**
+ * Returns true for transient network/Odoo errors that should NOT permanently fail
+ * a shipment record. The same patterns AccurateClient uses, plus a few Odoo-specific
+ * ones (XML-RPC timeouts, server-side temporary failures).
+ */
+export const isTransientNetworkError = (message: string): boolean =>
+  /fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|ECONNRESET|socket hang up|ESOCKETTIMEDOUT|timeout|503|504|Gateway/i.test(message);
+
+/**
  * Compute the net amount the merchant actually receives from Telegraph after the
  * delivery fee is deducted. Returns null when inputs are missing/invalid so the
  * caller can defer invoice creation rather than producing a wrong total.
@@ -379,6 +387,14 @@ export class OdooSyncService {
       return { id: saleOrderId, name: saleOrderName, created: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown Odoo sales order error';
+      // A transient network/Odoo blip should NOT lock the record permanently. Throw without
+      // touching DB status so the V7 queue (or the next cron tick) re-runs Stage 1 normally.
+      if (isTransientNetworkError(message)) {
+        logger.warn('ensureSalesOrder transient error — leaving status untouched for retry', {
+          shopifyOrderId: String(order.id), reason: message
+        });
+        throw error;
+      }
       await shipmentRepository.markOdooFailed(String(order.id), message);
       throw error;
     }
@@ -451,7 +467,10 @@ export class OdooSyncService {
     const order = JSON.parse(record.rawOrderJson) as ShopifyOrder;
     // prepareStock: false — delivery is already confirmed by the time a shipment is collected.
     // Skips manufacturing + picking validation (already done) saving ~5-8 s of Odoo calls.
-    const saleOrder = await this.ensureSalesOrder(order, record, { prepareStock: false });
+    // skipDbStatusUpdate: true — the caller (sync-open-shipments cron) owns the post-paid
+    // status transition. Without it, a Lambda timeout between ensureSalesOrder and the
+    // downstream invoice/payment writes would leave the record orphaned at sales-order-created.
+    const saleOrder = await this.ensureSalesOrder(order, record, { prepareStock: false, skipDbStatusUpdate: true });
 
     // Business rule: the customer invoice in Odoo must equal the net merchant due
     // (collectedAmount − deliveryFees). When the inputs are missing we defer rather
