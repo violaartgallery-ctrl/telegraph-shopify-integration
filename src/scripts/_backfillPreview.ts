@@ -11,6 +11,7 @@ const TOLERANCE = 0.02;
 const odoo = new OdooClient();
 
 interface InvoiceRow {
+  [key: string]: unknown;
   id: number;
   name?: string;
   state?: string;
@@ -24,6 +25,7 @@ interface InvoiceRow {
 }
 
 interface LineRow {
+  [key: string]: unknown;
   id: number;
   display_type?: string | false;
   price_unit?: number;
@@ -34,7 +36,7 @@ interface LineRow {
   move_id?: [number, string];
 }
 
-interface ReversalRow { id: number; reversed_entry_id?: [number, string] | false; }
+interface ReversalRow { [key: string]: unknown; id: number; reversed_entry_id?: [number, string] | false; }
 
 interface Candidate {
   shopifyOrderName: string;

@@ -27,7 +27,7 @@ console.log('invoice_line_ids:', lineIds);
 
 if (lineIds.length === 0) { console.log('No lines'); process.exit(0); }
 
-const lines = await odoo.searchRead<Record<string, unknown>>(
+const lines = await odoo.searchRead<Record<string, unknown> & { id: number }>(
   'account.move.line',
   [['id', 'in', lineIds]],
   ['display_type', 'price_unit', 'quantity', 'price_subtotal', 'price_total', 'tax_ids', 'move_id', 'name', 'product_id', 'account_id'],

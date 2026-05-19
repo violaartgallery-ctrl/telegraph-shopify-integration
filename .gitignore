@@ -2,6 +2,8 @@ node_modules
 dist
 .bin/
 .env
+.env.*
+!.env.example
 prisma/dev.db
 prisma/dev.db-journal
 prisma/prisma/
