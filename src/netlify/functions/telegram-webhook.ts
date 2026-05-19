@@ -51,13 +51,13 @@ function siteUrl(): string {
   return (process.env.URL ?? '').replace(/\/$/, '');
 }
 
-async function triggerBackground(chatId: number, execute: boolean): Promise<void> {
+async function triggerBackground(chatId: number, execute: boolean, orderId?: string): Promise<void> {
   const url = `${siteUrl()}/.netlify/functions/run-production-background`;
   try {
     await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chatId, execute }),
+      body: JSON.stringify({ chatId, execute, ...(orderId ? { orderId } : {}) }),
     });
   } catch (err) {
     console.error('[webhook] Failed to trigger background function:', err);
@@ -67,7 +67,8 @@ async function triggerBackground(chatId: number, execute: boolean): Promise<void
 
 async function handleCommand(
   chatId: number,
-  command: string
+  command: string,
+  fullText: string
 ): Promise<void> {
   if (command === '/start') {
     const user = await getUser(chatId);
@@ -100,15 +101,36 @@ async function handleCommand(
     return;
   }
 
+  if (command === '/stop') {
+    const { prisma } = await import('../../lib/prisma.js');
+    await prisma.failedPayload.deleteMany({ where: { source: 'bot_control' } });
+    await prisma.failedPayload.create({ data: { source: 'bot_control', reason: 'bot_paused', payloadJson: '{}' } });
+    await sendMessage(chatId, '🛑 البوت اتوقف — مش هيقبل /run أو /preview.\nابعت /resume عشان تشغله تاني.');
+    return;
+  }
+
+  if (command === '/resume') {
+    const { prisma } = await import('../../lib/prisma.js');
+    await prisma.failedPayload.deleteMany({ where: { source: 'bot_control' } });
+    await sendMessage(chatId, '✅ البوت شغال تاني — ابعت /run أو /preview.');
+    return;
+  }
+
   if (command === '/run') {
-    await sendMessage(chatId, '⏳ جاري تشغيل التجميعة (تنفيذ حقيقي)...');
-    await triggerBackground(chatId, true);
+    const parts = fullText.trim().split(/\s+/);
+    const orderArg = parts[1] ? parts[1].replace(/^#/, '') : undefined;
+    const orderLabel = orderArg ? ` (أوردر #${orderArg} فقط)` : '';
+    await sendMessage(chatId, `⏳ جاري تشغيل التجميعة (تنفيذ حقيقي)${orderLabel}...`);
+    await triggerBackground(chatId, true, orderArg);
     return;
   }
 
   if (command === '/preview') {
-    await sendMessage(chatId, '⏳ جاري تشغيل البريفيو...');
-    await triggerBackground(chatId, false);
+    const parts = fullText.trim().split(/\s+/);
+    const orderArg = parts[1] ? parts[1].replace(/^#/, '') : undefined;
+    const orderLabel = orderArg ? ` (أوردر #${orderArg} فقط)` : '';
+    await sendMessage(chatId, `⏳ جاري تشغيل البريفيو${orderLabel}...`);
+    await triggerBackground(chatId, false, orderArg);
     return;
   }
 
@@ -175,8 +197,8 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
   if (!text) return { statusCode: 200, body: 'ok' };
 
   if (text.startsWith('/')) {
-    const command = text.split(' ')[0].split('@')[0];
-    await handleCommand(chatId, command);
+    const command = text.split(' ')[0]!.split('@')[0]!;
+    await handleCommand(chatId, command, text);
   } else {
     if (!(await isAllowed(chatId))) {
       await sendMessage(

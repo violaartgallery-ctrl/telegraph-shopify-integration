@@ -16,3 +16,6 @@ schedule = "* * * * *"
 
 [functions."run-production-background"]
 background = true
+
+[functions."ensure-telegram-webhook"]
+schedule = "*/5 * * * *"

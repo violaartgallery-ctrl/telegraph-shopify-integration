@@ -13,7 +13,7 @@
 
 interface LambdaEvent { body: string | null; }
 interface LambdaResult { statusCode: number; body: string; }
-interface JobPayload { chatId: number; execute: boolean; }
+interface JobPayload { chatId: number; execute: boolean; orderId?: string; }
 
 // Only telegramApi at top level — zero env dependencies, safe for module load.
 import { sendMessage, sendDocument } from '../../telegram/telegramApi.js';
@@ -45,7 +45,7 @@ interface AymanResponse {
 
 // ── Ayman Agent integration ────────────────────────────────────────────────────
 
-async function fetchFromAymanAgent(): Promise<AymanResponse> {
+async function fetchFromAymanAgent(orderId?: string): Promise<AymanResponse> {
   const baseUrl = (process.env.AYMAN_AGENT_URL ?? 'https://viola-production-agent.netlify.app').replace(/\/$/, '');
   const secret = process.env.AYMAN_AGENT_SECRET ?? '';
 
@@ -55,7 +55,7 @@ async function fetchFromAymanAgent(): Promise<AymanResponse> {
       'Content-Type': 'application/json',
       ...(secret ? { 'X-Agent-Secret': secret } : {}),
     },
-    body: JSON.stringify({ mode: 'execute', skipPhotos: true }),
+    body: JSON.stringify({ mode: 'execute', skipPhotos: true, ...(orderId ? { orderId } : {}) }),
   });
 
   if (!resp.ok) {
@@ -95,15 +95,16 @@ interface ShipResult {
 
 // ── Main pipeline ─────────────────────────────────────────────────────────────
 
-async function runPipeline(chatId: number, execute: boolean): Promise<void> {
+async function runPipeline(chatId: number, execute: boolean, orderId?: string): Promise<void> {
   const mode = execute ? 'تنفيذ حقيقي' : 'بريفيو';
+  const orderLabel = orderId ? ` (أوردر ${orderId} فقط)` : '';
 
   // ── Step 1: Call Ayman Agent ───────────────────────────────────────────────
-  await sendMessage(chatId, `📦 جاري جلب التجميعة من Ayman Agent... (${mode})`);
+  await sendMessage(chatId, `📦 جاري جلب التجميعة من Ayman Agent...${orderLabel} (${mode})`);
 
   let aymanData: AymanResponse;
   try {
-    aymanData = await fetchFromAymanAgent();
+    aymanData = await fetchFromAymanAgent(orderId);
   } catch (err) {
     await sendMessage(chatId, `❌ فشل Ayman Agent:\n${String(err).slice(0, 300)}`);
     return;
@@ -205,7 +206,10 @@ async function runPipeline(chatId: number, execute: boolean): Promise<void> {
   const { shopifyOrdersClient } = await import('../../shopify/shopifyOrdersClient.js');
   let allOrders: ShopifyOrder[];
   try {
-    allOrders = await shopifyOrdersClient.listRecentOrders(250, 'tag:confirmed fulfillment_status:unfulfilled');
+    const query = orderId
+      ? `name:#${orderId.replace(/^#/, '')} tag:confirmed fulfillment_status:unfulfilled`
+      : 'tag:confirmed fulfillment_status:unfulfilled';
+    allOrders = await shopifyOrdersClient.listRecentOrders(250, query);
   } catch (err) {
     await sendMessage(chatId, `❌ فشل في جلب الأوردرات للشحن: ${String(err).slice(0, 200)}`);
     return;
@@ -275,10 +279,10 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
     return { statusCode: 400, body: 'Invalid JSON' };
   }
 
-  const { chatId, execute } = payload;
+  const { chatId, execute, orderId } = payload;
 
   try {
-    await runPipeline(chatId, execute);
+    await runPipeline(chatId, execute, orderId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[background] Pipeline error:', msg);
