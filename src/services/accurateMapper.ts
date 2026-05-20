@@ -6,7 +6,7 @@ import { getTelegraphLocationSelection } from './telegraphLocation.js';
 
 const buildOrderReference = (order: ShopifyOrder): string => `${env.orderReferencePrefix}-${order.order_number}`;
 
-const buildCustomerName = (order: ShopifyOrder): string => {
+export const buildCustomerName = (order: ShopifyOrder): string => {
   const shippingName = order.shipping_address?.name;
   if (shippingName) return `${shippingName} | ${buildOrderReference(order)}`;
   const shippingParts = [order.shipping_address?.first_name, order.shipping_address?.last_name].filter(Boolean);
@@ -16,7 +16,7 @@ const buildCustomerName = (order: ShopifyOrder): string => {
   return `${order.email ?? `Shopify Order ${order.name}`} | ${buildOrderReference(order)}`;
 };
 
-const buildPhone = (order: ShopifyOrder): string => {
+export const buildPhone = (order: ShopifyOrder): string => {
   return (
     order.shipping_address?.phone ??
     order.phone ??
@@ -37,7 +37,7 @@ const itemQuantity = (item: ShopifyLineItem): number =>
 const activeLineItems = (lineItems: ShopifyLineItem[]): ShopifyLineItem[] =>
   lineItems.filter((item) => itemQuantity(item) > 0);
 
-const buildAddress = (order: ShopifyOrder): string => {
+export const buildAddress = (order: ShopifyOrder): string => {
   const address = order.shipping_address ?? order.billing_address;
   const parts = [
     address?.address1,
@@ -54,10 +54,10 @@ const buildProductsSummary = (lineItems: ShopifyLineItem[]): string =>
     })
     .join('\n');
 
-const buildShipmentDescription = (order: ShopifyOrder): string =>
+export const buildShipmentDescription = (order: ShopifyOrder): string =>
   buildProductsSummary(activeLineItems(order.line_items));
 
-const buildPiecesCount = (order: ShopifyOrder): number =>
+export const buildPiecesCount = (order: ShopifyOrder): number =>
   activeLineItems(order.line_items).reduce((total, item) => total + itemQuantity(item), 0);
 
 const buildShipmentProducts = (lineItems: ShopifyLineItem[]) => {

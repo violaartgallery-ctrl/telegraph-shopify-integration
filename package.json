@@ -23,11 +23,14 @@
   },
   "dependencies": {
     "@netlify/blobs": "^10.7.6",
+    "@pdf-lib/fontkit": "^1.1.1",
     "@prisma/client": "^6.7.0",
+    "bwip-js": "^4.10.1",
     "docx": "^9.6.1",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "graphql": "^16.11.0",
+    "pdf-lib": "^1.17.1",
     "serverless-http": "^3.2.0"
   },
   "devDependencies": {

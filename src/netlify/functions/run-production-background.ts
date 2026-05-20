@@ -227,6 +227,7 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
   const { createAppServices } = await import('../../app.js');
   const { shopifyOrderProcessor } = createAppServices();
   const results: ShipResult[] = [];
+  const createdShipmentCodes: string[] = [];
 
   for (const order of orders) {
     try {
@@ -239,6 +240,9 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
         results.push({ orderName: order.name, ok: true, reason });
         await sendMessage(chatId, `⏭️ ${order.name} — تم تخطيه: ${reason}`);
       } else {
+        if (result.accurateShipmentCode) {
+          createdShipmentCodes.push(result.accurateShipmentCode);
+        }
         results.push({ orderName: order.name, ok: true });
         await sendMessage(chatId, `✅ ${order.name} — تم الشحن بنجاح`);
       }
@@ -246,6 +250,24 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
       const errMsg = String(err).slice(0, 200);
       results.push({ orderName: order.name, ok: false, reason: errMsg });
       await sendMessage(chatId, `❌ ${order.name} — فشل: ${errMsg}`);
+    }
+  }
+
+  // ── Waybill PDF ────────────────────────────────────────────────────────────
+  if (createdShipmentCodes.length > 0) {
+    await sendMessage(chatId, `🖨️ جاري تجهيز PDF البوالص — ${createdShipmentCodes.length} شحنة...`);
+    try {
+      const { generateWaybillPdf } = await import('../../services/waybillGenerator.js');
+      const pdfBuf = await generateWaybillPdf(createdShipmentCodes);
+      const dateStr = new Date().toISOString().slice(0, 10);
+      await sendDocument(
+        chatId,
+        pdfBuf,
+        `waybills_${dateStr}.pdf`,
+        `واي بيل ✅ — ${createdShipmentCodes.length} شحنة`
+      );
+    } catch (err) {
+      await sendMessage(chatId, `⚠️ فشل تجهيز PDF البوالص:\n${String(err).slice(0, 300)}`);
     }
   }
 

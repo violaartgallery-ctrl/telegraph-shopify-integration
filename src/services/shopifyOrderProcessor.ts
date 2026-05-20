@@ -14,6 +14,7 @@ import type { OdooSyncService } from '../odoo/odooSyncService.js';
 interface ProcessResult {
   skipped: boolean;
   reason?: string;
+  accurateShipmentCode?: string;
   fulfillment?: {
     skipped: boolean;
     reason?: string;
@@ -141,7 +142,7 @@ export class ShopifyOrderProcessor {
       await shipmentRepository.markOdooSoPending(orderId);
       const odoo: NonNullable<ProcessResult['odoo']> = { skipped: true, reason: 'queued-for-background' };
 
-      return { skipped: false, fulfillment, odoo };
+      return { skipped: false, accurateShipmentCode: shipment.code, fulfillment, odoo };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown shipment creation error';
       await shipmentRepository.markFailed(orderId, message);
