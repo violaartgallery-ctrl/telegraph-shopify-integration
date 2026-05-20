@@ -16,6 +16,7 @@ schedule = "* * * * *"
 
 [functions."run-production-background"]
 background = true
+included_files = ["dist/assets/fonts/**"]
 
 [functions."ensure-telegram-webhook"]
 schedule = "*/5 * * * *"

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "prisma generate && tsc -p tsconfig.json",
+    "build": "prisma generate && tsc -p tsconfig.json && node -e \"const fs=require('fs');fs.mkdirSync('dist/assets/fonts',{recursive:true});fs.copyFileSync('src/assets/fonts/Cairo-Regular.ttf','dist/assets/fonts/Cairo-Regular.ttf');\"",
     "start": "node dist/index.js",
     "test:shopify-token": "tsx src/scripts/testShopifyToken.ts",
     "test:accurate-config": "tsx src/scripts/testAccurateConfig.ts",
