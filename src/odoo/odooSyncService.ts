@@ -99,6 +99,32 @@ export const isTransientNetworkError = (message: string): boolean =>
   /fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|ECONNRESET|socket hang up|ESOCKETTIMEDOUT|timeout|503|504|Gateway/i.test(message);
 
 /**
+ * Authoritative invoice-target calculator for collected Telegraph shipments.
+ *
+ * Mirrors the priority used by calculateTelegraphMerchantPaymentAmount so the
+ * invoice total and the payment amount never drift (which is what caused the
+ * #2024 residual-mismatch incident: invoice was sized to collected−fees while
+ * payment was sized to customerDue, leaving a 10 EGP residual).
+ *
+ * Priority:
+ *   1. customerDue (when Telegraph reports it positive) — authoritative.
+ *   2. collectedAmount − deliveryFees — fallback.
+ *
+ * Returns null when the inputs are not enough to safely produce a number.
+ */
+export const calculateMerchantInvoiceTarget = (params: {
+  collectedAmount?: number | null;
+  deliveryFees?: number | null;
+  customerDue?: number | null;
+}): number | null => {
+  const cd = Number(params.customerDue);
+  if (Number.isFinite(cd) && cd > 0) {
+    return Number(cd.toFixed(2));
+  }
+  return calculateNetMerchantDue({ collectedAmount: params.collectedAmount, deliveryFees: params.deliveryFees });
+};
+
+/**
  * Compute the net amount the merchant actually receives from Telegraph after the
  * delivery fee is deducted. Returns null when inputs are missing/invalid so the
  * caller can defer invoice creation rather than producing a wrong total.
@@ -472,18 +498,21 @@ export class OdooSyncService {
     // downstream invoice/payment writes would leave the record orphaned at sales-order-created.
     const saleOrder = await this.ensureSalesOrder(order, record, { prepareStock: false, skipDbStatusUpdate: true });
 
-    // Business rule: the customer invoice in Odoo must equal the net merchant due
-    // (collectedAmount − deliveryFees). When the inputs are missing we defer rather
-    // than book a wrong total — the next sync cycle will retry once Telegraph reports.
-    const netMerchantDue = calculateNetMerchantDue({
+    // Business rule: the customer invoice in Odoo must equal the merchant target
+    // (= customerDue when Telegraph reports it; otherwise collectedAmount − deliveryFees).
+    // Using the SAME priority as the payment calculator guarantees invoice total and
+    // payment amount stay in lock-step — no residual mismatch.
+    const invoiceTarget = calculateMerchantInvoiceTarget({
       collectedAmount: record.collectedAmount,
-      deliveryFees: record.deliveryFees
+      deliveryFees: record.deliveryFees,
+      customerDue: record.customerDue
     });
-    if (netMerchantDue === null) {
-      logger.info('Skipping collected sync: net merchant due not computable yet', {
+    if (invoiceTarget === null) {
+      logger.info('Skipping collected sync: merchant invoice target not computable yet', {
         shopifyOrderId: order.id,
         collectedAmount: record.collectedAmount,
-        deliveryFees: record.deliveryFees
+        deliveryFees: record.deliveryFees,
+        customerDue: record.customerDue
       });
       return;
     }
@@ -491,7 +520,7 @@ export class OdooSyncService {
     const invoice = await this.findOrCreatePostedSaleInvoice(
       String(order.id),
       saleOrder.id,
-      { targetInvoiceTotal: netMerchantDue }
+      { targetInvoiceTotal: invoiceTarget }
     );
 
     if (!env.odoo.paymentJournalId) {
