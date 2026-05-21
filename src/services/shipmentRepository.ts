@@ -39,6 +39,13 @@ export const shipmentRepository = {
       }
     }),
 
+  findByShipmentCodes: async (codes: string[]) =>
+    await prisma.shipmentRecord.findMany({
+      where: {
+        accurateShipmentCode: { in: codes }
+      }
+    }),
+
   findOpenShipments: async (limit?: number) => {
     const collectedSyncWhere = {
       accurateShipmentId: { not: null },

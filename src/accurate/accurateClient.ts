@@ -2,7 +2,14 @@ import { env } from '../config/env.js';
 import { UnauthorizedError, ValidationError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { retry } from '../lib/retry.js';
-import { GET_SHIPMENT_QUERY, LIST_ZONES_QUERY, LOGIN_MUTATION, SAVE_SHIPMENT_MUTATION } from './queries.js';
+import {
+  GET_SHIPMENT_QUERY,
+  LIST_PAYMENTS_QUERY,
+  LIST_SHIPMENTS_FOR_PAYMENT_QUERY,
+  LIST_ZONES_QUERY,
+  LOGIN_MUTATION,
+  SAVE_SHIPMENT_MUTATION
+} from './queries.js';
 
 interface LoginResponse {
   login: {
@@ -58,6 +65,49 @@ interface ZoneDropdownResponse {
     name: string;
     code?: string | null;
   }>;
+}
+
+interface PaginatorInfo {
+  total: number;
+  count: number;
+  currentPage: number;
+  lastPage: number;
+  hasMorePages: boolean;
+}
+
+export interface AccuratePaymentSummary {
+  id: number;
+  code: string;
+  date: string;
+  approved: boolean;
+  glApproved: boolean;
+  paymentAmount?: number | null;
+  deliveredAmount?: number | null;
+  collectedFees?: number | null;
+  customer?: {
+    id?: number | null;
+    name?: string | null;
+    code?: string | null;
+  } | null;
+}
+
+interface ListPaymentsResponse {
+  listPayments: {
+    paginatorInfo: PaginatorInfo;
+    data: AccuratePaymentSummary[];
+  };
+}
+
+export interface AccuratePaymentShipmentEntry {
+  amount: number;
+  shipment: ShipmentLookupResponse['shipment'];
+}
+
+interface ListShipmentsForPaymentResponse {
+  listShipmentsForPayment: {
+    paginatorInfo: PaginatorInfo;
+    data: AccuratePaymentShipmentEntry[];
+  };
 }
 
 interface AccurateGraphqlResponse<T> {
@@ -263,6 +313,30 @@ export class AccurateClient {
   async getShipment(params: { id?: number; code?: string }): Promise<ShipmentLookupResponse['shipment']> {
     const response = await this.requestWithAuth<ShipmentLookupResponse>(GET_SHIPMENT_QUERY, params);
     return response.shipment;
+  }
+
+  async listPayments(input: {
+    typeCode?: 'CUSTM' | 'DLVBY';
+    fromDate?: string;
+    toDate?: string;
+    approved?: boolean;
+    glApproved?: boolean;
+  }, first = 10, page = 1): Promise<ListPaymentsResponse['listPayments']> {
+    const response = await this.requestWithAuth<ListPaymentsResponse>(LIST_PAYMENTS_QUERY, {
+      input,
+      first,
+      page
+    });
+    return response.listPayments;
+  }
+
+  async listShipmentsForPayment(id: number, first = 100, page = 1): Promise<ListShipmentsForPaymentResponse['listShipmentsForPayment']> {
+    const response = await this.requestWithAuth<ListShipmentsForPaymentResponse>(LIST_SHIPMENTS_FOR_PAYMENT_QUERY, {
+      id,
+      first,
+      page
+    });
+    return response.listShipmentsForPayment;
   }
 
   async listZones(input: {
