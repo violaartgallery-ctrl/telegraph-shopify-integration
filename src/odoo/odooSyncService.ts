@@ -1042,7 +1042,10 @@ export class OdooSyncService {
       { limit: 200 }
     );
 
-    const productLines = lines.filter((line) => !line.display_type);
+    // Odoo 17 marks normal product lines with display_type='product' (truthy), so the old
+    // `!line.display_type` filter silently rejected ALL product lines and the function no-oped.
+    // We treat falsy and 'product' as product lines; exclude line_section / line_note / tax / etc.
+    const productLines = lines.filter((line) => !line.display_type || line.display_type === 'product');
     if (productLines.length === 0) return;
 
     if (productLines.length === 1) {
