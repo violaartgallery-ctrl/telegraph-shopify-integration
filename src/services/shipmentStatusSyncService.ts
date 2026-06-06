@@ -174,52 +174,135 @@ export class ShipmentStatusSyncService {
     }
 
     if (projection.collectionStatus === 'collected') {
-      try {
-        const markResult = await shopifyStatusSyncClient.markOrderAsPaid(record.shopifyOrderId);
-        if (markResult.skipped) {
-          logger.info('Shopify order already paid — mark-as-paid skipped', {
-            shopifyOrderId: record.shopifyOrderId,
-            reason: markResult.reason
-          });
-        } else {
-          logger.info('Shopify order marked as paid', {
-            shopifyOrderId: record.shopifyOrderId,
-            financialStatus: markResult.financialStatus
-          });
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : 'Unknown Shopify mark-as-paid error';
-        logger.error('Failed to mark Shopify order as paid', {
-          recordId: record.id,
-          shopifyOrderId: record.shopifyOrderId,
-          reason
-        });
-        await failedPayloadService.save({
-          source: 'shopify-mark-as-paid',
-          externalId: record.shopifyOrderId,
-          reason,
-          payload: record
-        });
-      }
+      await this.recordShopifyPayment(record, Number(shipment.collectedAmount ?? 0));
     }
 
-    if ((projection.collectionStatus === 'returned' || projection.collectionStatus === 'returned-settled') && this.odooSyncService) {
-      try {
-        await this.odooSyncService.syncReturnedShipmentCharge(record.id);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : 'Unknown Odoo return charge sync error';
-        logger.error('Failed to sync returned shipment charge to Odoo', {
-          recordId: record.id,
-          shopifyOrderId: record.shopifyOrderId,
-          reason
-        });
-        await failedPayloadService.save({
-          source: 'odoo-return-charge-sync',
-          externalId: record.shopifyOrderId,
-          reason,
-          payload: record
+    if (projection.collectionStatus === 'returned' || projection.collectionStatus === 'returned-settled') {
+      if (this.odooSyncService) {
+        try {
+          await this.odooSyncService.syncReturnedShipmentCharge(record.id);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'Unknown Odoo return charge sync error';
+          logger.error('Failed to sync returned shipment charge to Odoo', {
+            recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
+          });
+          await failedPayloadService.save({
+            source: 'odoo-return-charge-sync', externalId: record.shopifyOrderId, reason, payload: record
+          });
+        }
+      }
+      await this.cancelShopifyOrderForReturn(record, projection.collectionStatus);
+    }
+
+    if (projection.collectionStatus === 'delivered-not-collected') {
+      await this.flagShopifyOrderNotCollected(record);
+    }
+  }
+
+  /**
+   * Phase 1 + discount-aware Shopify payment recording.
+   * - Compares the actual collected amount with the Shopify order total.
+   * - Equal (or higher) → straight SALE transaction for the total.
+   * - Lower → add a line-item discount for the gap, then SALE for collected.
+   * - Idempotent: fetchOrderPaymentState skips already-paid orders.
+   */
+  private async recordShopifyPayment(record: { id: number; shopifyOrderId: string }, collectedAmount: number): Promise<void> {
+    try {
+      const first = await shopifyStatusSyncClient.recordCustomerPayment({
+        orderId: record.shopifyOrderId,
+        amount: collectedAmount
+      });
+      if (first.skipped) {
+        if (first.reason === 'needs-discount' && first.needsDiscountFor && first.total) {
+          // Phase 1 (Case B): collected < shopifyTotal → apply discount + pay collected
+          try {
+            await shopifyStatusSyncClient.applyOrderDiscountAndPay({
+              orderId: record.shopifyOrderId,
+              discountAmount: first.needsDiscountFor,
+              paymentAmount: collectedAmount,
+              discountDescription: 'Telegraph collection adjustment'
+            });
+            logger.info('Shopify discount applied + payment recorded', {
+              shopifyOrderId: record.shopifyOrderId,
+              total: first.total,
+              discount: first.needsDiscountFor,
+              paid: collectedAmount
+            });
+          } catch (discountError) {
+            const reason = discountError instanceof Error ? discountError.message : 'Unknown discount error';
+            logger.error('Failed to apply Shopify discount before payment', {
+              recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
+            });
+            await failedPayloadService.save({
+              source: 'shopify-mark-as-paid', externalId: record.shopifyOrderId, reason, payload: record
+            });
+          }
+        } else {
+          logger.info('Shopify payment skipped', { shopifyOrderId: record.shopifyOrderId, reason: first.reason });
+        }
+      } else {
+        logger.info('Shopify payment recorded', {
+          shopifyOrderId: record.shopifyOrderId, transactionId: first.transactionId, amount: collectedAmount
         });
       }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unknown Shopify payment recording error';
+      logger.error('Failed to record Shopify customer payment', {
+        recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
+      });
+      await failedPayloadService.save({
+        source: 'shopify-mark-as-paid', externalId: record.shopifyOrderId, reason, payload: record
+      });
+    }
+  }
+
+  /** Phase 2: cancel a Shopify order when Telegraph returns it. Idempotent. */
+  private async cancelShopifyOrderForReturn(
+    record: { id: number; shopifyOrderId: string },
+    collectionStatus: string
+  ): Promise<void> {
+    try {
+      const result = await shopifyStatusSyncClient.cancelOrder({
+        orderId: record.shopifyOrderId,
+        reason: 'OTHER',
+        refund: false,
+        restock: true,
+        notifyCustomer: false,
+        staffNote: 'Telegraph returned shipment (' + collectionStatus + ')'
+      });
+      if (result.skipped) {
+        logger.info('Shopify cancel skipped', { shopifyOrderId: record.shopifyOrderId, reason: result.reason });
+      } else {
+        logger.info('Shopify order cancelled for return', { shopifyOrderId: record.shopifyOrderId, collectionStatus });
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unknown Shopify cancel error';
+      logger.error('Failed to cancel Shopify order for return', {
+        recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
+      });
+      await failedPayloadService.save({
+        source: 'shopify-order-cancel', externalId: record.shopifyOrderId, reason, payload: record
+      });
+    }
+  }
+
+  /** Phase 2: flag a delivered-but-not-collected order for human follow-up. */
+  private async flagShopifyOrderNotCollected(record: { id: number; shopifyOrderId: string }): Promise<void> {
+    try {
+      await shopifyStatusSyncClient.flagOrderForFollowUp({
+        orderId: record.shopifyOrderId,
+        note: '⚠️ Telegraph delivered but customer did not pay. Business follow-up required.',
+        tag: 'needs-collection-followup'
+      });
+      logger.warn('Shopify order flagged for not-collected', { shopifyOrderId: record.shopifyOrderId });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unknown Shopify flag error';
+      logger.error('Failed to flag Shopify order as not-collected', {
+        recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
+      });
+      await failedPayloadService.save({
+        source: 'shopify-order-flag', externalId: record.shopifyOrderId, reason, payload: record
+      });
     }
   }
 
@@ -247,18 +330,16 @@ export class ShipmentStatusSyncService {
     }
 
     try {
-      const markResult = await shopifyStatusSyncClient.markOrderAsPaid(record.shopifyOrderId);
-      if (markResult.skipped) {
-        logger.info('Shopify order already paid — mark-as-paid skipped', {
-          shopifyOrderId: record.shopifyOrderId,
-          reason: markResult.reason
-        });
-      } else {
-        logger.info('Shopify order marked as paid from approved Telegraph payment', {
-          shopifyOrderId: record.shopifyOrderId,
-          financialStatus: markResult.financialStatus
-        });
+      // For payment-entry-driven sync the actual collected amount lives on the DB record.
+      const dbRec = await shipmentRepository.findById(record.id);
+      const collectedAmount = Number(dbRec?.collectedAmount ?? 0);
+      if (collectedAmount > 0) {
+        await this.recordShopifyPayment({ id: record.id, shopifyOrderId: record.shopifyOrderId }, collectedAmount);
+        return;
       }
+      logger.info('Shopify payment skipped from financials path (no collectedAmount)', {
+        shopifyOrderId: record.shopifyOrderId
+      });
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'Unknown Shopify mark-as-paid error';
       logger.error('Failed to mark Shopify order as paid from payment entry', {
