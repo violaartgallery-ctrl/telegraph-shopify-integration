@@ -1,5 +1,7 @@
 import { env } from '../config/env.js';
-import { requestShopifyAdmin } from './shopifyAdminGraphql.js';
+import { requestShopifyAdmin, requestShopifyAdminRest } from './shopifyAdminGraphql.js';
+
+const orderRestId = (orderGid: string): string => orderGid.split('/').pop() ?? orderGid;
 
 const METAFIELDS_SET_MUTATION = `
   mutation SetAccurateMetafields($metafields: [MetafieldsSetInput!]!) {
@@ -380,30 +382,31 @@ export const shopifyStatusSyncClient = {
     }
 
     const captureAmount = Math.min(amount, Math.max(state.totalOutstanding, state.totalPrice));
-    const response = await requestShopifyAdmin<{
-      orderTransactionCreate: {
-        transaction: { id: string; status: string; kind: string } | null;
-        userErrors: Array<{ field?: string[] | null; message: string }>;
-      };
-    }>(ORDER_TRANSACTION_CREATE_MUTATION, {
-      input: {
-        orderId: ownerId,
-        kind: 'SALE',
-        status: 'SUCCESS',
-        amount: captureAmount.toFixed(2),
-        gateway: params.gateway ?? 'Cash on Delivery (COD)',
-        parentId: null
-      }
-    });
-    const errs = response.orderTransactionCreate.userErrors;
-    if (errs.length > 0) {
-      const msg = errs.map((e) => e.message).join('; ');
-      if (/already paid|cannot.*paid/i.test(msg)) {
-        return { skipped: true, reason: 'already-paid' };
-      }
-      throw new Error(`orderTransactionCreate failed: ${msg}`);
+    // Older Shopify API versions don't expose orderTransactionCreate via GraphQL.
+    // REST endpoint /orders/:id/transactions.json has been stable for years.
+    const restOrderId = orderRestId(ownerId);
+    try {
+      const resp = await requestShopifyAdminRest<{ transaction: { id: number; kind: string; status: string; amount: string } }>(
+        `/orders/${restOrderId}/transactions.json`,
+        {
+          method: 'POST',
+          body: {
+            transaction: {
+              kind: 'sale',
+              status: 'success',
+              amount: captureAmount.toFixed(2),
+              gateway: params.gateway ?? 'Cash on Delivery (COD)',
+              source: 'external'
+            }
+          }
+        }
+      );
+      return { skipped: false, transactionId: String(resp.transaction.id) };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/already paid|cannot.*paid/i.test(msg)) return { skipped: true, reason: 'already-paid' };
+      throw new Error(`Shopify transaction create (REST) failed: ${msg}`);
     }
-    return { skipped: false, transactionId: response.orderTransactionCreate.transaction?.id };
   },
 
   /**
@@ -475,28 +478,26 @@ export const shopifyStatusSyncClient = {
       throw new Error('orderEditCommit: ' + commit.orderEditCommit.userErrors.map((e) => e.message).join('; '));
     }
 
-    // 4. Create the SALE transaction for the actual collected amount.
-    const tx = await requestShopifyAdmin<{
-      orderTransactionCreate: {
-        transaction: { id: string; status: string; kind: string } | null;
-        userErrors: Array<{ field?: string[] | null; message: string }>;
-      };
-    }>(ORDER_TRANSACTION_CREATE_MUTATION, {
-      input: {
-        orderId: ownerId,
-        kind: 'SALE',
-        status: 'SUCCESS',
-        amount: Number(params.paymentAmount).toFixed(2),
-        gateway: params.gateway ?? 'Cash on Delivery (COD)',
-        parentId: null
+    // 4. Create the SALE transaction for the actual collected amount (REST, see recordCustomerPayment).
+    const restOrderId = orderRestId(ownerId);
+    const txResp = await requestShopifyAdminRest<{ transaction: { id: number; kind: string; status: string; amount: string } }>(
+      `/orders/${restOrderId}/transactions.json`,
+      {
+        method: 'POST',
+        body: {
+          transaction: {
+            kind: 'sale',
+            status: 'success',
+            amount: Number(params.paymentAmount).toFixed(2),
+            gateway: params.gateway ?? 'Cash on Delivery (COD)',
+            source: 'external'
+          }
+        }
       }
-    });
-    if (tx.orderTransactionCreate.userErrors.length > 0) {
-      throw new Error('orderTransactionCreate after edit: ' + tx.orderTransactionCreate.userErrors.map((e) => e.message).join('; '));
-    }
+    );
 
     return {
-      transactionId: tx.orderTransactionCreate.transaction?.id,
+      transactionId: String(txResp.transaction.id),
       calculatedOrderId: calc.id
     };
   },
