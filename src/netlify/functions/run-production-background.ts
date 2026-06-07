@@ -258,28 +258,25 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
     }
   }
 
-  // ── Waybill PDF ────────────────────────────────────────────────────────────
-  // De-duplicate codes (an order could appear once; guard anyway) so the PDF
-  // doesn't render the same waybill twice.
+  // ── Waybill print link ───────────────────────────────────────────────────
+  // We send Telegraph's official print URL instead of generating a PDF on the
+  // server. The link is deterministic (just shipment codes joined into a URL)
+  // so it can never fail to build, and it opens Telegraph's own print page in
+  // the user's browser — where they are already logged in — giving a 100%
+  // reliable waybill the user can print or save as PDF (Ctrl+P).
   const uniqueShipmentCodes = [...new Set(createdShipmentCodes)];
   if (uniqueShipmentCodes.length > 0) {
-    await sendMessage(chatId, `🖨️ جاري تجهيز PDF البوالص — ${uniqueShipmentCodes.length} شحنة...`);
-    try {
-      const { generateWaybillPdf } = await import('../../services/waybillGenerator.js');
-      const pdfBuf = await generateWaybillPdf(uniqueShipmentCodes);
-      const dateStr = new Date().toISOString().slice(0, 10);
-      await sendDocument(
-        chatId,
-        pdfBuf,
-        `waybills_${dateStr}.pdf`,
-        `واي بيل ✅ — ${uniqueShipmentCodes.length} شحنة`
-      );
-    } catch (err) {
-      await sendMessage(chatId, `⚠️ فشل تجهيز PDF البوالص:\n${String(err).slice(0, 300)}`);
-    }
+    const codesParam = uniqueShipmentCodes.map(encodeURIComponent).join(',');
+    const printUrl = `https://system.telegraphex.com/print/waybill/shipment/A4/3d/${codesParam}`;
+    await sendMessage(
+      chatId,
+      `🖨️ *بوالص الشحن (${uniqueShipmentCodes.length}):*\n${printUrl}\n\n` +
+        `افتح اللينك ← هيفتح صفحة الطباعة الرسمية ← اطبع أو احفظ PDF (Ctrl+P).`,
+      { parse_mode: 'Markdown' }
+    );
   } else {
     // No shipment codes at all — tell the user explicitly instead of silently
-    // skipping, so a /run that produces no PDF is never a mystery.
+    // skipping, so a /run that produces no waybills is never a mystery.
     await sendMessage(
       chatId,
       'ℹ️ مفيش بوالص للطباعة — يا إما مفيش أوردرات جاهزة، يا إما كلها اتشحنت ومالهاش كود شحنة محفوظ.'
