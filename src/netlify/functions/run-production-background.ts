@@ -134,7 +134,8 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
   // function has a 15-min budget, so it generates them locally from the entries.
   try {
     const { buildAiBuffers } = await import('../../services/aiWriter.js');
-    const aiFiles = await buildAiBuffers(productionEntries as never, { maxLines: 90 });
+    // Split by file size (~3 MB each) so RDWorks doesn't choke on one big file.
+    const aiFiles = await buildAiBuffers(productionEntries as never, { maxBytes: 3_000_000 });
     for (let i = 0; i < aiFiles.length; i++) {
       const label = aiFiles.length > 1 ? `${i + 1}/${aiFiles.length}` : '';
       await sendDocument(chatId, aiFiles[i]!, `laser_${dateStr}_${i + 1}.ai`, `ملف الليزر 🔪 ${label}`.trim());

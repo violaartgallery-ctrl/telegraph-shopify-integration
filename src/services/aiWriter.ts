@@ -262,57 +262,49 @@ function allRows(blocks: Block[]): Row[] {
   return rows;
 }
 
-function splitRows(rows: Row[], numParts?: number, maxLines?: number): Row[][] {
-  const n0 = rows.length;
-  if (n0 === 0) return [];
-  let parts: Row[][] = [];
-  if (numParts && !maxLines) {
-    const n = Math.max(1, Math.min(numParts, n0));
-    const target = n0 / n;
-    let cur: Row[] = [];
-    rows.forEach((row, idx) => {
-      cur.push(row);
-      const remaining = n0 - idx - 1;
-      const partsAfter = n - parts.length - 1;
-      if (parts.length < n - 1 && (cur.length >= target || remaining <= partsAfter)) { parts.push(cur); cur = []; }
-    });
-    if (cur.length) parts.push(cur);
-  } else {
-    const cap = Math.max(1, maxLines || n0);
-    let cur: Row[] = [];
-    for (const row of rows) {
-      if (cur.length && cur.length + 1 > cap) { parts.push(cur); cur = []; }
-      cur.push(row);
-    }
-    if (cur.length) parts.push(cur);
-  }
-  // Re-insert the header when a part begins mid-product.
-  return parts.map((part) => (part.length && part[0]!.kind === "value"
-    ? [{ text: part[0]!.owner, kind: "name", owner: part[0]!.owner } as Row, ...part]
-    : part));
+// ── Weld once, pack by file SIZE, emit ─────────────────────────────────────────
+// Splitting by line count is wrong because one inline wallet line can be huge.
+// We weld every row once (at baseline 0), estimate its byte weight, then pack
+// rows into files so each file stays under a target size (~3 MB → 3-4 files).
+const BYTES_PER_POINT = 16;          // ~"1234.56 789.01 L\n"
+const DEFAULT_MAX_BYTES = 3_000_000; // target per .ai file
+
+interface WeldedRow { kind: "name" | "value"; owner: string; geom: MultiPoly | null; width: number; points: number; }
+
+function countPoints(geom: MultiPoly | null): number {
+  if (!geom) return 0;
+  let n = 0;
+  for (const poly of geom) for (const ring of poly) n += ring.length;
+  return n;
 }
 
-// ── Layout + AI emit ───────────────────────────────────────────────────────────
-function layoutRows(rows: Row[]) {
-  const placed: Array<{ text: string; kind: "name" | "value"; off: number }> = [];
-  let offset = MARGIN;
-  let prev: string | null = null;
-  for (const r of rows) {
-    if (r.kind === "name") offset += GROUP_GAP;
-    else if (prev === "name") offset += HEADER_GAP;
-    else offset += WALLET_GAP;
-    placed.push({ text: r.text, kind: r.kind, off: offset });
-    prev = r.kind;
+function weldRow(r: { text: string; kind: "name" | "value"; owner: string }): WeldedRow {
+  const { geom, width } = weldLine(r.text, 0);  // weld at baseline 0; translate later
+  return { kind: r.kind, owner: r.owner, geom, width, points: countPoints(geom) };
+}
+
+function translateGeom(geom: MultiPoly, dy: number): MultiPoly {
+  return geom.map((poly) => poly.map((ring) => ring.map(([x, y]) => [x, y + dy] as [number, number])));
+}
+
+function packBySize(welded: WeldedRow[], maxBytes: number): WeldedRow[][] {
+  const parts: WeldedRow[][] = [];
+  let cur: WeldedRow[] = [];
+  let curBytes = 0;
+  for (const w of welded) {
+    const wb = w.points * BYTES_PER_POINT;
+    if (cur.length && curBytes + wb > maxBytes) { parts.push(cur); cur = []; curBytes = 0; }
+    cur.push(w);
+    curBytes += wb;
   }
-  const totalH = offset + MARGIN;
-  const welded: Array<{ geom: MultiPoly; kind: "name" | "value" }> = [];
-  let maxW = 0;
-  for (const p of placed) {
-    const { geom, width } = weldLine(p.text, totalH - p.off);
-    if (geom && geom.length) { welded.push({ geom, kind: p.kind }); maxW = Math.max(maxW, width); }
-  }
-  if (!welded.length) throw new Error("No drawable customization content for the AI file.");
-  return { welded, totalW: maxW + 2 * MARGIN, totalH };
+  if (cur.length) parts.push(cur);
+  // Re-insert the product header when a file begins in the middle of a product.
+  return parts.map((part) => {
+    if (part.length && part[0]!.kind === "value") {
+      return [weldRow({ text: part[0]!.owner, kind: "name", owner: part[0]!.owner }), ...part];
+    }
+    return part;
+  });
 }
 
 function polyToAi(poly: Poly, out: string[]) {
@@ -328,17 +320,33 @@ function polyToAi(poly: Poly, out: string[]) {
   out.push("f");
 }
 
-function writeAiRows(rows: Row[]): string {
-  const { welded, totalW, totalH } = layoutRows(rows);
+function emitPart(part: WeldedRow[]): string {
+  // Assign top-down baselines with kind-aware gaps.
+  const placed: Array<{ w: WeldedRow; off: number }> = [];
+  let offset = MARGIN;
+  let prev: string | null = null;
+  let maxW = 0;
+  for (const w of part) {
+    if (w.kind === "name") offset += GROUP_GAP;
+    else if (prev === "name") offset += HEADER_GAP;
+    else offset += WALLET_GAP;
+    placed.push({ w, off: offset });
+    prev = w.kind;
+    maxW = Math.max(maxW, w.width);
+  }
+  const totalH = offset + MARGIN;
+
   const out: string[] = [
     "%!PS-Adobe-3.0 EPSF-3.0",
     "%%Creator: VIOLA Production Agent (welded outlines, no fonts)",
-    `%%BoundingBox: 0 0 ${Math.floor(totalW * PT_SCALE) + 1} ${Math.floor(totalH * PT_SCALE) + 1}`,
+    `%%BoundingBox: 0 0 ${Math.floor((maxW + 2 * MARGIN) * PT_SCALE) + 1} ${Math.floor(totalH * PT_SCALE) + 1}`,
     "%%EndComments",
   ];
   let last: string | null = null;
-  for (const { geom, kind } of welded) {
-    const c = kind === "value" ? COLOR_VALUE : COLOR_REF;
+  for (const { w, off } of placed) {
+    if (!w.geom) continue;
+    const geom = translateGeom(w.geom, totalH - off);  // move from baseline 0 to its place
+    const c = w.kind === "value" ? COLOR_VALUE : COLOR_REF;
     const key = c.join(",");
     if (key !== last) { out.push(`${c[0].toFixed(1)} ${c[1].toFixed(1)} ${c[2].toFixed(1)} setrgbcolor`); last = key; }
     for (const poly of geom) polyToAi(poly, out);
@@ -347,14 +355,15 @@ function writeAiRows(rows: Row[]): string {
   return out.join("\n");
 }
 
-/** Build one or more .ai files. Returns array of Buffers (latin1-encoded). */
+/** Build one or more .ai files, split by file SIZE. Returns latin1 Buffers. */
 export async function buildAiBuffers(
   entries: AiEntry[],
-  opts: { numParts?: number; maxLines?: number } = {},
+  opts: { maxBytes?: number } = {},
 ): Promise<Buffer[]> {
   await ensureHB();  // load the HarfBuzz WASM module before any sync glyph work
   const rows = allRows(buildBlocks(entries));
   if (!rows.length) return [];
-  const parts = splitRows(rows, opts.numParts, opts.maxLines ?? 90);
-  return parts.map((part) => Buffer.from(writeAiRows(part), "latin1"));
+  const welded = rows.map(weldRow);
+  const parts = packBySize(welded, opts.maxBytes ?? DEFAULT_MAX_BYTES);
+  return parts.map((part) => Buffer.from(emitPart(part), "latin1"));
 }
