@@ -16,7 +16,11 @@ schedule = "* * * * *"
 
 [functions."run-production-background"]
 background = true
-included_files = ["dist/assets/fonts/**", "node_modules/harfbuzzjs/dist/*.wasm"]
+node_bundler = "esbuild"
+included_files = ["dist/assets/fonts/**", "node_modules/harfbuzzjs/dist/**"]
+# harfbuzzjs is ESM with a top-level await — keep it unbundled so it loads as a
+# real ESM module at runtime (dynamic import) instead of being inlined into CJS.
+external_node_modules = ["harfbuzzjs"]
 
 [functions."ensure-telegram-webhook"]
 schedule = "*/5 * * * *"
