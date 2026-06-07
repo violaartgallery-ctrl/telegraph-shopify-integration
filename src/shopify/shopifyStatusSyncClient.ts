@@ -502,6 +502,17 @@ export const shopifyStatusSyncClient = {
     };
   },
 
+  /** Add tags to an order (standalone helper, used by legacy reconciliation). */
+  addOrderTags: async (orderId: string | number, tags: string[]): Promise<void> => {
+    const ownerId = toOrderGid(orderId);
+    const resp = await requestShopifyAdmin<{ tagsAdd: { userErrors: Array<{ message: string }> } }>(
+      TAGS_ADD_MUTATION, { id: ownerId, tags }
+    );
+    if (resp.tagsAdd.userErrors.length > 0) {
+      throw new Error('addOrderTags: ' + resp.tagsAdd.userErrors.map((e) => e.message).join('; '));
+    }
+  },
+
   /**
    * Phase 2: cancel an order (used for returned / returned-settled).
    *

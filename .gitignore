@@ -12,3 +12,8 @@ logs
 .claude/
 *.log
 *.pid
+
+# legacy reconciliation temp artifacts
+_*.cjs
+_legacy_*.csv
+_legacy_*.json
