@@ -128,11 +128,15 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
   );
 
   // ── Step 3: Send photos individually from photo_attachments URLs ──────────
-  const allPhotoAttachments: Array<{ url: string; orderName: string; name: string }> = [];
+  // Caption format the factory needs: "#orderNumber — productName color".
+  // We carry the entry's product/color (not the attachment filename, which is
+  // a generic "صورة الطبعة") so each photo is identifiable.
+  const allPhotoAttachments: Array<{ url: string; orderName: string; product: string }> = [];
   for (const entry of productionEntries) {
+    const product = `${entry.display_product}${entry.display_color ? ` ${entry.display_color}` : ''}`.trim();
     for (const ph of entry.photo_attachments ?? []) {
       if (ph.attachment_url) {
-        allPhotoAttachments.push({ url: ph.attachment_url, orderName: ph.order_name, name: ph.attachment_name });
+        allPhotoAttachments.push({ url: ph.attachment_url, orderName: ph.order_name, product });
       }
     }
   }
@@ -155,7 +159,9 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
           const rawExt = new URL(photo.url).pathname.split('.').pop() ?? 'jpg';
           const ext = rawExt.length <= 5 ? rawExt : 'jpg';
           const safeName = photo.orderName.replace(/[^a-zA-Z0-9_-]/g, '_');
-          await sendDocument(chatId, photoBuf, `${safeName}_photo_${i + 1}.${ext}`, `${photo.orderName} — ${photo.name}`);
+          // Caption = "#orderNumber — productName color" so the factory can
+          // identify which order/product each photo belongs to.
+          await sendDocument(chatId, photoBuf, `${safeName}_photo_${i + 1}.${ext}`, `${photo.orderName} — ${photo.product}`);
         } else {
           photoFailures.push(`${photo.orderName}: HTTP ${photoResp.status}`);
         }
