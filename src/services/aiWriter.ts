@@ -224,7 +224,8 @@ function entryInline(e: AiEntry): string {
     for (const piece of String(value).split(/\r?\n/)) {
       const p = piece.trim();
       if (!p) continue;
-      parts.push(sl ? `${sl} ${p}`.trim() : p);
+      // Colon glues the label to its value so long values stay readable.
+      parts.push(sl ? `${sl}: ${p}` : p);
     }
   }
   return parts.join("  ----  ");
