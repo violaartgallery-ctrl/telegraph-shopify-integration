@@ -30,7 +30,9 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "graphql": "^16.11.0",
+    "harfbuzzjs": "^1.2.1",
     "pdf-lib": "^1.17.1",
+    "polygon-clipping": "^0.15.7",
     "serverless-http": "^3.2.0"
   },
   "devDependencies": {

@@ -16,7 +16,7 @@ schedule = "* * * * *"
 
 [functions."run-production-background"]
 background = true
-included_files = ["dist/assets/fonts/**"]
+included_files = ["dist/assets/fonts/**", "node_modules/harfbuzzjs/dist/*.wasm"]
 
 [functions."ensure-telegram-webhook"]
 schedule = "*/5 * * * *"
