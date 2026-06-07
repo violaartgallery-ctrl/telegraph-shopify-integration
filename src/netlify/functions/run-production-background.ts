@@ -36,9 +36,20 @@ interface AymanEntry {
   photo_attachments?: PhotoAttachment[];
 }
 
+interface AymanOrderDetail {
+  order_name: string;
+  customer: string;
+  created_at: string;
+  items: Array<{
+    product: string; color: string; variant: string; quantity: number;
+    customizations: Array<[string, string]>; photo_urls: string[];
+  }>;
+}
+
 interface AymanResponse {
   wordBase64: string;
   aiBase64?: string[];   // laser-ready welded outline .ai file(s) for RDWorks
+  ordersDetail?: AymanOrderDetail[]; // per-order summary data (lightweight)
   productionEntries: AymanEntry[];
   summary?: { totalOrders?: number; productionEntries?: number };
   warnings?: string[];
@@ -143,6 +154,19 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
     if (aiFiles.length) await sendMessage(chatId, `🔪 بعتّ ${aiFiles.length} ملف ليزر (AI)`);
   } catch (err) {
     await sendMessage(chatId, `⚠️ فشل توليد ملف الليزر: ${String(err).slice(0, 200)}`);
+  }
+
+  // ── Step 2c: Build + send the per-order summary (customer + photos embedded) ─
+  // Built here (not the aggregator) so the embedded photos never hit the 6 MB cap.
+  try {
+    const detail = aymanData.ordersDetail ?? [];
+    if (detail.length) {
+      const { buildOrdersSummaryBuffer } = await import('../../services/orderSummaryWriter.js');
+      const ordersBuf = await buildOrdersSummaryBuffer(detail as never);
+      await sendDocument(chatId, ordersBuf, `orders_${dateStr}.docx`, 'تجميعة بالأوردر 📋');
+    }
+  } catch (err) {
+    await sendMessage(chatId, `⚠️ فشل توليد ملف الأوردرات: ${String(err).slice(0, 200)}`);
   }
 
   // ── Step 3: Send photos individually from photo_attachments URLs ──────────
