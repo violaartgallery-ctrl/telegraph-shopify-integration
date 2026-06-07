@@ -37,6 +37,25 @@ const itemQuantity = (item: ShopifyLineItem): number =>
 const activeLineItems = (lineItems: ShopifyLineItem[]): ShopifyLineItem[] =>
   lineItems.filter((item) => itemQuantity(item) > 0);
 
+/**
+ * Net unit price AFTER all discounts (line-level + order-level codes like "20Eid").
+ *
+ * Shopify's `discountedUnitPriceSet` (mapped to item.price) only reflects line-level
+ * discounts; order-level discount codes are reported separately in discount_allocations.
+ * So the true per-unit price the customer pays =
+ *   (item.price * qty - sum(discount_allocations)) / qty
+ *
+ * Returns a 2-decimal string for the shipment description / Accurate product price.
+ */
+const netUnitPrice = (item: ShopifyLineItem): number => {
+  const qty = itemQuantity(item) || 1;
+  const lineDiscounted = Number.parseFloat(item.price) * qty;
+  const allocated = (item.discount_allocations ?? [])
+    .reduce((sum, a) => sum + Number.parseFloat(a.amount || '0'), 0);
+  const net = (lineDiscounted - allocated) / qty;
+  return Number.isFinite(net) && net > 0 ? Number(net.toFixed(2)) : Number.parseFloat(item.price);
+};
+
 export const buildAddress = (order: ShopifyOrder): string => {
   const address = order.shipping_address ?? order.billing_address;
   const parts = [
@@ -50,7 +69,7 @@ const buildProductsSummary = (lineItems: ShopifyLineItem[]): string =>
   lineItems
     .map((item) => {
       const variant = item.variant_title ? ` - ${item.variant_title}` : '';
-      return `${item.title}${variant} x${itemQuantity(item)} - Price: ${item.price}`;
+      return `${item.title}${variant} x${itemQuantity(item)} - Price: ${netUnitPrice(item)}`;
     })
     .join('\n');
 
@@ -70,7 +89,7 @@ const buildShipmentProducts = (lineItems: ShopifyLineItem[]) => {
       {
         productId: accurateProductId,
         quantity: itemQuantity(item),
-        price: Number.parseFloat(item.price),
+        price: netUnitPrice(item),
         typeCode: env.accurate.defaultProductTypeCode
       }
     ];
