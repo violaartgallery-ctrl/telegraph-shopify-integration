@@ -238,6 +238,11 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
       if (result.skipped) {
         const reason = result.reason ?? 'skipped';
         results.push({ orderName: order.name, ok: true, reason });
+        // Already-shipped orders still carry their shipment code — collect it so
+        // re-running /run regenerates the waybill PDF instead of sending nothing.
+        if (result.accurateShipmentCode) {
+          createdShipmentCodes.push(result.accurateShipmentCode);
+        }
         await sendMessage(chatId, `⏭️ ${order.name} — تم تخطيه: ${reason}`);
       } else {
         if (result.accurateShipmentCode) {
@@ -253,22 +258,29 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
     }
   }
 
-  // ── Waybill PDF ────────────────────────────────────────────────────────────
-  if (createdShipmentCodes.length > 0) {
-    await sendMessage(chatId, `🖨️ جاري تجهيز PDF البوالص — ${createdShipmentCodes.length} شحنة...`);
-    try {
-      const { generateWaybillPdf } = await import('../../services/waybillGenerator.js');
-      const pdfBuf = await generateWaybillPdf(createdShipmentCodes);
-      const dateStr = new Date().toISOString().slice(0, 10);
-      await sendDocument(
-        chatId,
-        pdfBuf,
-        `waybills_${dateStr}.pdf`,
-        `واي بيل ✅ — ${createdShipmentCodes.length} شحنة`
-      );
-    } catch (err) {
-      await sendMessage(chatId, `⚠️ فشل تجهيز PDF البوالص:\n${String(err).slice(0, 300)}`);
-    }
+  // ── Waybill print link ───────────────────────────────────────────────────
+  // We send Telegraph's official print URL instead of generating a PDF on the
+  // server. The link is deterministic (just shipment codes joined into a URL)
+  // so it can never fail to build, and it opens Telegraph's own print page in
+  // the user's browser — where they are already logged in — giving a 100%
+  // reliable waybill the user can print or save as PDF (Ctrl+P).
+  const uniqueShipmentCodes = [...new Set(createdShipmentCodes)];
+  if (uniqueShipmentCodes.length > 0) {
+    const codesParam = uniqueShipmentCodes.map(encodeURIComponent).join(',');
+    const printUrl = `https://system.telegraphex.com/print/waybill/shipment/A4/3d/${codesParam}`;
+    await sendMessage(
+      chatId,
+      `🖨️ *بوالص الشحن (${uniqueShipmentCodes.length}):*\n${printUrl}\n\n` +
+        `افتح اللينك ← هيفتح صفحة الطباعة الرسمية ← اطبع أو احفظ PDF (Ctrl+P).`,
+      { parse_mode: 'Markdown' }
+    );
+  } else {
+    // No shipment codes at all — tell the user explicitly instead of silently
+    // skipping, so a /run that produces no waybills is never a mystery.
+    await sendMessage(
+      chatId,
+      'ℹ️ مفيش بوالص للطباعة — يا إما مفيش أوردرات جاهزة، يا إما كلها اتشحنت ومالهاش كود شحنة محفوظ.'
+    );
   }
 
   // ── Step 8: Final report ───────────────────────────────────────────────────
