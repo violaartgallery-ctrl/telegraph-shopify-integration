@@ -156,19 +156,6 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
     await sendMessage(chatId, `⚠️ فشل توليد ملف الليزر: ${String(err).slice(0, 200)}`);
   }
 
-  // ── Step 2c: Build + send the per-order summary (customer + photos embedded) ─
-  // Built here (not the aggregator) so the embedded photos never hit the 6 MB cap.
-  try {
-    const detail = aymanData.ordersDetail ?? [];
-    if (detail.length) {
-      const { buildOrdersSummaryBuffer } = await import('../../services/orderSummaryWriter.js');
-      const ordersBuf = await buildOrdersSummaryBuffer(detail as never);
-      await sendDocument(chatId, ordersBuf, `orders_${dateStr}.docx`, 'تجميعة بالأوردر 📋');
-    }
-  } catch (err) {
-    await sendMessage(chatId, `⚠️ فشل توليد ملف الأوردرات: ${String(err).slice(0, 200)}`);
-  }
-
   // ── Step 3: Send photos individually from photo_attachments URLs ──────────
   // Caption format the factory needs: "#orderNumber — productName color".
   // We carry the entry's product/color (not the attachment filename, which is
@@ -214,6 +201,21 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
     if (photoFailures.length > 0) {
       await sendMessage(chatId, `⚠️ فشل إرسال ${photoFailures.length} صورة:\n${photoFailures.slice(0, 5).join('\n')}`);
     }
+  }
+
+  // ── Step 3b: Per-order summary doc (customer + photos embedded) — LAST, so a
+  // failure here never blocks the Word/AI/photos that already went out. Built
+  // here (not the aggregator) so embedded photos never hit the 6 MB cap; image
+  // size is bounded inside the builder to keep the upload reliable. ───────────
+  try {
+    const detail = aymanData.ordersDetail ?? [];
+    if (detail.length) {
+      const { buildOrdersSummaryBuffer } = await import('../../services/orderSummaryWriter.js');
+      const ordersBuf = await buildOrdersSummaryBuffer(detail as never);
+      await sendDocument(chatId, ordersBuf, `orders_${dateStr}.docx`, 'تجميعة بالأوردر 📋');
+    }
+  } catch (err) {
+    await sendMessage(chatId, `⚠️ فشل توليد ملف الأوردرات: ${String(err).slice(0, 200)}`);
   }
 
   // ── Step 4: Production summary ────────────────────────────────────────────
