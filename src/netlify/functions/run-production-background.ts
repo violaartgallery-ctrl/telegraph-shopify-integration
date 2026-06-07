@@ -238,6 +238,11 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
       if (result.skipped) {
         const reason = result.reason ?? 'skipped';
         results.push({ orderName: order.name, ok: true, reason });
+        // Already-shipped orders still carry their shipment code — collect it so
+        // re-running /run regenerates the waybill PDF instead of sending nothing.
+        if (result.accurateShipmentCode) {
+          createdShipmentCodes.push(result.accurateShipmentCode);
+        }
         await sendMessage(chatId, `⏭️ ${order.name} — تم تخطيه: ${reason}`);
       } else {
         if (result.accurateShipmentCode) {
@@ -254,21 +259,31 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
   }
 
   // ── Waybill PDF ────────────────────────────────────────────────────────────
-  if (createdShipmentCodes.length > 0) {
-    await sendMessage(chatId, `🖨️ جاري تجهيز PDF البوالص — ${createdShipmentCodes.length} شحنة...`);
+  // De-duplicate codes (an order could appear once; guard anyway) so the PDF
+  // doesn't render the same waybill twice.
+  const uniqueShipmentCodes = [...new Set(createdShipmentCodes)];
+  if (uniqueShipmentCodes.length > 0) {
+    await sendMessage(chatId, `🖨️ جاري تجهيز PDF البوالص — ${uniqueShipmentCodes.length} شحنة...`);
     try {
       const { generateWaybillPdf } = await import('../../services/waybillGenerator.js');
-      const pdfBuf = await generateWaybillPdf(createdShipmentCodes);
+      const pdfBuf = await generateWaybillPdf(uniqueShipmentCodes);
       const dateStr = new Date().toISOString().slice(0, 10);
       await sendDocument(
         chatId,
         pdfBuf,
         `waybills_${dateStr}.pdf`,
-        `واي بيل ✅ — ${createdShipmentCodes.length} شحنة`
+        `واي بيل ✅ — ${uniqueShipmentCodes.length} شحنة`
       );
     } catch (err) {
       await sendMessage(chatId, `⚠️ فشل تجهيز PDF البوالص:\n${String(err).slice(0, 300)}`);
     }
+  } else {
+    // No shipment codes at all — tell the user explicitly instead of silently
+    // skipping, so a /run that produces no PDF is never a mystery.
+    await sendMessage(
+      chatId,
+      'ℹ️ مفيش بوالص للطباعة — يا إما مفيش أوردرات جاهزة، يا إما كلها اتشحنت ومالهاش كود شحنة محفوظ.'
+    );
   }
 
   // ── Step 8: Final report ───────────────────────────────────────────────────

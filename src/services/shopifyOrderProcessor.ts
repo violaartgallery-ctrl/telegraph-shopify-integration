@@ -66,6 +66,9 @@ export class ShopifyOrderProcessor {
           return {
             skipped: true,
             reason: 'duplicate-order',
+            // Surface the existing shipment code so a re-run can still
+            // regenerate the waybill PDF for an already-shipped order.
+            accurateShipmentCode: existing.accurateShipmentCode ?? undefined,
             fulfillment,
             odoo: {
               skipped: true,
@@ -97,7 +100,15 @@ export class ShopifyOrderProcessor {
           await shipmentRepository.markOdooSoPending(orderId);
           odoo = { skipped: true, reason: 'queued-for-background' };
         }
-        return { skipped: true, reason: 'duplicate-order', fulfillment, odoo };
+        return {
+          skipped: true,
+          reason: 'duplicate-order',
+          // Surface the existing shipment code so a re-run can still
+          // regenerate the waybill PDF for an already-shipped order.
+          accurateShipmentCode: existing.accurateShipmentCode ?? undefined,
+          fulfillment,
+          odoo,
+        };
       }
     }
 
