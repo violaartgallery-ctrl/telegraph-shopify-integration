@@ -111,7 +111,7 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
     return;
   }
 
-  const { wordBase64, aiBase64, productionEntries, summary, warnings } = aymanData;
+  const { wordBase64, productionEntries, summary, warnings } = aymanData;
   const dateStr = new Date().toISOString().slice(0, 10);
 
   await sendMessage(
@@ -128,14 +128,21 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
     `قائمة الإنتاج ✅ — ${productionEntries.length} منتج`
   );
 
-  // ── Step 2b: Send laser AI file(s) for RDWorks ─────────────────────────────
-  const aiFiles = aiBase64 ?? [];
-  for (let i = 0; i < aiFiles.length; i++) {
-    const aiBuf = Buffer.from(aiFiles[i]!, 'base64');
-    const label = aiFiles.length > 1 ? `${i + 1}/${aiFiles.length}` : '';
-    await sendDocument(chatId, aiBuf, `laser_${dateStr}_${i + 1}.ai`, `ملف الليزر 🔪 ${label}`.trim());
+  // ── Step 2b: Build + send laser AI file(s) for RDWorks ─────────────────────
+  // Built here (not in the aggregator) because the welded .ai files are large and
+  // would blow past the aggregator's 6 MB response limit. This background
+  // function has a 15-min budget, so it generates them locally from the entries.
+  try {
+    const { buildAiBuffers } = await import('../../services/aiWriter.js');
+    const aiFiles = await buildAiBuffers(productionEntries as never, { maxLines: 90 });
+    for (let i = 0; i < aiFiles.length; i++) {
+      const label = aiFiles.length > 1 ? `${i + 1}/${aiFiles.length}` : '';
+      await sendDocument(chatId, aiFiles[i]!, `laser_${dateStr}_${i + 1}.ai`, `ملف الليزر 🔪 ${label}`.trim());
+    }
+    if (aiFiles.length) await sendMessage(chatId, `🔪 بعتّ ${aiFiles.length} ملف ليزر (AI)`);
+  } catch (err) {
+    await sendMessage(chatId, `⚠️ فشل توليد ملف الليزر: ${String(err).slice(0, 200)}`);
   }
-  if (aiFiles.length) await sendMessage(chatId, `🔪 بعتّ ${aiFiles.length} ملف ليزر (AI)`);
 
   // ── Step 3: Send photos individually from photo_attachments URLs ──────────
   // Caption format the factory needs: "#orderNumber — productName color".
