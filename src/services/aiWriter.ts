@@ -192,6 +192,9 @@ function weldLine(text: string, baseline: number): { geom: MultiPoly | null; wid
     const fb = kind === "ar" ? ara : lat;
     const scale = ara.upem / fb.upem;
     for (const gl of shapeRun(fb, run)) {
+      // glyph 0 == .notdef: the font has no glyph (emoji, &, …). Skip it so we
+      // never draw a tofu box.
+      if (gl.g === 0) continue;
       const g = glyphGeom(fb, gl.g, penX + gl.xo * scale, baseline + gl.yo * scale, scale);
       if (g && g.length) geoms.push(g);
       penX += gl.ax * scale;
@@ -205,8 +208,15 @@ function weldLine(text: string, baseline: number): { geom: MultiPoly | null; wid
 }
 
 // ── Entry -> blocks (grouped inline layout) ────────────────────────────────────
+const MAX_INLINE = 70; // chars per AI line before wrapping (keeps lines readable)
+
 function productKey(e: AiEntry): string {
-  return `${e.display_product} ${e.display_color}`.trim();
+  const product = (e.display_product || "").trim();
+  const pl = product.toLowerCase();
+  // Boxes are grouped WITHOUT color; all purse boxes collapse into one group.
+  if (pl.includes("purse") && pl.includes("box")) return "Gift purse box";
+  if (pl.includes("box") || pl.includes("بوكس")) return product;
+  return `${product} ${e.display_color || ""}`.trim();
 }
 function shortLabel(label: string): string {
   const s = (label || "").trim();
@@ -217,7 +227,7 @@ function qtyOf(e: AiEntry): number {
   const q = Number(e.total_quantity || 1);
   return Number.isFinite(q) && q > 0 ? Math.floor(q) : 1;
 }
-function entryInline(e: AiEntry): string {
+function entryParts(e: AiEntry): string[] {
   const parts: string[] = [];
   for (const [label, value] of e.customization_cleaned) {
     const sl = shortLabel(label);
@@ -228,7 +238,36 @@ function entryInline(e: AiEntry): string {
       parts.push(sl ? `${sl}: ${p}` : p);
     }
   }
-  return parts.join("  ----  ");
+  return parts;
+}
+function wrapWords(text: string, maxChars: number): string[] {
+  const out: string[] = [];
+  let cur = "";
+  for (const w of text.split(/\s+/)) {
+    const cand = cur ? `${cur} ${w}` : w;
+    if (cand.length > maxChars && cur) { out.push(cur); cur = w; } else cur = cand;
+  }
+  if (cur) out.push(cur);
+  return out.length ? out : [text];
+}
+// One wallet on as FEW lines as fit; long values wrap so we never emit one giant
+// unreadable (multi-MB) line.
+function entryLines(e: AiEntry, maxChars = MAX_INLINE): string[] {
+  const parts = entryParts(e);
+  if (!parts.length) return [];
+  const lines: string[] = [];
+  let cur = "";
+  for (const part of parts) {
+    if (part.length > maxChars) {
+      if (cur) { lines.push(cur); cur = ""; }
+      lines.push(...wrapWords(part, maxChars));
+      continue;
+    }
+    const cand = cur ? `${cur}  ----  ${part}` : part;
+    if (cand.length > maxChars && cur) { lines.push(cur); cur = part; } else cur = cand;
+  }
+  if (cur) lines.push(cur);
+  return lines;
 }
 
 interface Block { header: string; lines: string[] }
@@ -236,7 +275,7 @@ function buildBlocks(entries: AiEntry[]): Block[] {
   const order: string[] = [];
   const byKey = new Map<string, AiEntry[]>();
   for (const e of entries) {
-    if (!entryInline(e)) continue;
+    if (!entryLines(e).length) continue;
     const k = productKey(e);
     if (!byKey.has(k)) { byKey.set(k, []); order.push(k); }
     byKey.get(k)!.push(e);
@@ -244,11 +283,13 @@ function buildBlocks(entries: AiEntry[]): Block[] {
   return order.map((k) => {
     const ents = byKey.get(k)!;
     const count = ents.reduce((s, e) => s + qtyOf(e), 0);
-    const lines = ents.map((e) => {
-      const txt = entryInline(e);
+    const lines: string[] = [];
+    for (const e of ents) {
+      const elines = entryLines(e);
       const q = qtyOf(e);
-      return q > 1 ? `x${q}   ${txt}` : txt;
-    });
+      if (q > 1 && elines.length) elines[0] = `x${q}   ${elines[0]}`;
+      lines.push(...elines);
+    }
     return { header: `${count} X ${k}`.toUpperCase(), lines };
   });
 }
