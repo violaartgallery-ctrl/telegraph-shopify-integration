@@ -231,12 +231,11 @@ function entryParts(e: AiEntry): string[] {
   const parts: string[] = [];
   for (const [label, value] of e.customization_cleaned) {
     const sl = shortLabel(label);
-    for (const piece of String(value).split(/\r?\n/)) {
-      const p = piece.trim();
-      if (!p) continue;
-      // Colon glues the label to its value so long values stay readable.
-      parts.push(sl ? `${sl}: ${p}` : p);
-    }
+    // Flatten multi-line values to one part so the label shows ONCE; word-wrap
+    // later splits long values across lines without repeating the label.
+    const v = String(value).replace(/\s+/g, " ").trim();
+    if (!v) continue;
+    parts.push(sl ? `${sl}: ${v}` : v);
   }
   return parts;
 }
