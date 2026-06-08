@@ -277,7 +277,9 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
   const { createAppServices } = await import('../../app.js');
   const { shopifyOrderProcessor } = createAppServices();
   const results: ShipResult[] = [];
-  const createdShipmentCodes: string[] = [];
+  // Telegraph's print page resolves shipments by their NUMERIC id (e.g. 9279686),
+  // NOT the VI display code — so collect ids for the waybill URL.
+  const createdShipmentIds: number[] = [];
 
   for (const order of orders) {
     try {
@@ -288,15 +290,15 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
       if (result.skipped) {
         const reason = result.reason ?? 'skipped';
         results.push({ orderName: order.name, ok: true, reason });
-        // Already-shipped orders still carry their shipment code — collect it so
-        // re-running /run regenerates the waybill PDF instead of sending nothing.
-        if (result.accurateShipmentCode) {
-          createdShipmentCodes.push(result.accurateShipmentCode);
+        // Already-shipped orders still carry their shipment id — collect it so
+        // re-running /run regenerates the waybill instead of sending nothing.
+        if (result.accurateShipmentId) {
+          createdShipmentIds.push(result.accurateShipmentId);
         }
         await sendMessage(chatId, `⏭️ ${order.name} — تم تخطيه: ${reason}`);
       } else {
-        if (result.accurateShipmentCode) {
-          createdShipmentCodes.push(result.accurateShipmentCode);
+        if (result.accurateShipmentId) {
+          createdShipmentIds.push(result.accurateShipmentId);
         }
         results.push({ orderName: order.name, ok: true });
         await sendMessage(chatId, `✅ ${order.name} — تم الشحن بنجاح`);
@@ -314,13 +316,13 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
   // so it can never fail to build, and it opens Telegraph's own print page in
   // the user's browser — where they are already logged in — giving a 100%
   // reliable waybill the user can print or save as PDF (Ctrl+P).
-  const uniqueShipmentCodes = [...new Set(createdShipmentCodes)];
-  if (uniqueShipmentCodes.length > 0) {
-    const codesParam = uniqueShipmentCodes.map(encodeURIComponent).join(',');
-    const printUrl = `https://system.telegraphex.com/print/waybill/shipment/A4/3d/${codesParam}`;
+  const uniqueShipmentIds = [...new Set(createdShipmentIds)];
+  if (uniqueShipmentIds.length > 0) {
+    const idsParam = uniqueShipmentIds.join(',');
+    const printUrl = `https://system.telegraphex.com/print/waybill/shipment/A4/3d/${idsParam}`;
     await sendMessage(
       chatId,
-      `🖨️ *بوالص الشحن (${uniqueShipmentCodes.length}):*\n${printUrl}\n\n` +
+      `🖨️ *بوالص الشحن (${uniqueShipmentIds.length}):*\n${printUrl}\n\n` +
         `افتح اللينك ← هيفتح صفحة الطباعة الرسمية ← اطبع أو احفظ PDF (Ctrl+P).`,
       { parse_mode: 'Markdown' }
     );

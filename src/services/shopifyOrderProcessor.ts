@@ -15,6 +15,7 @@ interface ProcessResult {
   skipped: boolean;
   reason?: string;
   accurateShipmentCode?: string;
+  accurateShipmentId?: number;
   fulfillment?: {
     skipped: boolean;
     reason?: string;
@@ -69,6 +70,7 @@ export class ShopifyOrderProcessor {
             // Surface the existing shipment code so a re-run can still
             // regenerate the waybill PDF for an already-shipped order.
             accurateShipmentCode: existing.accurateShipmentCode ?? undefined,
+            accurateShipmentId: existing.accurateShipmentId ?? undefined,
             fulfillment,
             odoo: {
               skipped: true,
@@ -153,7 +155,7 @@ export class ShopifyOrderProcessor {
       await shipmentRepository.markOdooSoPending(orderId);
       const odoo: NonNullable<ProcessResult['odoo']> = { skipped: true, reason: 'queued-for-background' };
 
-      return { skipped: false, accurateShipmentCode: shipment.code, fulfillment, odoo };
+      return { skipped: false, accurateShipmentCode: shipment.code, accurateShipmentId: shipment.id, fulfillment, odoo };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown shipment creation error';
       await shipmentRepository.markFailed(orderId, message);

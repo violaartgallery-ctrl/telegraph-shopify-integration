@@ -293,13 +293,17 @@ function buildBlocks(entries: AiEntry[]): Block[] {
   });
 }
 
-type Row = { text: string; kind: "name" | "value"; owner: string };
+const SEP_TEXT = "-".repeat(50); // divider line drawn between products
+type Kind2 = "name" | "value" | "sep";
+type Row = { text: string; kind: Kind2; owner: string };
 function allRows(blocks: Block[]): Row[] {
   const rows: Row[] = [];
-  for (const b of blocks) {
+  blocks.forEach((b, i) => {
+    // A divider line between products so they are easy to tell apart on the laser.
+    if (i > 0) rows.push({ text: SEP_TEXT, kind: "sep", owner: b.header });
     rows.push({ text: b.header, kind: "name", owner: b.header });
     for (const ln of b.lines) rows.push({ text: ln, kind: "value", owner: b.header });
-  }
+  });
   return rows;
 }
 
@@ -310,7 +314,7 @@ function allRows(blocks: Block[]): Row[] {
 const BYTES_PER_POINT = 16;          // ~"1234.56 789.01 L\n"
 const DEFAULT_MAX_BYTES = 3_000_000; // target per .ai file
 
-interface WeldedRow { kind: "name" | "value"; owner: string; geom: MultiPoly | null; width: number; points: number; }
+interface WeldedRow { kind: Kind2; owner: string; geom: MultiPoly | null; width: number; points: number; }
 
 function countPoints(geom: MultiPoly | null): number {
   if (!geom) return 0;
@@ -319,7 +323,7 @@ function countPoints(geom: MultiPoly | null): number {
   return n;
 }
 
-function weldRow(r: { text: string; kind: "name" | "value"; owner: string }): WeldedRow {
+function weldRow(r: { text: string; kind: Kind2; owner: string }): WeldedRow {
   const { geom, width } = weldLine(r.text, 0);  // weld at baseline 0; translate later
   return { kind: r.kind, owner: r.owner, geom, width, points: countPoints(geom) };
 }
@@ -340,7 +344,10 @@ function packBySize(welded: WeldedRow[], maxBytes: number): WeldedRow[][] {
   }
   if (cur.length) parts.push(cur);
   // Re-insert the product header when a file begins in the middle of a product.
-  return parts.map((part) => {
+  return parts.map((partIn) => {
+    // Never start a file with a divider line.
+    let part = partIn;
+    while (part.length && part[0]!.kind === "sep") part = part.slice(1);
     if (part.length && part[0]!.kind === "value") {
       return [weldRow({ text: part[0]!.owner, kind: "name", owner: part[0]!.owner }), ...part];
     }
@@ -368,7 +375,8 @@ function emitPart(part: WeldedRow[]): string {
   let prev: string | null = null;
   let maxW = 0;
   for (const w of part) {
-    if (w.kind === "name") offset += GROUP_GAP;
+    if (w.kind === "sep") offset += GROUP_GAP;                       // big space before the divider
+    else if (w.kind === "name") offset += prev === "sep" ? HEADER_GAP : GROUP_GAP;
     else if (prev === "name") offset += HEADER_GAP;
     else offset += WALLET_GAP;
     placed.push({ w, off: offset });
@@ -387,7 +395,7 @@ function emitPart(part: WeldedRow[]): string {
   for (const { w, off } of placed) {
     if (!w.geom) continue;
     const geom = translateGeom(w.geom, totalH - off);  // move from baseline 0 to its place
-    const c = w.kind === "value" ? COLOR_VALUE : COLOR_REF;
+    const c = w.kind === "name" ? COLOR_REF : COLOR_VALUE;
     const key = c.join(",");
     if (key !== last) { out.push(`${c[0].toFixed(1)} ${c[1].toFixed(1)} ${c[2].toFixed(1)} setrgbcolor`); last = key; }
     for (const poly of geom) polyToAi(poly, out);
