@@ -5,6 +5,7 @@ import { retry } from '../lib/retry.js';
 import {
   GET_SHIPMENT_QUERY,
   LIST_PAYMENTS_QUERY,
+  LIST_SHIPMENTS_QUERY,
   LIST_SHIPMENTS_FOR_PAYMENT_QUERY,
   LIST_ZONES_QUERY,
   LOGIN_MUTATION,
@@ -57,6 +58,14 @@ interface ShipmentLookupResponse {
       name?: string | null;
     } | null;
   } | null;
+}
+
+type ShipmentSummary = NonNullable<ShipmentLookupResponse['shipment']>;
+interface ListShipmentsResponse {
+  listShipments: {
+    paginatorInfo: PaginatorInfo;
+    data: ShipmentSummary[];
+  };
 }
 
 interface ZoneDropdownResponse {
@@ -328,6 +337,16 @@ export class AccurateClient {
       page
     });
     return response.listPayments;
+  }
+
+  // Lists ALL shipments (page-by-page). Works even when getShipment is unauthorized.
+  async listShipments(
+    input: Record<string, unknown> = {},
+    first = 100,
+    page = 1
+  ): Promise<ListShipmentsResponse['listShipments']> {
+    const response = await this.requestWithAuth<ListShipmentsResponse>(LIST_SHIPMENTS_QUERY, { input, first, page });
+    return response.listShipments;
   }
 
   async listShipmentsForPayment(id: number, first = 100, page = 1): Promise<ListShipmentsForPaymentResponse['listShipmentsForPayment']> {

@@ -14,6 +14,9 @@ schedule = "*/15 * * * *"
 [functions."process-odoo-queue"]
 schedule = "* * * * *"
 
+[functions."sync-collections-from-reports"]
+schedule = "*/15 * * * *"
+
 [functions."run-production-background"]
 background = true
 node_bundler = "esbuild"

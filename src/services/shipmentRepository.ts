@@ -39,6 +39,9 @@ export const shipmentRepository = {
       }
     }),
 
+  findByShopifyOrderName: async (shopifyOrderName: string) =>
+    await prisma.shipmentRecord.findFirst({ where: { shopifyOrderName } }),
+
   findByShipmentCodes: async (codes: string[]) =>
     await prisma.shipmentRecord.findMany({
       where: {

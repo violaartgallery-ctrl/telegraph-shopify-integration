@@ -105,6 +105,38 @@ export const LIST_PAYMENTS_QUERY = `
   }
 `;
 
+// Lists ALL shipments (works even when getShipment is unauthorized for this account).
+// Used by the collection-from-reports sync to detect collected shipments reliably.
+export const LIST_SHIPMENTS_QUERY = `
+  query ListShipments($input: ListShipmentsFilterInput, $first: Int!, $page: Int) {
+    listShipments(input: $input, first: $first, page: $page) {
+      paginatorInfo {
+        hasMorePages
+        currentPage
+        lastPage
+        total
+      }
+      data {
+        id
+        code
+        refNumber
+        deliveredOrReturnedDate
+        collected
+        cancelled
+        collectedAmount
+        pendingCollectionAmount
+        returnedValue
+        deliveryFees
+        returnFees
+        returningDueFees
+        customerDue
+        status { code name }
+        returnStatus { code name }
+      }
+    }
+  }
+`;
+
 export const LIST_SHIPMENTS_FOR_PAYMENT_QUERY = `
   query ListShipmentsForPayment($id: Int!, $first: Int!, $page: Int) {
     listShipmentsForPayment(id: $id, first: $first, page: $page) {

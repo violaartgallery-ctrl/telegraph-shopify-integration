@@ -44,6 +44,78 @@ export class ShipmentStatusSyncService {
     private readonly odooSyncService?: OdooSyncService
   ) {}
 
+  /**
+   * PERMANENT FIX (C): detect collections via the working `listShipments` API
+   * instead of the unauthorized `getShipment`. For each delivered+collected
+   * shipment that has a DB record but no Odoo invoice/payment yet, write the
+   * collection snapshot, create the Odoo invoice+payment, and mark Shopify paid.
+   *
+   * Time-budgeted for Netlify; processes up to `maxActions` per run. Returns a
+   * summary. Designed to run on a cron — keeps collections recorded going forward.
+   */
+  async syncCollectionsFromReports(opts: { maxActions?: number; budgetMs?: number } = {}): Promise<{ scanned: number; recorded: number; shopifyPaid: number; skipped: number; notInDb: number; failed: number }> {
+    const maxActions = opts.maxActions ?? 6;
+    const budgetMs = opts.budgetMs ?? 23_000;
+    const start = Date.now();
+    const DELIVERED = new Set(['DTR']);
+    const summary = { scanned: 0, recorded: 0, shopifyPaid: 0, skipped: 0, notInDb: 0, failed: 0 };
+    if (!this.odooSyncService) return summary;
+
+    let page = 1;
+    let actions = 0;
+    while (actions < maxActions && Date.now() - start < budgetMs) {
+      const res = await this.accurateClient.listShipments({}, 100, page);
+      const rows = res.data ?? [];
+      if (rows.length === 0) break;
+
+      for (const sh of rows) {
+        summary.scanned++;
+        const code = sh.code;
+        const ref = sh.refNumber ?? null;
+        const isOurs = /^VI\d/i.test(code) || (ref ? /viola/i.test(ref) : false);
+        if (!isOurs) continue;
+        if (!DELIVERED.has((sh.status?.code ?? '').toUpperCase()) || Number(sh.collectedAmount ?? 0) <= 0) continue;
+
+        // Find DB record by code, then by refNumber → order number.
+        let rec = await shipmentRepository.findByReference(code);
+        if (!rec && ref) {
+          const m = ref.match(/(\d{3,})\s*$/);
+          if (m) rec = await shipmentRepository.findByShopifyOrderName('#' + m[1]);
+        }
+        if (!rec) { summary.notInDb++; continue; }
+        if (rec.odooInvoiceId && (rec.odooPaymentId || rec.odooSalePaymentId)) { summary.skipped++; continue; }
+        if (actions >= maxActions || Date.now() - start >= budgetMs) break;
+
+        try {
+          await shipmentRepository.updateAccurateSnapshot(rec.id, {
+            accurateStatus: 'تم التسليم', accurateStatusCode: sh.status?.code ?? 'DTR',
+            collectionStatus: 'collected',
+            collectedAmount: Number(sh.collectedAmount ?? 0),
+            pendingCollectionAmount: Number(sh.pendingCollectionAmount ?? 0),
+            returnedValue: Number(sh.returnedValue ?? 0),
+            deliveryFees: Number(sh.deliveryFees ?? 0),
+            customerDue: Number(sh.customerDue ?? 0),
+            deliveredAt: sh.deliveredOrReturnedDate ? new Date(sh.deliveredOrReturnedDate) : null
+          });
+          await this.odooSyncService.syncCollectedShipment(rec.id);
+          summary.recorded++;
+          actions++;
+          try {
+            await this.recordShopifyPayment({ id: rec.id, shopifyOrderId: rec.shopifyOrderId }, Number(sh.collectedAmount ?? 0));
+            summary.shopifyPaid++;
+          } catch { /* shopify discount scope etc. — Odoo already recorded */ }
+        } catch (e) {
+          summary.failed++;
+          logger.error('syncCollectionsFromReports: failed', { code, reason: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      if (!res.paginatorInfo?.hasMorePages) break;
+      page++;
+    }
+    logger.info('syncCollectionsFromReports: done', summary);
+    return summary;
+  }
+
   async syncRecord(record: {
     id: number;
     shopifyOrderId: string;
