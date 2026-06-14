@@ -333,24 +333,33 @@ function translateGeom(geom: MultiPoly, dy: number): MultiPoly {
 }
 
 function packBySize(welded: WeldedRow[], maxBytes: number): WeldedRow[][] {
+  // Keep every product WHOLE inside one file — a product is never split across
+  // two files (even if that means more files). A product bigger than the cap
+  // gets its own file alone.
+  // Group consecutive rows by owner so each product block stays together.
+  const blocks: WeldedRow[][] = [];
+  for (const w of welded) {
+    const last = blocks[blocks.length - 1];
+    if (!last || last[0]!.owner !== w.owner) blocks.push([w]);
+    else last.push(w);
+  }
+
   const parts: WeldedRow[][] = [];
   let cur: WeldedRow[] = [];
   let curBytes = 0;
-  for (const w of welded) {
-    const wb = w.points * BYTES_PER_POINT;
-    if (cur.length && curBytes + wb > maxBytes) { parts.push(cur); cur = []; curBytes = 0; }
-    cur.push(w);
-    curBytes += wb;
+  for (const block of blocks) {
+    const blockBytes = block.reduce((s, w) => s + w.points * BYTES_PER_POINT, 0);
+    // Start a new file if this whole product would overflow the current one.
+    if (cur.length && curBytes + blockBytes > maxBytes) { parts.push(cur); cur = []; curBytes = 0; }
+    cur.push(...block);
+    curBytes += blockBytes;
   }
   if (cur.length) parts.push(cur);
-  // Re-insert the product header when a file begins in the middle of a product.
+
+  // Never start a file with a divider line.
   return parts.map((partIn) => {
-    // Never start a file with a divider line.
     let part = partIn;
     while (part.length && part[0]!.kind === "sep") part = part.slice(1);
-    if (part.length && part[0]!.kind === "value") {
-      return [weldRow({ text: part[0]!.owner, kind: "name", owner: part[0]!.owner }), ...part];
-    }
     return part;
   });
 }
