@@ -221,6 +221,9 @@ function productKey(e: AiEntry): string {
 function shortLabel(label: string): string {
   const s = (label || "").trim();
   if (s.toLowerCase() === "message") return "";
+  // Box-writing labels ('كتابه علي البوكس') are suppressed — only the actual
+  // engraving text should appear in the laser file, not the position meta-label.
+  if (s.includes("بوكس") || s.toLowerCase().includes("box")) return "";
   return s.replace("المحفظة", "").trim();
 }
 function qtyOf(e: AiEntry): number {
