@@ -144,14 +144,28 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
   // would blow past the aggregator's 6 MB response limit. This background
   // function has a 15-min budget, so it generates them locally from the entries.
   try {
-    const { buildAiBuffers } = await import('../../services/aiWriter.js');
+    const { buildAiBuffers, buildBoxGridBuffers } = await import('../../services/aiWriter.js');
+    // Box products go to a 9×2 grid file; wallets/others stay linear.
+    const isBoxEntry = (e: unknown): boolean => {
+      const p = String((e as { display_product?: string })?.display_product || '').toLowerCase();
+      return p.includes('box') || p.includes('بوكس');
+    };
+    const entries = productionEntries as unknown[];
+    const linearEntries = entries.filter((e) => !isBoxEntry(e));
+    const boxEntries = entries.filter(isBoxEntry);
     // Split by file size (~1.5 MB each) — the laser PC is weak, so keep files small.
-    const aiFiles = await buildAiBuffers(productionEntries as never, { maxBytes: 1_500_000 });
+    const aiFiles = linearEntries.length ? await buildAiBuffers(linearEntries as never, { maxBytes: 1_500_000 }) : [];
+    const boxFiles = boxEntries.length ? await buildBoxGridBuffers(boxEntries as never) : [];
     for (let i = 0; i < aiFiles.length; i++) {
       const label = aiFiles.length > 1 ? `${i + 1}/${aiFiles.length}` : '';
       await sendDocument(chatId, aiFiles[i]!, `laser_${dateStr}_${i + 1}.ai`, `ملف الليزر 🔪 ${label}`.trim());
     }
-    if (aiFiles.length) await sendMessage(chatId, `🔪 بعتّ ${aiFiles.length} ملف ليزر (AI)`);
+    for (let i = 0; i < boxFiles.length; i++) {
+      const label = boxFiles.length > 1 ? `${i + 1}/${boxFiles.length}` : '';
+      await sendDocument(chatId, boxFiles[i]!, `box_grid_${dateStr}_${i + 1}.ai`, `شبكة البوكسات 📦 ${label}`.trim());
+    }
+    if (aiFiles.length || boxFiles.length)
+      await sendMessage(chatId, `🔪 بعتّ ${aiFiles.length} ملف ليزر + ${boxFiles.length} شبكة بوكسات`);
   } catch (err) {
     await sendMessage(chatId, `⚠️ فشل توليد ملف الليزر: ${String(err).slice(0, 200)}`);
   }
