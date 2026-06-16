@@ -76,26 +76,40 @@ function isArabic(ch: string): boolean {
   return (c >= 0x0600 && c <= 0x06ff) || (c >= 0xfb50 && c <= 0xfeff) || (c >= 0x0750 && c <= 0x077f);
 }
 
-type Kind = "ar" | "lat" | "heart";
+type Kind = "ar" | "lat" | "num" | "heart";
 function splitRuns(text: string): Array<{ text: string; kind: Kind }> {
+  // Digits get their own LTR run so "40" never reverses to "04" inside RTL
+  // Arabic; neutral chars (space/punct) stick to the current run.
   const runs: Array<{ text: string; kind: Kind }> = [];
   let cur = "";
-  let curAr: boolean | null = null;
+  let curKind: Kind | null = null;
   const flush = () => {
-    if (cur.trim()) runs.push({ text: cur, kind: curAr ? "ar" : "lat" });
-    cur = ""; curAr = null;
+    if (cur.trim()) runs.push({ text: cur, kind: curKind ?? "lat" });
+    cur = ""; curKind = null;
   };
   for (const ch of text) {
     if (SKIP_CHARS.has(ch)) continue;
     if (HEARTS.has(ch)) { flush(); runs.push({ text: ch, kind: "heart" }); continue; }
-    if (/\s/.test(ch) || /\d/.test(ch) || "()[]/-.,:&+".includes(ch)) { cur += ch; continue; }
-    const ar = isArabic(ch);
-    if (curAr === null) curAr = ar;
-    if (ar !== curAr && cur.trim()) { runs.push({ text: cur, kind: curAr ? "ar" : "lat" }); cur = ch; curAr = ar; }
-    else { cur += ch; curAr = ar; }
+    let k: Kind;
+    if (/\d/.test(ch)) k = "num";
+    else if (isArabic(ch)) k = "ar";
+    else if (/\p{L}/u.test(ch)) k = "lat";
+    else { cur += ch; continue; }          // neutral: stick to current run
+    if (curKind === null) curKind = k;
+    if (k !== curKind && cur.trim()) { runs.push({ text: cur, kind: curKind }); cur = ch; curKind = k; }
+    else { cur += ch; curKind = k; }
   }
   flush();
   return runs;
+}
+
+function lineIsRtl(text: string): boolean {
+  // Base direction = RTL if the first strong-directional char is Arabic.
+  for (const ch of text) {
+    if (isArabic(ch)) return true;
+    if (/\p{L}/u.test(ch)) return false;
+  }
+  return false;
 }
 
 // ── Glyph outline -> polygons ──────────────────────────────────────────────────
@@ -182,14 +196,18 @@ function weldLine(text: string, baseline: number): { geom: MultiPoly | null; wid
   const [ara, lat] = fonts();
   const geoms: MultiPoly[] = [];
   let penX = 0;
-  for (const { text: run, kind } of splitRuns(text)) {
+  let runs = splitRuns(text);
+  // RTL base line: lay runs right-to-left so mixed Arabic + numbers + Latin
+  // read correctly instead of scrambled.
+  if (lineIsRtl(text)) runs = runs.slice().reverse();
+  for (const { text: run, kind } of runs) {
     if (kind === "heart") {
       const h = heartGeom(penX, baseline, EM * 0.62);
       geoms.push(h.geom);
       penX += h.width + EM * 0.12;
       continue;
     }
-    const fb = kind === "ar" ? ara : lat;
+    const fb = kind === "ar" || kind === "num" ? ara : lat;
     const scale = ara.upem / fb.upem;
     for (const gl of shapeRun(fb, run)) {
       // glyph 0 == .notdef: the font has no glyph (emoji, &, …). Skip it so we
