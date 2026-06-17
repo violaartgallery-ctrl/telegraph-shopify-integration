@@ -7,10 +7,13 @@
  *   npx tsx src/scripts/processOdooQueueOnce.ts
  *
  * What it does:
- *   - Fetches up to 2 records from the Odoo queue (odoo-so-pending,
- *     odoo-stock-pending, odoo-delivery-pending, odoo-failed-retryable)
- *   - Runs one stage per record (same logic as the cron function)
- *   - Writes results to Odoo and DB immediately
+ *   - Drains the WHOLE Odoo queue (odoo-so-pending, odoo-stock-pending,
+ *     odoo-delivery-pending, odoo-failed-retryable) within the time budget
+ *   - Runs stages and writes results to Odoo and DB immediately
+ *
+ * It invokes the background drainer's handler directly (the scheduled
+ * `process-odoo-queue` function is only an HTTP trigger and would not work
+ * locally).
  *
  * To see what is in the queue WITHOUT processing, query the DB directly:
  *   SELECT id, "shopifyOrderName", "odooSyncStatus", "odooAttemptCount", "odooRetryAt"
@@ -20,7 +23,7 @@
  *   );
  */
 
-import { handler } from '../netlify/functions/process-odoo-queue.js';
+import { handler } from '../netlify/functions/process-odoo-queue-background.js';
 
 console.log('[processOdooQueueOnce] Starting — this will write to Odoo and DB.');
 

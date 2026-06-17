@@ -8,14 +8,24 @@ from = "/*"
 to = "/.netlify/functions/api/:splat"
 status = 200
 
+# All three DB-touching crons run every 30 min ALIGNED (same :00/:30 ticks) so
+# Neon's compute is woken once per burst and can scale to zero in the long idle
+# gap between them. Free-tier autosuspend is locked at 5 min, so each wake costs
+# ~5 min of compute regardless — fewer, aligned wakes is what keeps us inside the
+# 100 CU-hr/mo free allowance (~30 CU-hr/mo at this cadence).
+#
+# process-odoo-queue here is only a lightweight TRIGGER: it fires the background
+# drainer (process-odoo-queue-background) which has Netlify's 15-min budget to
+# clear the whole queue in one wake. This removes the old 1-order-per-run ceiling
+# that could not keep up with 30–80 orders/day.
 [functions."sync-open-shipments"]
-schedule = "*/15 * * * *"
+schedule = "*/30 * * * *"
 
 [functions."process-odoo-queue"]
-schedule = "* * * * *"
+schedule = "*/30 * * * *"
 
 [functions."sync-collections-from-reports"]
-schedule = "*/15 * * * *"
+schedule = "*/30 * * * *"
 
 [functions."run-production-background"]
 background = true

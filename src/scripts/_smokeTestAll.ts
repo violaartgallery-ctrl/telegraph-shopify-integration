@@ -76,11 +76,11 @@ check('adjustDraftInvoiceLinesToTotal exists', /adjustDraftInvoiceLinesToTotal/.
 
 console.log('\n🧪 5. Admin + cron callers pass skipDbStatusUpdate');
 const adminSrc = readFileSync('src/routes/adminAppRoute.ts', 'utf8');
-const queueSrc = readFileSync('src/netlify/functions/process-odoo-queue.ts', 'utf8');
+const queueSrc = readFileSync('src/netlify/functions/process-odoo-queue-background.ts', 'utf8');
 const adminMatches = adminSrc.match(/skipDbStatusUpdate: true/g) ?? [];
 const queueMatches = queueSrc.match(/skipDbStatusUpdate: true/g) ?? [];
 check('adminAppRoute has 3 callers protected', adminMatches.length >= 3, 'found ' + adminMatches.length);
-check('process-odoo-queue has all stages protected', queueMatches.length >= 3, 'found ' + queueMatches.length);
+check('process-odoo-queue-background has all stages protected', queueMatches.length >= 3, 'found ' + queueMatches.length);
 const syncCollectedHasFlag = /syncCollectedShipment[\s\S]+?ensureSalesOrder[\s\S]+?skipDbStatusUpdate: true/.test(syncSrc);
 check('syncCollectedShipment passes skipDbStatusUpdate', syncCollectedHasFlag);
 

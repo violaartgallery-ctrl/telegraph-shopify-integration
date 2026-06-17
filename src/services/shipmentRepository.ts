@@ -28,6 +28,11 @@ export const shipmentRepository = {
       }
     }),
 
+  // Omit the heavy rawOrderJson column: every caller of these two finders
+  // (Telegraph webhook, admin manual action, collection-report sync) uses only
+  // ids/codes/status fields — never the raw order. The collection sync calls
+  // findByReference once per collected shipment every 30 min, so dropping the
+  // 10–50 KB JSON here is a large network-egress saving.
   findByReference: async (reference: string) =>
     await prisma.shipmentRecord.findFirst({
       where: {
@@ -36,11 +41,15 @@ export const shipmentRepository = {
           { shopifyOrderName: reference },
           { accurateShipmentCode: reference }
         ]
-      }
+      },
+      omit: { rawOrderJson: true }
     }),
 
   findByShopifyOrderName: async (shopifyOrderName: string) =>
-    await prisma.shipmentRecord.findFirst({ where: { shopifyOrderName } }),
+    await prisma.shipmentRecord.findFirst({
+      where: { shopifyOrderName },
+      omit: { rawOrderJson: true }
+    }),
 
   findByShipmentCodes: async (codes: string[]) =>
     await prisma.shipmentRecord.findMany({
@@ -50,6 +59,11 @@ export const shipmentRepository = {
     }),
 
   findOpenShipments: async (limit?: number) => {
+    // The status-sync path (syncRecord) never reads rawOrderJson — only the Odoo
+    // queue needs it. Omitting that one heavy column (the full Shopify order JSON,
+    // tens of KB per row) cuts this cron's Neon network egress by ~90%.
+    const omitRaw = { rawOrderJson: true } as const;
+
     const collectedSyncWhere = {
       accurateShipmentId: { not: null },
       accurateIsTerminal: true,
@@ -66,6 +80,7 @@ export const shipmentRepository = {
 
     const collectedRecords = await prisma.shipmentRecord.findMany({
       where: collectedSyncWhere,
+      omit: omitRaw,
       orderBy: { updatedAt: 'asc' },
       ...(limit ? { take: limit } : {})
     });
@@ -93,6 +108,7 @@ export const shipmentRepository = {
           { returningDueFees: { gt: 0 } }
         ]
       },
+      omit: omitRaw,
       orderBy: { updatedAt: 'asc' },
       ...(remaining ? { take: remaining } : {})
     });
@@ -110,6 +126,7 @@ export const shipmentRepository = {
           { accurateIsTerminal: false }
         ]
       },
+      omit: omitRaw,
       orderBy: { updatedAt: 'asc' },
       ...(remaining ? { take: remaining } : {})
     });
