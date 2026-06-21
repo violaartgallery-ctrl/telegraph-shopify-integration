@@ -26,6 +26,7 @@ interface PhotoAttachment {
   attachment_url: string;
   order_name: string;
   comment_id: string;
+  position_label?: string | null;
 }
 
 interface AymanEntry {
@@ -168,6 +169,37 @@ async function runPipeline(chatId: number, execute: boolean, orderId?: string): 
       await sendMessage(chatId, `🔪 بعتّ ${aiFiles.length} ملف ليزر + ${boxFiles.length} شبكة بوكسات`);
   } catch (err) {
     await sendMessage(chatId, `⚠️ فشل توليد ملف الليزر: ${String(err).slice(0, 200)}`);
+  }
+
+  // ── Step 2.5: Print-ready photo sheet ────────────────────────────────────
+  // The "طباعة الصور" photos (no place on the product → excluded from the laser)
+  // are arranged on A4 at their per-product size and sent as one print-ready PDF.
+  try {
+    const { buildPrintSheetPdf, kindForProduct } = await import('../../services/printSheet.js');
+    const printList: Array<{ url: string; kind: 'wallet' | 'keychain' }> = [];
+    const seenPrint = new Set<string>();
+    for (const entry of productionEntries) {
+      const kind = kindForProduct(entry.display_product);
+      for (const ph of entry.photo_attachments ?? []) {
+        if ((ph.position_label ?? '').trim()) continue; // has a place -> laser, not print
+        if (!ph.attachment_url || seenPrint.has(ph.attachment_url)) continue;
+        seenPrint.add(ph.attachment_url);
+        printList.push({ url: ph.attachment_url, kind });
+      }
+    }
+    if (printList.length) {
+      const photos: Array<{ buffer: Buffer; kind: 'wallet' | 'keychain' }> = [];
+      for (const p of printList) {
+        const r = await fetch(p.url);
+        if (r.ok) photos.push({ buffer: Buffer.from(await r.arrayBuffer()), kind: p.kind });
+      }
+      const pdf = await buildPrintSheetPdf(photos);
+      if (pdf) {
+        await sendDocument(chatId, Buffer.from(pdf), `print_sheets_${dateStr}.pdf`, 'ورق طباعة الصور 🖨️');
+      }
+    }
+  } catch (err) {
+    await sendMessage(chatId, `⚠️ فشل توليد ورق الطباعة: ${String(err).slice(0, 200)}`);
   }
 
   // ── Step 3: Send photos individually from photo_attachments URLs ──────────

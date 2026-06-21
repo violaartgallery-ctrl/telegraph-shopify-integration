@@ -27,6 +27,7 @@ export interface AiEntry {
   display_color?: string;
   total_quantity?: number;
   customization_cleaned: Array<[string, string]>;
+  photo_numbers?: Array<{ position_label?: string | null; display_label?: string }>;
 }
 import { ARABIC_FONT_B64, LATIN_FONT_B64 } from "./fontsData.js";
 import { BOX_TEMPLATE, AI_HEAD, AI_TAIL } from "./boxAssets.js";
@@ -271,11 +272,27 @@ function wrapWords(text: string, maxChars: number): string[] {
   if (cur) out.push(cur);
   return out.length ? out : [text];
 }
+// Customisation-photo markers for the laser file, as SEPARATE lines:
+//   "المحفظة برا يمين:"
+//   "photo 31"
+// The Arabic position label and the LTR "photo N" marker live on their OWN lines
+// so BiDi never reorders the digits — matches the Word doc exactly. ONLY photos
+// with a known place (position_label set) are written; "طباعة الصور" uploads have
+// no place and are skipped (print photos, never reach the laser file).
+function entryPhotoLines(e: AiEntry): string[] {
+  const lines: string[] = [];
+  for (const p of e.photo_numbers ?? []) {
+    const pos = (p.position_label ?? "").trim();
+    if (!pos) continue;
+    lines.push(`${pos}:`);
+    lines.push(p.display_label ?? "photo");
+  }
+  return lines;
+}
 // One wallet on as FEW lines as fit; long values wrap so we never emit one giant
 // unreadable (multi-MB) line.
 function entryLines(e: AiEntry, maxChars = MAX_INLINE): string[] {
   const parts = entryParts(e);
-  if (!parts.length) return [];
   const lines: string[] = [];
   let cur = "";
   for (const part of parts) {
@@ -288,6 +305,8 @@ function entryLines(e: AiEntry, maxChars = MAX_INLINE): string[] {
     if (cand.length > maxChars && cur) { lines.push(cur); cur = part; } else cur = cand;
   }
   if (cur) lines.push(cur);
+  // Photo markers come AFTER the text, each on its own line (label + "photo N").
+  lines.push(...entryPhotoLines(e));
   return lines;
 }
 
@@ -588,8 +607,16 @@ function boxCellContents(entries: AiEntry[]): BoxCell[] {
   for (const e of entries) {
     if (!isBox(e)) continue;
     const text = boxText(e);
-    if (!text) { for (let i = 0; i < qtyOf(e); i++) cells.push({ kind: "logozone" }); continue; }
-    const block = weldLinesBlock(wrapToWidth(text, targetW));
+    const lines: string[] = text ? wrapToWidth(text, targetW) : [];
+    // Customisation photos -> "photo N" marker on its own line (the box is a
+    // single zone, so the position is implicit). "طباعة الصور" uploads have no
+    // place (position_label null) and are skipped.
+    for (const p of e.photo_numbers ?? []) {
+      if (!((p.position_label ?? "").trim())) continue;
+      lines.push(p.display_label ?? "photo");
+    }
+    if (!lines.length) { for (let i = 0; i < qtyOf(e); i++) cells.push({ kind: "logozone" }); continue; }
+    const block = weldLinesBlock(lines);
     if (!block) continue;
     for (let i = 0; i < qtyOf(e); i++) cells.push({ kind: "text", block });
   }
