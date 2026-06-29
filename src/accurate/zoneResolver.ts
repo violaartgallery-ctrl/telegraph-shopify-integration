@@ -90,15 +90,14 @@ export class AccurateZoneResolver {
       }
     }
 
-    if (env.accurate.defaultRecipientZoneId && env.accurate.defaultRecipientSubzoneId) {
-      logger.warn('Falling back to default Accurate recipient zone config', input);
-      return {
-        zoneId: env.accurate.defaultRecipientZoneId,
-        subzoneId: env.accurate.defaultRecipientSubzoneId,
-        resolution: 'default'
-      };
-    }
-
-    throw new Error('Could not resolve Accurate recipient zone/subzone and no defaults are configured');
+    // IMPORTANT: do NOT silently fall back to the default recipient zone here.
+    // The configured default equals the SENDER zone (الاسكندرية/السيوف), so a
+    // silent fallback ships the parcel to the wrong place under the sender's own
+    // address. Failing loudly flags the order for manual review instead. An
+    // explicit governorate/area selection (resolution: 'attribute') is the only
+    // reliable input; this branch is only reached when that is missing AND the
+    // address could not be matched.
+    logger.warn('Could not resolve recipient zone — refusing to ship (no governorate, no address match)', input);
+    throw new Error('Could not resolve recipient governorate/area — order needs an explicit Telegraph governorate/area selection (will NOT ship to the default sender zone)');
   }
 }

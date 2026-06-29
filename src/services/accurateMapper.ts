@@ -120,8 +120,14 @@ export class AccurateMapper {
     }
 
     const telegraphLocation = getTelegraphLocationSelection(order);
-    if (options?.requireTelegraphLocation && !telegraphLocation) {
-      throw new Error(`Order ${order.name} is missing Telegraph governorate/area selection`);
+    // Enforce an explicit governorate/area selection by DEFAULT. Callers must
+    // opt out explicitly (requireTelegraphLocation: false) — which no shipping
+    // path should. Without an explicit selection we refuse to ship: we do NOT
+    // silently guess from the free-text address or fall back to the sender zone
+    // (الاسكندرية/السيوف). The order surfaces as failed for manual review.
+    const requireLocation = options?.requireTelegraphLocation ?? true;
+    if (requireLocation && !telegraphLocation) {
+      throw new Error(`Order ${order.name} is missing Telegraph governorate/area selection — flagged for manual review (NOT shipped to a default zone)`);
     }
 
     const zones = await this.zoneResolver.resolve({
