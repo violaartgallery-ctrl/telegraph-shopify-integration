@@ -8,6 +8,7 @@ import { ShopifyOrderProcessor } from './services/shopifyOrderProcessor.js';
 import { createAccurateWebhookHandler } from './routes/accurateWebhookRoute.js';
 import { createAdminAppRouter } from './routes/adminAppRoute.js';
 import { createShopifyWebhookHandler } from './routes/shopifyWebhookRoute.js';
+import { createOpsRouter } from './routes/opsRoute.js';
 import { ShipmentStatusSyncService } from './services/shipmentStatusSyncService.js';
 import { OdooClient } from './odoo/odooClient.js';
 import { OdooSyncService } from './odoo/odooSyncService.js';
@@ -48,6 +49,11 @@ export const createApp = () => {
   app.get('/health', (_request, response) => {
     response.status(200).json({ ok: true });
   });
+
+  // Scheduled ops (triggered by GitHub Actions every 30 min). Mounted before the
+  // adminAuth guards because it lives under /ops (not /api) and self-guards via
+  // OPS_SECRET.
+  app.use(createOpsRouter(services.shipmentStatusSyncService));
 
   // BUG-SEC-4 FIX: Protect all admin routes under /orders/* and /api/* with adminAuth.
   // Shopify webhook routes (/webhooks/*) are intentionally NOT protected here —

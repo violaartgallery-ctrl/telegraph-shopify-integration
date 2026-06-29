@@ -2,15 +2,9 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "npm run build && npm run prisma:deploy",
   "functions": {
-    "api/cron/process-odoo-queue.ts": { "maxDuration": 300 },
-    "api/run-production.ts": { "maxDuration": 300 },
-    "api/cron/sync-open-shipments.ts": { "maxDuration": 300 },
-    "api/cron/sync-collections.ts": { "maxDuration": 300 },
-    "api/cron/ensure-telegram-webhook.ts": { "maxDuration": 60 },
-    "api/telegram-webhook.ts": { "maxDuration": 60 },
-    "api/index.ts": { "maxDuration": 60 }
+    "api/index.ts": { "maxDuration": 300 }
   },
   "rewrites": [
-    { "source": "/((?!api/cron|api/run-production|api/telegram-webhook).*)", "destination": "/api" }
+    { "source": "/(.*)", "destination": "/api" }
   ]
 }

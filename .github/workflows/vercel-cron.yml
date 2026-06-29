@@ -14,14 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Drain Odoo queue (create Sales Orders)
-        run: curl -s -m 280 -o /dev/null -w "odoo-queue: %{http_code}\n" "$BASE/api/cron/process-odoo-queue" || true
+        run: curl -s -m 280 -o /dev/null -w "odoo-queue: %{http_code}\n" "$BASE/ops/process-odoo-queue" || true
         env:
           BASE: https://viola-telegraph-integration.vercel.app
       - name: Sync open shipments (status → invoice + mark paid)
-        run: curl -s -m 280 -o /dev/null -w "open-shipments: %{http_code}\n" "$BASE/api/cron/sync-open-shipments" || true
+        run: curl -s -m 280 -o /dev/null -w "open-shipments: %{http_code}\n" "$BASE/ops/sync-open-shipments" || true
         env:
           BASE: https://viola-telegraph-integration.vercel.app
       - name: Sync collections from reports (safety net)
-        run: curl -s -m 280 -o /dev/null -w "collections: %{http_code}\n" "$BASE/api/cron/sync-collections" || true
+        run: curl -s -m 280 -o /dev/null -w "collections: %{http_code}\n" "$BASE/ops/sync-collections" || true
         env:
           BASE: https://viola-telegraph-integration.vercel.app
