@@ -122,7 +122,9 @@ export const LIST_SHIPMENTS_QUERY = `
         refNumber
         deliveredOrReturnedDate
         collected
+        paidToCustomer
         cancelled
+        trackingUrl
         collectedAmount
         pendingCollectionAmount
         returnedValue

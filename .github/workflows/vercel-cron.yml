@@ -1,0 +1,27 @@
+name: Vercel scheduled sync (free timer)
+
+# Replaces Netlify's scheduled functions. Vercel Hobby crons run only once a day,
+# so GitHub Actions (free) pings the Vercel HTTP endpoints every 30 minutes. Each
+# call runs within Vercel's 300s budget and is idempotent, so overlapping with the
+# old Netlify crons during cutover is safe.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drain Odoo queue (create Sales Orders)
+        run: curl -s -m 280 -o /dev/null -w "odoo-queue: %{http_code}\n" "$BASE/api/cron/process-odoo-queue" || true
+        env:
+          BASE: https://viola-telegraph-integration.vercel.app
+      - name: Sync open shipments (status → invoice + mark paid)
+        run: curl -s -m 280 -o /dev/null -w "open-shipments: %{http_code}\n" "$BASE/api/cron/sync-open-shipments" || true
+        env:
+          BASE: https://viola-telegraph-integration.vercel.app
+      - name: Sync collections from reports (safety net)
+        run: curl -s -m 280 -o /dev/null -w "collections: %{http_code}\n" "$BASE/api/cron/sync-collections" || true
+        env:
+          BASE: https://viola-telegraph-integration.vercel.app

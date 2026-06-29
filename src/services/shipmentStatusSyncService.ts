@@ -134,19 +134,28 @@ export class ShipmentStatusSyncService {
       });
     } catch (error) {
       if (error instanceof UnauthorizedError) {
-        // The current Telegraph account cannot read this shipment's status.
-        // This happens when the account has write-only API permissions.
-        // Log a warning and skip — do NOT mark terminal, because the shipment
-        // is still active and may be collected in the future (via webhook).
-        logger.warn('syncRecord: Telegraph account cannot read shipment status — skipping this run', {
-          recordId: record.id,
-          shipmentCode: record.accurateShipmentCode,
-          shipmentId: record.accurateShipmentId,
-          hint: 'Contact Telegraph support to enable read permissions for this account, or configure webhooks'
-        });
-        return;
+        // This Telegraph account is write/list-only: getShipment (single read) is
+        // unauthorized. Fall back to the AUTHORIZED listShipments(search) API to
+        // fetch this one shipment, so the webhook (event-driven) and cron paths
+        // both still work instead of silently skipping.
+        const searchKey = record.accurateShipmentCode ?? String(record.accurateShipmentId ?? '');
+        const list = await this.accurateClient.listShipments({ search: searchKey }, 20, 1);
+        const match = (list.data ?? []).find((s) =>
+          (record.accurateShipmentCode != null && s.code === record.accurateShipmentCode) ||
+          (record.accurateShipmentId != null && Number(s.id) === Number(record.accurateShipmentId))
+        );
+        if (!match) {
+          logger.warn('syncRecord: shipment not found via listShipments fallback — skipping this run', {
+            recordId: record.id,
+            shipmentCode: record.accurateShipmentCode,
+            shipmentId: record.accurateShipmentId
+          });
+          return;
+        }
+        shipment = match;
+      } else {
+        throw error;
       }
-      throw error;
     }
 
     if (!shipment) {

@@ -1,0 +1,18 @@
+# Keep the Vercel upload under the Hobby 100 MB limit — exclude local artifacts,
+# pulled themes, reports, and diagnostics. Vercel rebuilds dist/ via buildCommand.
+dist
+.netlify
+.git
+node_modules
+theme-pull
+theme-verify
+samples
+src/scripts
+*.csv
+*.pdf
+*.bak*
+tempnetlify_sites.json
+_*.json
+MANUAL_WORK_REQUIRED.*
+telegraph-locations.json
+.env.local
