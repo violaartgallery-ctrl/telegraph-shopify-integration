@@ -59,10 +59,12 @@ interface AymanResponse {
 // ── Ayman Agent integration ────────────────────────────────────────────────────
 
 async function fetchFromAymanAgent(orderId?: string): Promise<AymanResponse> {
-  const baseUrl = (process.env.AYMAN_AGENT_URL ?? 'https://viola-production-agent.netlify.app').replace(/\/$/, '');
+  const baseUrl = (process.env.AYMAN_AGENT_URL ?? 'https://viola-production-agent.vercel.app').replace(/\/$/, '');
   const secret = process.env.AYMAN_AGENT_SECRET ?? '';
 
-  const resp = await fetch(`${baseUrl}/.netlify/functions/production`, {
+  // Ayman agent migrated to Vercel: endpoint is /api/production (POST), not the
+  // old Netlify /.netlify/functions/production path (which now 404s).
+  const resp = await fetch(`${baseUrl}/api/production`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
