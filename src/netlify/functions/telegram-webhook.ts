@@ -1,4 +1,6 @@
+import { waitUntil } from '@vercel/functions';
 import { sendMessage } from '../../telegram/telegramApi.js';
+import { runPipeline } from './run-production-background.js';
 import {
   isAllowed,
   getUser,
@@ -52,15 +54,15 @@ function siteUrl(): string {
 }
 
 async function triggerBackground(chatId: number, execute: boolean, orderId?: string): Promise<void> {
-  const url = `${siteUrl()}/.netlify/functions/run-production-background`;
+  // Vercel has no separate 15-min background function. We ack Telegram fast and
+  // let the production pipeline keep running AFTER the HTTP response via
+  // waitUntil() (kept alive up to the function maxDuration, 300s). runPipeline is
+  // idempotent (shipment creation skips orders that already have a shipment), so
+  // if a large /run is cut at the time limit, re-sending /run safely continues.
   try {
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chatId, execute, ...(orderId ? { orderId } : {}) }),
-    });
+    waitUntil(runPipeline(chatId, execute, orderId));
   } catch (err) {
-    console.error('[webhook] Failed to trigger background function:', err);
+    console.error('[webhook] Failed to schedule pipeline:', err);
     await sendMessage(chatId, '❌ فيه مشكلة في تشغيل الـ pipeline. حاول تاني.');
   }
 }

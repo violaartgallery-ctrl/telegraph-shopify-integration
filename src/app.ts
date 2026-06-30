@@ -9,6 +9,7 @@ import { createAccurateWebhookHandler } from './routes/accurateWebhookRoute.js';
 import { createAdminAppRouter } from './routes/adminAppRoute.js';
 import { createShopifyWebhookHandler } from './routes/shopifyWebhookRoute.js';
 import { createOpsRouter } from './routes/opsRoute.js';
+import { handler as telegramWebhookHandler } from './netlify/functions/telegram-webhook.js';
 import { ShipmentStatusSyncService } from './services/shipmentStatusSyncService.js';
 import { OdooClient } from './odoo/odooClient.js';
 import { OdooSyncService } from './odoo/odooSyncService.js';
@@ -74,6 +75,18 @@ export const createApp = () => {
     express.json({ limit: '1mb' }),
     createAccurateWebhookHandler(services.shipmentStatusSyncService)
   );
+
+  // Telegram bot webhook. Not under /orders or /api, so it bypasses adminAuth; it
+  // self-verifies via the x-telegram-bot-api-secret-token header inside the
+  // handler. The handler acks fast and runs the /run pipeline via waitUntil.
+  app.post('/telegram-webhook', express.json({ limit: '1mb' }), async (request, response) => {
+    const result = await telegramWebhookHandler({
+      httpMethod: request.method,
+      headers: request.headers as Record<string, string | undefined>,
+      body: JSON.stringify(request.body ?? {})
+    });
+    response.status(result.statusCode).send(result.body);
+  });
 
   app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
     logger.error('Unhandled request error', error);

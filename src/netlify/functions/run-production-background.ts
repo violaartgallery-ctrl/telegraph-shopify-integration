@@ -108,7 +108,7 @@ interface ShipResult {
 
 // ── Main pipeline ─────────────────────────────────────────────────────────────
 
-async function runPipeline(chatId: number, execute: boolean, orderId?: string): Promise<void> {
+export async function runPipeline(chatId: number, execute: boolean, orderId?: string): Promise<void> {
   const mode = execute ? 'تنفيذ حقيقي' : 'بريفيو';
   const orderLabel = orderId ? ` (أوردر ${orderId} فقط)` : '';
 
