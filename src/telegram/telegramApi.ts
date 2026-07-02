@@ -6,10 +6,20 @@ function botUrl(method: string): string {
   return `${TELEGRAM_API}/bot${token}/${method}`;
 }
 
+// A single inline button. Pressing it sends a callback_query update (with
+// `data`) to the webhook — used for the "Continue" button on a paused job.
+export interface InlineButton {
+  text: string;
+  callback_data: string;
+}
+
 export async function sendMessage(
   chatId: number | string,
   text: string,
-  options: { parse_mode?: 'Markdown' | 'HTML' | 'MarkdownV2' } = {}
+  options: {
+    parse_mode?: 'Markdown' | 'HTML' | 'MarkdownV2';
+    reply_markup?: { inline_keyboard: InlineButton[][] };
+  } = {}
 ): Promise<void> {
   try {
     const response = await fetch(botUrl('sendMessage'), {
@@ -23,6 +33,36 @@ export async function sendMessage(
     }
   } catch (err) {
     console.error('[telegram] sendMessage error:', err);
+  }
+}
+
+/** Send a message carrying a single inline button (e.g. "Continue"). */
+export async function sendMessageWithButton(
+  chatId: number | string,
+  text: string,
+  button: InlineButton,
+  options: { parse_mode?: 'Markdown' | 'HTML' | 'MarkdownV2' } = {}
+): Promise<void> {
+  await sendMessage(chatId, text, { ...options, reply_markup: { inline_keyboard: [[button]] } });
+}
+
+/**
+ * Acknowledge a callback_query so Telegram stops showing the button's loading
+ * spinner. Optionally shows a brief toast to the user.
+ */
+export async function answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+  try {
+    const response = await fetch(botUrl('answerCallbackQuery'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, ...(text ? { text } : {}) }),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      console.error(`[telegram] answerCallbackQuery failed: ${response.status} ${body}`);
+    }
+  } catch (err) {
+    console.error('[telegram] answerCallbackQuery error:', err);
   }
 }
 

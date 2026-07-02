@@ -1,6 +1,7 @@
 import { waitUntil } from '@vercel/functions';
-import { sendMessage } from '../../telegram/telegramApi.js';
+import { sendMessage, answerCallbackQuery } from '../../telegram/telegramApi.js';
 import { runPipeline } from './run-production-background.js';
+import { loadJob, JOB_STALE_MS } from '../../services/productionJobStore.js';
 import {
   isAllowed,
   getUser,
@@ -28,9 +29,17 @@ interface TelegramMessage {
   text?: string;
 }
 
+interface TelegramCallbackQuery {
+  id: string;
+  from?: TelegramUser;
+  message?: TelegramMessage;
+  data?: string;
+}
+
 interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -57,18 +66,42 @@ function siteUrl(): string {
   return (process.env.URL ?? '').replace(/\/$/, '');
 }
 
-async function triggerBackground(chatId: number, execute: boolean, orderId?: string): Promise<void> {
+async function triggerBackground(
+  chatId: number,
+  execute: boolean,
+  orderId?: string,
+  resume = false
+): Promise<void> {
   // Vercel has no separate 15-min background function. We ack Telegram fast and
   // let the production pipeline keep running AFTER the HTTP response via
-  // waitUntil() (kept alive up to the function maxDuration, 300s). runPipeline is
-  // idempotent (shipment creation skips orders that already have a shipment), so
-  // if a large /run is cut at the time limit, re-sending /run safely continues.
+  // waitUntil() (kept alive up to the function maxDuration, 300s). The pipeline
+  // checkpoints itself: at a ~4-min soft deadline it saves where it stopped and
+  // sends a "Continue" button, so nothing is ever truncated by the hard limit.
+  // resume=true continues a previously-paused job from its saved cursor.
   try {
-    waitUntil(runPipeline(chatId, execute, orderId));
+    waitUntil(runPipeline(chatId, execute, orderId, resume));
   } catch (err) {
     console.error('[webhook] Failed to schedule pipeline:', err);
     await sendMessage(chatId, '❌ فيه مشكلة في تشغيل الـ pipeline. حاول تاني.');
   }
+}
+
+// Handle the "Continue" button press on a paused job.
+async function handleContinue(chatId: number, data: string): Promise<void> {
+  const execute = data === 'cont:run';
+  const job = await loadJob(chatId);
+  if (!job) {
+    await sendMessage(chatId, 'ℹ️ مفيش حاجة موقوفة أكمّلها. ابعت /run أو /preview من الأول.');
+    return;
+  }
+  // Guard against double-press while a segment is genuinely still running (a
+  // 'running' job older than JOB_STALE_MS is treated as crashed → resumable).
+  if (job.status === 'running' && Date.now() - job.updatedAt < JOB_STALE_MS) {
+    await sendMessage(chatId, '⏳ لسه بشتغل على الجزء الحالي — استنّى لما أطلب Continue تاني.');
+    return;
+  }
+  await sendMessage(chatId, '▶️ بكمّل من مكان الوقوف...');
+  await triggerBackground(chatId, execute, undefined, true);
 }
 
 async function handleCommand(
@@ -191,6 +224,22 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
   try {
     update = JSON.parse(event.body) as TelegramUpdate;
   } catch {
+    return { statusCode: 200, body: 'ok' };
+  }
+
+  // Inline-button press (the "Continue" button on a paused job).
+  const callback = update.callback_query;
+  if (callback) {
+    await answerCallbackQuery(callback.id); // stop the button's loading spinner
+    const cbChatId = callback.message?.chat.id;
+    const data = callback.data ?? '';
+    if (cbChatId && data.startsWith('cont:')) {
+      if (await isAllowed(cbChatId)) {
+        await handleContinue(cbChatId, data);
+      } else {
+        await sendMessage(cbChatId, `مش مصرّح ليك.\nChat ID بتاعك: \`${cbChatId}\``, { parse_mode: 'Markdown' });
+      }
+    }
     return { statusCode: 200, body: 'ok' };
   }
 
