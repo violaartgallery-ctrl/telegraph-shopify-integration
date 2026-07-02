@@ -3,8 +3,9 @@
  *
  * Arranges the "طباعة الصور" print photos (the ones with NO place on the product,
  * so excluded from the laser) onto A4 sheets at their per-product size:
- *   photo keychain : inner 39.3x49.8mm  frame 42.0x55.7mm  (smaller)
- *   wallet         : inner 52.4x75.8mm  frame 66.0x85.7mm  (bigger)
+ *   small (default)      : inner 39.3x49.8mm  frame 42.0x55.7mm  — purse, photo keychain, plain wallet, …
+ *   big (wallet pocket)  : inner 52.4x75.8mm  frame 66.0x85.7mm  — ONLY "Wallet with transparent pocket"
+ * (size keys below are still named keychain=small / wallet=big.)
  * Each photo is cropped to fill its inner size, drawn centred inside its outer
  * frame (white margin), wrapped in a dotted cut frame, and packed with a skyline
  * bin-packer so a sheet is used to the max (sizes mixed on one page).
@@ -40,8 +41,10 @@ const px = (mm: number): number => Math.round(mm * MM);
 
 export function kindForProduct(product: string): PrintKind {
   const p = (product || "").toLowerCase();
-  if (["keychain", "key chain", "ميدالية", "ميداليه"].some((k) => p.includes(k))) return "keychain";
-  return "wallet";
+  // Only "Wallet with transparent pocket" prints at the BIG wallet-pocket size.
+  // Everything else (Purse Havan, Photo keychain, plain Wallet, …) is SMALL.
+  if (p.includes("transparent pocket")) return "wallet";
+  return "keychain";
 }
 
 // ── skyline bin-packing (bottom-left), mirrors print_layout._skyline_pack ─────
