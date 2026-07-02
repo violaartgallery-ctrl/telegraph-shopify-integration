@@ -35,15 +35,19 @@ interface TelegramUpdate {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const RUN_PHRASES = new Set([
+// /run = create shipments (البوالص). /preview = production documents (التجميعة).
+const RUN_PHRASES = new Set(['شحن', 'اشحن', 'بوالص', 'اعمل الشحنات', 'اعمل الشحن']);
+
+const PREVIEW_PHRASES = new Set([
+  'بريفيو',
+  'preview',
+  'بريفو',
+  'تجميعة',
+  'التجميعة',
   'اعمل التجميعة',
   'اعمل التجميعه',
-  'اعمل',
-  'ابدأ',
-  'شغل',
+  'مستندات',
 ]);
-
-const PREVIEW_PHRASES = new Set(['بريفيو', 'preview', 'بريفو']);
 
 function isTelegraphEnabled(): boolean {
   return process.env.TELEGRAPH_ENABLED?.trim().toLowerCase() === 'true';
@@ -84,8 +88,8 @@ async function handleCommand(
       chatId,
       `${greeting}\n\n${access}\n\n` +
         `الأوامر:\n` +
-        `• *اعمل التجميعة* أو /run — تجميعة + شحن كامل\n` +
-        `• *بريفيو* أو /preview — تجميعة بدون شحن حقيقي\n` +
+        `• *بريفيو* أو /preview — المستندات (Word + ليزر + صور) للمصنع\n` +
+        `• *شحن* أو /run — إنشاء الشحنات (البوالص) + لينك الطباعة\n` +
         `• /users — اليوزرز المصرّح ليهم\n` +
         `• /refresh — تحديث قائمة اليوزرز من الشيت\n\n` +
         `TELEGRAPH\\_ENABLED: \`${isTelegraphEnabled() ? 'true ✅' : 'false ⛔'}\``,
@@ -122,7 +126,7 @@ async function handleCommand(
     const parts = fullText.trim().split(/\s+/);
     const orderArg = parts[1] ? parts[1].replace(/^#/, '') : undefined;
     const orderLabel = orderArg ? ` (أوردر #${orderArg} فقط)` : '';
-    await sendMessage(chatId, `⏳ جاري تشغيل التجميعة (تنفيذ حقيقي)${orderLabel}...`);
+    await sendMessage(chatId, `⏳ جاري إنشاء الشحنات (البوالص)${orderLabel}...`);
     await triggerBackground(chatId, true, orderArg);
     return;
   }
@@ -131,7 +135,7 @@ async function handleCommand(
     const parts = fullText.trim().split(/\s+/);
     const orderArg = parts[1] ? parts[1].replace(/^#/, '') : undefined;
     const orderLabel = orderArg ? ` (أوردر #${orderArg} فقط)` : '';
-    await sendMessage(chatId, `⏳ جاري تشغيل البريفيو${orderLabel}...`);
+    await sendMessage(chatId, `⏳ جاري تجهيز المستندات${orderLabel}...`);
     await triggerBackground(chatId, false, orderArg);
     return;
   }
@@ -209,10 +213,10 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
         { parse_mode: 'Markdown' }
       );
     } else if (RUN_PHRASES.has(text)) {
-      await sendMessage(chatId, '⏳ جاري تشغيل التجميعة (تنفيذ حقيقي)...');
+      await sendMessage(chatId, '⏳ جاري إنشاء الشحنات (البوالص)...');
       await triggerBackground(chatId, true);
     } else if (PREVIEW_PHRASES.has(text)) {
-      await sendMessage(chatId, '⏳ جاري تشغيل البريفيو...');
+      await sendMessage(chatId, '⏳ جاري تجهيز المستندات...');
       await triggerBackground(chatId, false);
     }
   }

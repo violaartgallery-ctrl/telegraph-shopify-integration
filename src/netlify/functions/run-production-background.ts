@@ -111,15 +111,15 @@ interface ShipResult {
 // ── Main pipeline ─────────────────────────────────────────────────────────────
 
 export async function runPipeline(chatId: number, execute: boolean, orderId?: string): Promise<void> {
-  // Ship FIRST (execute mode). Shipments are the irreplaceable step; the
-  // production documents can always be regenerated via /preview. Doing shipments
-  // first means Vercel's 300s function limit can only ever truncate the
-  // (regenerable) documents — never the shipments. (Docs-first previously ate the
-  // whole budget generating laser files, so shipments never ran.)
+  // Split flows so each gets its OWN 300s function budget (no starvation, and
+  // neither can ever truncate the other):
+  //   execute=true  (/run)     → create Telegraph shipments only.
+  //   execute=false (/preview) → generate + send the production documents only.
   if (execute) {
     await createShipmentsForRun(chatId, orderId);
+  } else {
+    await sendProductionDocuments(chatId, execute, orderId);
   }
-  await sendProductionDocuments(chatId, execute, orderId);
 }
 
 async function sendProductionDocuments(chatId: number, execute: boolean, orderId?: string): Promise<void> {
