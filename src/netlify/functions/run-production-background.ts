@@ -111,6 +111,18 @@ interface ShipResult {
 // ── Main pipeline ─────────────────────────────────────────────────────────────
 
 export async function runPipeline(chatId: number, execute: boolean, orderId?: string): Promise<void> {
+  // Ship FIRST (execute mode). Shipments are the irreplaceable step; the
+  // production documents can always be regenerated via /preview. Doing shipments
+  // first means Vercel's 300s function limit can only ever truncate the
+  // (regenerable) documents — never the shipments. (Docs-first previously ate the
+  // whole budget generating laser files, so shipments never ran.)
+  if (execute) {
+    await createShipmentsForRun(chatId, orderId);
+  }
+  await sendProductionDocuments(chatId, execute, orderId);
+}
+
+async function sendProductionDocuments(chatId: number, execute: boolean, orderId?: string): Promise<void> {
   const mode = execute ? 'تنفيذ حقيقي' : 'بريفيو';
   const orderLabel = orderId ? ` (أوردر ${orderId} فقط)` : '';
 
@@ -282,13 +294,18 @@ export async function runPipeline(chatId: number, execute: boolean, orderId?: st
   }
   await sendMessage(chatId, summaryLines.join('\n'), { parse_mode: 'Markdown' });
 
-  // ── Step 5: Preview only — stop here ──────────────────────────────────────
+  // Documents done. Preview stops here; in execute mode the shipments were
+  // already created at the TOP of runPipeline (before these documents).
   if (!execute) {
     await sendMessage(chatId, `🔒 بريفيو فقط — مش اتعملت أي شحنة.`);
-    return;
   }
+}
 
-  // ── Step 6: Check safety gate ──────────────────────────────────────────────
+// Business-critical: create the Telegraph shipments for confirmed orders. Called
+// FIRST in runPipeline (execute mode) so the 300s function limit can only ever
+// truncate the regenerable documents, never the shipments.
+async function createShipmentsForRun(chatId: number, orderId?: string): Promise<void> {
+  // ── Safety gate ────────────────────────────────────────────────────────────
   if (process.env.TELEGRAPH_ENABLED?.trim().toLowerCase() !== 'true') {
     await sendMessage(
       chatId,
