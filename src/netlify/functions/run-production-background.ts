@@ -145,16 +145,28 @@ export async function runPipeline(
   if (!cursor) {
     cursor = execute
       ? { kind: 'run', status: 'running', orderId, phase: 'shipping', processedOrderNames: [], createdShipmentIds: [], results: [], updatedAt: Date.now() }
-      : { kind: 'preview', status: 'running', orderId, docStep: 0, photoIndex: 0, summaryDone: false, updatedAt: Date.now() };
+      : { kind: 'preview', status: 'running', orderId, docStep: 0, sentPhotoUrls: [], summaryDone: false, updatedAt: Date.now() };
   } else {
     cursor.status = 'running';
   }
   await saveJob(chatId, cursor);
 
-  if (cursor.kind === 'run') {
-    await createShipmentsForRun(chatId, cursor, deadline);
-  } else {
-    await sendProductionDocuments(chatId, cursor, deadline);
+  // Any unexpected throw would otherwise leave the job stuck in 'running' (the
+  // Continue guard would block resume for JOB_STALE_MS). Catch it, flip the job
+  // back to 'paused', and offer Continue so the user can pick up immediately.
+  try {
+    if (cursor.kind === 'run') {
+      await createShipmentsForRun(chatId, cursor, deadline);
+    } else {
+      await sendProductionDocuments(chatId, cursor, deadline);
+    }
+  } catch (err) {
+    try {
+      cursor.status = 'paused';
+      await saveJob(chatId, cursor);
+    } catch { /* best-effort */ }
+    await sendMessage(chatId, `❌ حصل خطأ غير متوقع: ${String(err).slice(0, 200)}`);
+    await sendContinuePrompt(chatId, cursor.kind, 'حصل خطأ — تقدر تكمّل من نفس المكان.');
   }
 }
 
@@ -178,14 +190,17 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
   try {
     aymanData = await fetchFromAymanAgent(orderId);
   } catch (err) {
+    // Transient agent failure → keep the checkpoint and let the user retry via
+    // Continue instead of leaving the job stuck in 'running'.
     await sendMessage(chatId, `❌ فشل Ayman Agent:\n${String(err).slice(0, 300)}`);
+    await pause('فشل جلب التجميعة — دوس إكمال أحاول تاني.');
     return;
   }
 
   const { wordBase64, productionEntries, summary, warnings } = aymanData;
   const dateStr = new Date().toISOString().slice(0, 10);
 
-  if (cursor.docStep === 0 && cursor.photoIndex === 0) {
+  if (cursor.docStep === 0 && cursor.sentPhotoUrls.length === 0) {
     await sendMessage(
       chatId,
       `✅ لقيت ${summary?.totalOrders ?? '?'} أوردر — ${productionEntries.length} منتج\nبدأت الإرسال...`
@@ -203,6 +218,7 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
       `قائمة الإنتاج ✅ — ${productionEntries.length} منتج`
     );
     cursor.docStep = 1;
+    await saveJob(chatId, cursor);
   }
 
   // ── Step 2b: Build + send laser AI file(s) for RDWorks (docStep 2) ─────────
@@ -237,6 +253,7 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
       await sendMessage(chatId, `⚠️ فشل توليد ملف الليزر: ${String(err).slice(0, 200)}`);
     }
     cursor.docStep = 2;
+    await saveJob(chatId, cursor);
   }
 
   // ── Step 2.5: Print-ready photo sheet (docStep 3) ─────────────────────────
@@ -272,12 +289,15 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
       await sendMessage(chatId, `⚠️ فشل توليد ورق الطباعة: ${String(err).slice(0, 200)}`);
     }
     cursor.docStep = 3;
+    await saveJob(chatId, cursor);
   }
 
-  // ── Step 3: Send photos individually (resumable via photoIndex) ────────────
+  // ── Step 3: Send photos individually (resumable via sent-URL set) ──────────
   // Caption format the factory needs: "#orderNumber — productName color".
   // We carry the entry's product/color (not the attachment filename, which is
-  // a generic "صورة الطبعة") so each photo is identifiable.
+  // a generic "صورة الطبعة") so each photo is identifiable. Resume tracks WHICH
+  // urls were sent (not a positional index), so a re-fetch that reorders/adds/
+  // removes photos between segments can never skip or mis-caption a photo.
   const allPhotoAttachments: Array<{ url: string; orderName: string; product: string }> = [];
   for (const entry of productionEntries) {
     const product = `${entry.display_product}${entry.display_color ? ` ${entry.display_color}` : ''}`.trim();
@@ -287,28 +307,29 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
       }
     }
   }
-  const seenUrls = new Set<string>();
+  const dedup = new Set<string>();
   const uniquePhotos = allPhotoAttachments.filter((p) => {
-    if (seenUrls.has(p.url)) return false;
-    seenUrls.add(p.url);
+    if (dedup.has(p.url)) return false;
+    dedup.add(p.url);
     return true;
   });
 
-  if (cursor.photoIndex < uniquePhotos.length) {
+  const sent = new Set(cursor.sentPhotoUrls);
+  const pending = uniquePhotos.filter((p) => !sent.has(p.url));
+  if (pending.length > 0) {
     await sendMessage(
       chatId,
-      cursor.photoIndex === 0
-        ? `📷 جاري إرسال ${uniquePhotos.length} صورة...`
-        : `📷 بكمّل الصور من رقم ${cursor.photoIndex + 1} من ${uniquePhotos.length}...`
+      sent.size === 0
+        ? `📷 جاري إرسال ${pending.length} صورة...`
+        : `📷 بكمّل الصور — فاضل ${pending.length} (اتبعت ${sent.size}).`
     );
     const photoFailures: string[] = [];
-    for (let i = cursor.photoIndex; i < uniquePhotos.length; i++) {
+    for (let i = 0; i < pending.length; i++) {
       if (pastDeadline()) {
-        cursor.photoIndex = i; // resume from this photo next time
-        await pause(`اتبعت ${i} من ${uniquePhotos.length} صورة.`);
+        await pause(`اتبعت ${cursor.sentPhotoUrls.length} صورة — فاضل ${pending.length - i}.`);
         return;
       }
-      const photo = uniquePhotos[i]!;
+      const photo = pending[i]!;
       try {
         const photoResp = await fetch(photo.url);
         if (photoResp.ok) {
@@ -316,7 +337,10 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
           const rawExt = new URL(photo.url).pathname.split('.').pop() ?? 'jpg';
           const ext = rawExt.length <= 5 ? rawExt : 'jpg';
           const safeName = photo.orderName.replace(/[^a-zA-Z0-9_-]/g, '_');
-          await sendDocument(chatId, photoBuf, `${safeName}_photo_${i + 1}.${ext}`, `${photo.orderName} — ${photo.product}`);
+          await sendDocument(chatId, photoBuf, `${safeName}_photo_${cursor.sentPhotoUrls.length + 1}.${ext}`, `${photo.orderName} — ${photo.product}`);
+          // Mark this URL sent so a crash/resume never re-sends or skips it.
+          cursor.sentPhotoUrls.push(photo.url);
+          if (cursor.sentPhotoUrls.length % 10 === 0) await saveJob(chatId, cursor);
         } else {
           photoFailures.push(`${photo.orderName}: HTTP ${photoResp.status}`);
         }
@@ -324,7 +348,7 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
         photoFailures.push(`${photo.orderName}: ${String(err).slice(0, 80)}`);
       }
     }
-    cursor.photoIndex = uniquePhotos.length;
+    await saveJob(chatId, cursor);
     if (photoFailures.length > 0) {
       await sendMessage(chatId, `⚠️ فشل إرسال ${photoFailures.length} صورة:\n${photoFailures.slice(0, 5).join('\n')}`);
     }
@@ -346,7 +370,9 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
       await sendMessage(chatId, `⚠️ فشل توليد ملف الأوردرات: ${String(err).slice(0, 200)}`);
     }
 
-    const summaryLines = ['📋 *ملخص التجميعة:*'];
+    // Plain text (NO Markdown): product names can contain _ * [ ` which would
+    // make Telegram reject the whole message and silently drop the summary.
+    const summaryLines = ['📋 ملخص التجميعة:'];
     if (warnings?.length) {
       summaryLines.push(`⚠️ تحذيرات: ${warnings.length}`);
       for (const w of warnings.slice(0, 3)) {
@@ -359,7 +385,7 @@ async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, de
     if (productionEntries.length > 20) {
       summaryLines.push(`...و ${productionEntries.length - 20} منتج تاني`);
     }
-    await sendMessage(chatId, summaryLines.join('\n'), { parse_mode: 'Markdown' });
+    await sendMessage(chatId, summaryLines.join('\n'));
     cursor.summaryDone = true;
   }
 
@@ -458,6 +484,10 @@ async function createShipmentsForRun(chatId: number, cursor: RunCursor, deadline
           await sendMessage(chatId, `❌ ${order.name} — فشل: ${errMsg}`);
         }
         cursor.processedOrderNames.push(order.name);
+        // Persist after EVERY order so a hard 300s kill (or crash) mid-segment
+        // never loses which orders shipped or their waybill ids — resume skips
+        // them and the print link stays complete.
+        await saveJob(chatId, cursor);
       }
     }
 

@@ -33,7 +33,10 @@ export interface PreviewCursor extends JobCommon {
   kind: 'preview';
   // Document steps already sent: 0=none 1=word 2=laser+box 3=print-sheet.
   docStep: number;
-  photoIndex: number; // next photo to send in the individual-photo loop
+  // URLs of photos already sent — identity-based (NOT a positional index), so a
+  // re-fetch that reorders/adds/removes photos between segments can never skip
+  // or mis-caption a photo. Already-sent URLs are simply not sent again.
+  sentPhotoUrls: string[];
   summaryDone: boolean; // orders-summary + final summary already sent
 }
 

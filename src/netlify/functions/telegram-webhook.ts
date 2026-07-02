@@ -1,7 +1,7 @@
 import { waitUntil } from '@vercel/functions';
-import { sendMessage, answerCallbackQuery } from '../../telegram/telegramApi.js';
+import { sendMessage, sendMessageWithButton, answerCallbackQuery } from '../../telegram/telegramApi.js';
 import { runPipeline } from './run-production-background.js';
-import { loadJob, JOB_STALE_MS } from '../../services/productionJobStore.js';
+import { loadJob, saveJob, clearJob, JOB_STALE_MS } from '../../services/productionJobStore.js';
 import {
   isAllowed,
   getUser,
@@ -86,8 +86,45 @@ async function triggerBackground(
   }
 }
 
+// Is the bot paused via /stop? (the 'bot_control'/'bot_paused' flag). This is
+// what makes /stop actually block /run and /preview.
+async function isBotPaused(): Promise<boolean> {
+  const { prisma } = await import('../../lib/prisma.js');
+  const row = await prisma.failedPayload.findFirst({
+    where: { source: 'bot_control', reason: 'bot_paused' },
+  });
+  return Boolean(row);
+}
+
+// Gate a FRESH /run or /preview: refuse if the bot is paused, and never clobber
+// an in-progress/paused job (that would lose its shipment ids + progress) —
+// offer Continue instead. A stale 'running' job (crashed) is discarded so a new
+// run can start. Returns true only when it's safe to start fresh.
+async function canStartFresh(chatId: number): Promise<boolean> {
+  if (await isBotPaused()) {
+    await sendMessage(chatId, '🛑 البوت متوقف (/stop). ابعت /resume الأول عشان تشغّله.');
+    return false;
+  }
+  const existing = await loadJob(chatId);
+  if (existing && Date.now() - existing.updatedAt < JOB_STALE_MS) {
+    const kind = existing.kind === 'run' ? 'شحن' : 'تجميعة';
+    await sendMessageWithButton(
+      chatId,
+      `⚠️ فيه ${kind} لسه شغّال أو موقوف. دوس إكمال تكمّله، أو ابعت /cancel عشان تلغيه وتبدأ من الأول.`,
+      { text: '▶️ إكمال (Continue)', callback_data: `cont:${existing.kind}` }
+    );
+    return false;
+  }
+  if (existing) await clearJob(chatId); // stale/dead job → discard, allow fresh
+  return true;
+}
+
 // Handle the "Continue" button press on a paused job.
 async function handleContinue(chatId: number, data: string): Promise<void> {
+  if (await isBotPaused()) {
+    await sendMessage(chatId, '🛑 البوت متوقف (/stop). ابعت /resume الأول.');
+    return;
+  }
   const execute = data === 'cont:run';
   const job = await loadJob(chatId);
   if (!job) {
@@ -100,6 +137,10 @@ async function handleContinue(chatId: number, data: string): Promise<void> {
     await sendMessage(chatId, '⏳ لسه بشتغل على الجزء الحالي — استنّى لما أطلب Continue تاني.');
     return;
   }
+  // Claim the job (mark running now) BEFORE returning, so a fast second press
+  // sees 'running' and is rejected by the guard above — shrinks the race window.
+  job.status = 'running';
+  await saveJob(chatId, job);
   await sendMessage(chatId, '▶️ بكمّل من مكان الوقوف...');
   await triggerBackground(chatId, execute, undefined, true);
 }
@@ -123,8 +164,10 @@ async function handleCommand(
         `الأوامر:\n` +
         `• *بريفيو* أو /preview — المستندات (Word + ليزر + صور) للمصنع\n` +
         `• *شحن* أو /run — إنشاء الشحنات (البوالص) + لينك الطباعة\n` +
+        `• /cancel — إلغاء أي تجميعة/شحن موقوف والبدء من جديد\n` +
         `• /users — اليوزرز المصرّح ليهم\n` +
         `• /refresh — تحديث قائمة اليوزرز من الشيت\n\n` +
+        `لو الشغل كتير، البوت هيوقف قبل حد الوقت ويبعتلك زرار *إكمال* — دوسه يكمّل من نفس المكان.\n\n` +
         `TELEGRAPH\\_ENABLED: \`${isTelegraphEnabled() ? 'true ✅' : 'false ⛔'}\``,
       { parse_mode: 'Markdown' }
     );
@@ -155,7 +198,14 @@ async function handleCommand(
     return;
   }
 
+  if (command === '/cancel') {
+    await clearJob(chatId);
+    await sendMessage(chatId, '🗑️ اتلغت أي تجميعة/شحن موقوف. تقدر تبعت /run أو /preview من الأول.');
+    return;
+  }
+
   if (command === '/run') {
+    if (!(await canStartFresh(chatId))) return;
     const parts = fullText.trim().split(/\s+/);
     const orderArg = parts[1] ? parts[1].replace(/^#/, '') : undefined;
     const orderLabel = orderArg ? ` (أوردر #${orderArg} فقط)` : '';
@@ -165,6 +215,7 @@ async function handleCommand(
   }
 
   if (command === '/preview') {
+    if (!(await canStartFresh(chatId))) return;
     const parts = fullText.trim().split(/\s+/);
     const orderArg = parts[1] ? parts[1].replace(/^#/, '') : undefined;
     const orderLabel = orderArg ? ` (أوردر #${orderArg} فقط)` : '';
@@ -262,11 +313,15 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
         { parse_mode: 'Markdown' }
       );
     } else if (RUN_PHRASES.has(text)) {
-      await sendMessage(chatId, '⏳ جاري إنشاء الشحنات (البوالص)...');
-      await triggerBackground(chatId, true);
+      if (await canStartFresh(chatId)) {
+        await sendMessage(chatId, '⏳ جاري إنشاء الشحنات (البوالص)...');
+        await triggerBackground(chatId, true);
+      }
     } else if (PREVIEW_PHRASES.has(text)) {
-      await sendMessage(chatId, '⏳ جاري تجهيز المستندات...');
-      await triggerBackground(chatId, false);
+      if (await canStartFresh(chatId)) {
+        await sendMessage(chatId, '⏳ جاري تجهيز المستندات...');
+        await triggerBackground(chatId, false);
+      }
     }
   }
 
