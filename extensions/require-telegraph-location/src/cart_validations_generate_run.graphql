@@ -1,0 +1,10 @@
+query CartValidationsGenerateRunInput {
+  cart {
+    governorateId: attribute(key: "Telegraph Governorate ID") {
+      value
+    }
+    areaId: attribute(key: "Telegraph Area ID") {
+      value
+    }
+  }
+}
