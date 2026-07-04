@@ -1,7 +1,7 @@
 client_id = "eaf022045694e907d4ed6d02bbbfd49a"
 name = "viola-telegraph"
 handle = "viola-telegraph"
-application_url = "https://viola-telegraph-integration.netlify.app/"
+application_url = "https://viola-telegraph-integration.vercel.app/"
 embedded = true
 
 [build]
@@ -14,4 +14,4 @@ api_version = "2025-10"
 scopes = "read_all_orders,read_orders,write_orders,read_customers,read_products,write_products,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders"
 
 [auth]
-redirect_urls = [ "https://viola-telegraph-integration.netlify.app/api/auth" ]
+redirect_urls = [ "https://viola-telegraph-integration.vercel.app/api/auth" ]
