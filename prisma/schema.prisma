@@ -9,46 +9,86 @@ datasource db {
 }
 
 model ShipmentRecord {
-  id                   Int      @id @default(autoincrement())
-  shopifyOrderId       String   @unique
-  shopifyOrderNumber   String
-  shopifyOrderName     String?
-  plannedShipmentCode  String?  @unique
-  accurateShipmentId   Int?
-  accurateShipmentCode String?
-  accurateStatus       String?
-  accurateStatusCode   String?
-  accurateReturnStatus String?
-  accurateReturnStatusCode String?
-  accurateIsTerminal   Boolean?
-  collectionStatus     String?
-  trackingUrl          String?
-  collectedAmount      Float?
-  pendingCollectionAmount Float?
-  returnedValue        Float?
-  deliveryFees         Float?
-  returnFees           Float?
-  returningDueFees     Float?
-  customerDue          Float?
-  deliveredAt          DateTime?
-  lastSyncedAt         DateTime?
-  lastError            String?
-  odooSaleOrderId      Int?
-  odooSaleOrderName    String?
-  odooInvoiceId        Int?
-  odooInvoiceName      String?
-  odooPaymentId        Int?
-  odooSalePaymentId    Int?
-  odooReturnBillId     Int?
-  odooReturnPaymentId  Int?
-  odooSyncStatus       String?
-  odooLastError        String?
-  odooSyncedAt         DateTime?
-  odooAttemptCount     Int       @default(0)
-  odooRetryAt          DateTime?
-  rawOrderJson         String?
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  id                         Int                  @id @default(autoincrement())
+  shopifyOrderId             String               @unique
+  shopifyOrderNumber         String
+  shopifyOrderName           String?
+  plannedShipmentCode        String?              @unique
+  accurateShipmentId         Int?
+  accurateShipmentCode       String?
+  accurateStatus             String?
+  accurateStatusCode         String?
+  accurateReturnStatus       String?
+  accurateReturnStatusCode   String?
+  accurateIsTerminal         Boolean?
+  collectionStatus           String?
+  trackingUrl                String?
+  collectedAmount            Float?
+  pendingCollectionAmount    Float?
+  returnedValue              Float?
+  deliveryFees               Float?
+  returnFees                 Float?
+  returningDueFees           Float?
+  customerDue                Float?
+  deliveredAt                DateTime?
+  returnedAt                 DateTime?
+  shopifyCreatedAt           DateTime?
+  metaDeliveryLastReason     String?
+  metaDeliveryLastObservedAt DateTime?
+  metaDeliveryLastMode       String?
+  lastSyncedAt               DateTime?
+  lastError                  String?
+  odooSaleOrderId            Int?
+  odooSaleOrderName          String?
+  odooInvoiceId              Int?
+  odooInvoiceName            String?
+  odooPaymentId              Int?
+  odooSalePaymentId          Int?
+  odooReturnBillId           Int?
+  odooReturnPaymentId        Int?
+  odooSyncStatus             String?
+  odooLastError              String?
+  odooSyncedAt               DateTime?
+  odooAttemptCount           Int                  @default(0)
+  odooRetryAt                DateTime?
+  rawOrderJson               String?
+  createdAt                  DateTime             @default(now())
+  updatedAt                  DateTime             @updatedAt
+  metaDeliveryEvents         MetaDeliveryOutbox[]
+}
+
+model MetaDeliveryOutbox {
+  id               Int            @id @default(autoincrement())
+  shipmentRecordId Int
+  shopifyOrderId   String
+  eventName        String         @default("Delivered")
+  eventId          String
+  eventTime        DateTime
+  source           String
+  mode             String
+  payloadJson      String
+  payloadHash      String
+  matchQualityJson String?
+  status           String         @default("pending")
+  attemptCount     Int            @default(0)
+  nextAttemptAt    DateTime?
+  leaseToken       String?
+  leaseExpiresAt   DateTime?
+  lastAttemptAt    DateTime?
+  lastHttpStatus   Int?
+  lastErrorCode    String?
+  lastError        String?
+  eventsReceived   Int?
+  fbtraceId        String?
+  sentAt           DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  shipmentRecord   ShipmentRecord @relation(fields: [shipmentRecordId], references: [id], onDelete: Cascade)
+
+  @@unique([mode, eventId])
+  @@unique([mode, eventName, shopifyOrderId])
+  @@index([status, nextAttemptAt, leaseExpiresAt])
+  @@index([shipmentRecordId])
 }
 
 model ShipmentSequence {

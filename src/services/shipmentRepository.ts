@@ -1,6 +1,79 @@
 import { prisma } from '../lib/prisma.js';
 import type { ShopifyOrder } from '../types/shopify.js';
 
+export interface AccurateSnapshotData {
+  accurateStatus: string;
+  accurateStatusCode?: string | null;
+  accurateReturnStatus?: string | null;
+  accurateReturnStatusCode?: string | null;
+  accurateIsTerminal?: boolean | null;
+  collectionStatus?: string | null;
+  trackingUrl?: string | null;
+  collectedAmount?: number | null;
+  pendingCollectionAmount?: number | null;
+  returnedValue?: number | null;
+  deliveryFees?: number | null;
+  returnFees?: number | null;
+  returningDueFees?: number | null;
+  customerDue?: number | null;
+  deliveredAt?: Date | null;
+  returnedAt?: Date | null;
+}
+
+export interface AccurateSnapshotCurrentState {
+  accurateStatus?: string | null;
+  accurateStatusCode?: string | null;
+  accurateReturnStatus?: string | null;
+  accurateReturnStatusCode?: string | null;
+  accurateIsTerminal?: boolean | null;
+  collectionStatus?: string | null;
+  collectedAmount?: number | null;
+}
+
+const RETURN_CODES = new Set(['RTRN', 'RTS', 'RJCT']);
+
+/**
+ * Accurate's ordinary lookup can lag behind the collection report. Preserve a
+ * confirmed DTR+collected fact unless the incoming snapshot explicitly says the
+ * shipment was returned/cancelled or moved to payment review.
+ */
+export const mergeAccurateSnapshot = (
+  current: AccurateSnapshotCurrentState,
+  incoming: AccurateSnapshotData
+): AccurateSnapshotData => {
+  const currentCode = current.accurateStatusCode?.trim().toUpperCase() ?? '';
+  const currentCollection = current.collectionStatus?.trim().toLowerCase() ?? '';
+  const incomingCode = incoming.accurateStatusCode?.trim().toUpperCase() ?? '';
+  const incomingReturnCode = incoming.accurateReturnStatusCode?.trim().toUpperCase() ?? '';
+  const incomingCollection = incoming.collectionStatus?.trim().toLowerCase() ?? '';
+  const explicitReversal =
+    RETURN_CODES.has(incomingCode) ||
+    RETURN_CODES.has(incomingReturnCode) ||
+    ['returned', 'returned-settled', 'cancelled', 'payment-review'].includes(incomingCollection);
+
+  if (currentCode === 'DTR' && currentCollection === 'collected' && !explicitReversal) {
+    return {
+      ...incoming,
+      accurateStatus: current.accurateStatus ?? incoming.accurateStatus,
+      accurateStatusCode: current.accurateStatusCode ?? 'DTR',
+      accurateReturnStatus: current.accurateReturnStatus ?? incoming.accurateReturnStatus,
+      accurateReturnStatusCode: current.accurateReturnStatusCode ?? incoming.accurateReturnStatusCode,
+      accurateIsTerminal: current.accurateIsTerminal ?? true,
+      collectionStatus: 'collected',
+      collectedAmount: incoming.collectedAmount && incoming.collectedAmount > 0
+        ? incoming.collectedAmount
+        : current.collectedAmount ?? incoming.collectedAmount
+    };
+  }
+  return incoming;
+};
+
+const validDate = (value?: string | null): Date | undefined => {
+  if (!value) return undefined;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+};
+
 export const shipmentRepository = {
   findByShopifyOrderId: async (shopifyOrderId: string) =>
     await prisma.shipmentRecord.findUnique({ where: { shopifyOrderId } }),
@@ -140,6 +213,7 @@ export const shipmentRepository = {
       update: {
         shopifyOrderNumber: String(order.order_number),
         shopifyOrderName: order.name,
+        shopifyCreatedAt: validDate(order.created_at),
         rawOrderJson: JSON.stringify(order),
         accurateStatus: 'PENDING'
       },
@@ -147,6 +221,7 @@ export const shipmentRepository = {
         shopifyOrderId: String(order.id),
         shopifyOrderNumber: String(order.order_number),
         shopifyOrderName: order.name,
+        shopifyCreatedAt: validDate(order.created_at),
         rawOrderJson: JSON.stringify(order),
         accurateStatus: 'PENDING'
       }
@@ -194,44 +269,50 @@ export const shipmentRepository = {
       data: { plannedShipmentCode: code }
     }),
 
-  updateAccurateSnapshot: async (id: number, data: {
-    accurateStatus: string;
-    accurateStatusCode?: string | null;
-    accurateReturnStatus?: string | null;
-    accurateReturnStatusCode?: string | null;
-    accurateIsTerminal?: boolean | null;
-    collectionStatus?: string | null;
-    trackingUrl?: string | null;
-    collectedAmount?: number | null;
-    pendingCollectionAmount?: number | null;
-    returnedValue?: number | null;
-    deliveryFees?: number | null;
-    returnFees?: number | null;
-    returningDueFees?: number | null;
-    customerDue?: number | null;
-    deliveredAt?: Date | null;
-  }) =>
-    await prisma.shipmentRecord.update({
-      where: { id },
-      data: {
-        accurateStatus: data.accurateStatus,
-        accurateStatusCode: data.accurateStatusCode,
-        accurateReturnStatus: data.accurateReturnStatus,
-        accurateReturnStatusCode: data.accurateReturnStatusCode,
-        accurateIsTerminal: data.accurateIsTerminal,
-        collectionStatus: data.collectionStatus,
-        trackingUrl: data.trackingUrl,
-        collectedAmount: data.collectedAmount,
-        pendingCollectionAmount: data.pendingCollectionAmount,
-        returnedValue: data.returnedValue,
-        deliveryFees: data.deliveryFees,
-        returnFees: data.returnFees,
-        returningDueFees: data.returningDueFees,
-        customerDue: data.customerDue,
-        deliveredAt: data.deliveredAt,
-        lastSyncedAt: new Date()
+  updateAccurateSnapshot: async (id: number, data: AccurateSnapshotData) =>
+    await prisma.$transaction(async (tx) => {
+      // Acquire a row lock before reading/merging status precedence.
+      await tx.shipmentRecord.update({
+        where: { id },
+        data: { lastSyncedAt: new Date() }
+      });
+      const current = await tx.shipmentRecord.findUniqueOrThrow({ where: { id } });
+      const merged = mergeAccurateSnapshot(current, data);
+      await tx.shipmentRecord.update({
+        where: { id },
+        data: {
+          accurateStatus: merged.accurateStatus,
+          accurateStatusCode: merged.accurateStatusCode,
+          accurateReturnStatus: merged.accurateReturnStatus,
+          accurateReturnStatusCode: merged.accurateReturnStatusCode,
+          accurateIsTerminal: merged.accurateIsTerminal,
+          collectionStatus: merged.collectionStatus,
+          trackingUrl: merged.trackingUrl,
+          collectedAmount: merged.collectedAmount,
+          pendingCollectionAmount: merged.pendingCollectionAmount,
+          returnedValue: merged.returnedValue,
+          deliveryFees: merged.deliveryFees,
+          returnFees: merged.returnFees,
+          returningDueFees: merged.returningDueFees,
+          customerDue: merged.customerDue,
+          lastSyncedAt: new Date()
+        }
+      });
+      const timestamps = await tx.shipmentRecord.findUniqueOrThrow({
+        where: { id },
+        select: { deliveredAt: true, returnedAt: true }
+      });
+      if ((!timestamps.deliveredAt && merged.deliveredAt) || (!timestamps.returnedAt && merged.returnedAt)) {
+        await tx.shipmentRecord.update({
+          where: { id },
+          data: {
+            deliveredAt: timestamps.deliveredAt ? undefined : merged.deliveredAt ?? undefined,
+            returnedAt: timestamps.returnedAt ? undefined : merged.returnedAt ?? undefined
+          }
+        });
       }
-    }),
+      return await tx.shipmentRecord.findUniqueOrThrow({ where: { id } });
+    }, { maxWait: 20_000, timeout: 30_000 }),
 
   markFailed: async (shopifyOrderId: string, error: string) =>
     await prisma.shipmentRecord.update({

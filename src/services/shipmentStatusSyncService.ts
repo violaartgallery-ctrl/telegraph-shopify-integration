@@ -7,6 +7,26 @@ import { projectAccurateStatusToShopify } from './accurateStatusMapper.js';
 import { failedPayloadService } from './failedPayloadService.js';
 import { shipmentRepository } from './shipmentRepository.js';
 import { OdooSyncService } from '../odoo/odooSyncService.js';
+import type { AccurateSnapshotData } from './shipmentRepository.js';
+import type { MetaDeliveryService, MetaDeliverySource } from '../meta/metaDeliveryService.js';
+
+const RETURNED_STATUS_CODES = new Set(['RTRN', 'RTS', 'RJCT']);
+
+const actualShipmentDates = (shipment: {
+  deliveredOrReturnedDate?: string | null;
+  status?: { code?: string | null } | null;
+  returnStatus?: { code?: string | null } | null;
+}): Pick<AccurateSnapshotData, 'deliveredAt' | 'returnedAt'> => {
+  if (!shipment.deliveredOrReturnedDate) return {};
+  const actualAt = new Date(shipment.deliveredOrReturnedDate);
+  if (Number.isNaN(actualAt.getTime())) return {};
+  const statusCode = shipment.status?.code?.trim().toUpperCase() ?? '';
+  const returnStatusCode = shipment.returnStatus?.code?.trim().toUpperCase() ?? '';
+  if (RETURNED_STATUS_CODES.has(statusCode) || RETURNED_STATUS_CODES.has(returnStatusCode)) {
+    return { returnedAt: actualAt };
+  }
+  return statusCode === 'DTR' ? { deliveredAt: actualAt } : {};
+};
 
 const buildStatusNote = (params: {
   shipmentCode?: string | null;
@@ -41,8 +61,21 @@ const buildStatusNote = (params: {
 export class ShipmentStatusSyncService {
   constructor(
     private readonly accurateClient: AccurateClient,
-    private readonly odooSyncService?: OdooSyncService
+    private readonly odooSyncService?: OdooSyncService,
+    private readonly metaDeliveryService?: MetaDeliveryService
   ) {}
+
+  private async persistAccurateSnapshot(
+    recordId: number,
+    data: AccurateSnapshotData,
+    source: Exclude<MetaDeliverySource, 'reconciliation'>
+  ): Promise<void> {
+    if (this.metaDeliveryService) {
+      await this.metaDeliveryService.observeSnapshot(recordId, data, source);
+      return;
+    }
+    await shipmentRepository.updateAccurateSnapshot(recordId, data);
+  }
 
   /**
    * PERMANENT FIX (C): detect collections via the working `listShipments` API
@@ -59,8 +92,6 @@ export class ShipmentStatusSyncService {
     const start = Date.now();
     const DELIVERED = new Set(['DTR']);
     const summary = { scanned: 0, recorded: 0, shopifyPaid: 0, skipped: 0, notInDb: 0, failed: 0 };
-    if (!this.odooSyncService) return summary;
-
     let page = 1;
     let actions = 0;
     while (actions < maxActions && Date.now() - start < budgetMs) {
@@ -74,7 +105,24 @@ export class ShipmentStatusSyncService {
         const ref = sh.refNumber ?? null;
         const isOurs = /^VI\d/i.test(code) || (ref ? /viola/i.test(ref) : false);
         if (!isOurs) continue;
-        if (!DELIVERED.has((sh.status?.code ?? '').toUpperCase()) || Number(sh.collectedAmount ?? 0) <= 0) continue;
+        const reportStatusCode = (sh.status?.code ?? '').toUpperCase();
+        const reportReturnCode = (sh.returnStatus?.code ?? '').toUpperCase();
+        const reportProjection = projectAccurateStatusToShopify({
+          statusCode: sh.status?.code,
+          statusName: sh.status?.name,
+          returnStatusCode: sh.returnStatus?.code,
+          returnStatusName: sh.returnStatus?.name,
+          collected: true,
+          paidToCustomer: sh.paidToCustomer,
+          cancelled: sh.cancelled,
+          customerDue: sh.customerDue
+        });
+        if (
+          !DELIVERED.has(reportStatusCode) ||
+          RETURNED_STATUS_CODES.has(reportReturnCode) ||
+          reportProjection.collectionStatus !== 'collected' ||
+          Number(sh.collectedAmount ?? 0) <= 0
+        ) continue;
 
         // Find DB record by code, then by refNumber → order number.
         let rec = await shipmentRepository.findByReference(code);
@@ -83,20 +131,31 @@ export class ShipmentStatusSyncService {
           if (m) rec = await shipmentRepository.findByShopifyOrderName('#' + m[1]);
         }
         if (!rec) { summary.notInDb++; continue; }
-        if (rec.odooInvoiceId && (rec.odooPaymentId || rec.odooSalePaymentId)) { summary.skipped++; continue; }
         if (actions >= maxActions || Date.now() - start >= budgetMs) break;
 
         try {
-          await shipmentRepository.updateAccurateSnapshot(rec.id, {
+          await this.persistAccurateSnapshot(rec.id, {
             accurateStatus: 'تم التسليم', accurateStatusCode: sh.status?.code ?? 'DTR',
-            collectionStatus: 'collected',
+            accurateReturnStatus: sh.returnStatus?.name ?? sh.returnStatus?.code ?? null,
+            accurateReturnStatusCode: sh.returnStatus?.code ?? null,
+            accurateIsTerminal: reportProjection.isTerminal,
+            collectionStatus: reportProjection.collectionStatus,
             collectedAmount: Number(sh.collectedAmount ?? 0),
             pendingCollectionAmount: Number(sh.pendingCollectionAmount ?? 0),
             returnedValue: Number(sh.returnedValue ?? 0),
             deliveryFees: Number(sh.deliveryFees ?? 0),
             customerDue: Number(sh.customerDue ?? 0),
-            deliveredAt: sh.deliveredOrReturnedDate ? new Date(sh.deliveredOrReturnedDate) : null
-          });
+            ...actualShipmentDates(sh)
+          }, 'accurate-report');
+          // Meta must observe carrier truth even when accounting already finished.
+          if (rec.odooInvoiceId && (rec.odooPaymentId || rec.odooSalePaymentId)) {
+            summary.skipped++;
+            continue;
+          }
+          if (!this.odooSyncService) {
+            summary.skipped++;
+            continue;
+          }
           await this.odooSyncService.syncCollectedShipment(rec.id);
           summary.recorded++;
           actions++;
@@ -173,7 +232,7 @@ export class ShipmentStatusSyncService {
       customerDue: shipment.customerDue
     });
 
-    await shipmentRepository.updateAccurateSnapshot(record.id, {
+    await this.persistAccurateSnapshot(record.id, {
       accurateStatus: projection.shipmentStatus,
       accurateStatusCode: shipment.status?.code ?? null,
       accurateReturnStatus: shipment.returnStatus?.name ?? shipment.returnStatus?.code ?? null,
@@ -188,8 +247,8 @@ export class ShipmentStatusSyncService {
       returnFees: shipment.returnFees,
       returningDueFees: shipment.returningDueFees,
       customerDue: shipment.customerDue,
-      deliveredAt: shipment.deliveredOrReturnedDate ? new Date(shipment.deliveredOrReturnedDate) : null
-    });
+      ...actualShipmentDates(shipment)
+    }, 'accurate-status');
 
     await shopifyStatusSyncClient.syncShipmentState({
       orderId: record.shopifyOrderId,
@@ -446,7 +505,9 @@ export class ShipmentStatusSyncService {
     const isPositiveDeliveredPayment =
       entryAmount > 0 &&
       customerDue > 0 &&
-      shipment.status?.code?.toUpperCase() === 'DTR';
+      shipment.status?.code?.toUpperCase() === 'DTR' &&
+      !shipment.cancelled &&
+      !RETURNED_STATUS_CODES.has(shipment.returnStatus?.code?.toUpperCase() ?? '');
 
     if (!isPositiveDeliveredPayment) {
       return 'skipped';
@@ -468,13 +529,13 @@ export class ShipmentStatusSyncService {
       customerDue: shipment.customerDue
     });
 
-    await shipmentRepository.updateAccurateSnapshot(record.id, {
+    await this.persistAccurateSnapshot(record.id, {
       accurateStatus: projection.shipmentStatus,
       accurateStatusCode: shipment.status?.code ?? null,
       accurateReturnStatus: shipment.returnStatus?.name ?? shipment.returnStatus?.code ?? null,
       accurateReturnStatusCode: shipment.returnStatus?.code ?? null,
       accurateIsTerminal: projection.isTerminal,
-      collectionStatus: 'collected',
+      collectionStatus: projection.collectionStatus,
       trackingUrl: shipment.trackingUrl,
       collectedAmount: shipment.collectedAmount,
       pendingCollectionAmount: shipment.pendingCollectionAmount,
@@ -483,8 +544,8 @@ export class ShipmentStatusSyncService {
       returnFees: shipment.returnFees,
       returningDueFees: shipment.returningDueFees,
       customerDue: shipment.customerDue,
-      deliveredAt: shipment.deliveredOrReturnedDate ? new Date(shipment.deliveredOrReturnedDate) : null
-    });
+      ...actualShipmentDates(shipment)
+    }, 'accurate-payment');
 
     try {
       await shopifyStatusSyncClient.syncShipmentState({

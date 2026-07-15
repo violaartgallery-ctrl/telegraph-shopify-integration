@@ -12,6 +12,8 @@
     "test:odoo-config": "tsx src/scripts/testOdooConfig.ts",
     "test:odoo-preview": "tsx src/scripts/testOdooPreview.ts",
     "test:telegraph-scenarios": "tsx src/scripts/testTelegraphScenarioMatrix.ts",
+    "test:meta-delivered": "tsx src/scripts/testMetaDeliveredScenarioMatrix.ts && tsx src/meta/metaCapiClient.selfTest.ts",
+    "test:meta-delivered-db": "tsx src/scripts/testMetaDeliveredDatabase.ts",
     "sync:dry-run": "tsx src/scripts/dryRunShipmentStatusSync.ts",
     "queue:dry-run": "tsx src/scripts/dryRunOdooQueue.ts",
     "odoo:bulk-sales-orders": "tsx src/scripts/bulkCreateOdooSalesOrders.ts",

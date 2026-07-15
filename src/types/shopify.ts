@@ -22,6 +22,7 @@ export interface ShopifyLineItem {
   current_quantity?: number | null;
   price: string;
   variant_title?: string | null;
+  variant_id?: number | null;
   product_id?: number | null;
   discount_allocations?: Array<{
     amount: string;
@@ -38,6 +39,10 @@ export interface ShopifyNoteAttribute {
 export interface ShopifyOrder {
   id: number;
   admin_graphql_api_id?: string;
+  created_at?: string | null;
+  processed_at?: string | null;
+  updated_at?: string | null;
+  cancelled_at?: string | null;
   name: string;
   order_number: number;
   financial_status?: string | null;
@@ -56,9 +61,17 @@ export interface ShopifyOrder {
   test?: boolean;
   email?: string | null;
   phone?: string | null;
+  browser_ip?: string | null;
+  landing_site?: string | null;
+  referring_site?: string | null;
+  client_details?: {
+    browser_ip?: string | null;
+    user_agent?: string | null;
+  } | null;
   shipping_address?: ShopifyAddress | null;
   billing_address?: ShopifyAddress | null;
   customer?: {
+    id?: number | string | null;
     first_name?: string | null;
     last_name?: string | null;
     phone?: string | null;

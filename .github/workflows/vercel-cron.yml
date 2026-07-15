@@ -12,9 +12,42 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Run scheduled sync on Vercel
+      - name: Drain Meta Delivered outbox
+        env:
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
         run: |
+          set -euo pipefail
           BASE=https://viola-telegraph-integration.vercel.app
-          curl -s -m 280 -o /dev/null -w "odoo-queue %{http_code}\n" "$BASE/ops/process-odoo-queue" || true
-          curl -s -m 280 -o /dev/null -w "open-shipments %{http_code}\n" "$BASE/ops/sync-open-shipments" || true
-          curl -s -m 280 -o /dev/null -w "collections %{http_code}\n" "$BASE/ops/sync-collections" || true
+          test -n "$OPS_SECRET"
+          curl --fail-with-body --silent --show-error --max-time 280 \
+            -X POST -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/meta-delivered/drain"
+
+      - name: Process Odoo queue
+        if: always()
+        env:
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+        run: |
+          test -n "$OPS_SECRET"
+          curl --fail-with-body --silent --show-error --max-time 280 \
+            -H "x-ops-secret: $OPS_SECRET" \
+            "https://viola-telegraph-integration.vercel.app/ops/process-odoo-queue"
+
+      - name: Sync open shipments
+        if: always()
+        env:
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+        run: |
+          test -n "$OPS_SECRET"
+          curl --fail-with-body --silent --show-error --max-time 280 \
+            -H "x-ops-secret: $OPS_SECRET" \
+            "https://viola-telegraph-integration.vercel.app/ops/sync-open-shipments"
+
+      - name: Sync collection reports
+        if: always()
+        env:
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+        run: |
+          test -n "$OPS_SECRET"
+          curl --fail-with-body --silent --show-error --max-time 280 \
+            -H "x-ops-secret: $OPS_SECRET" \
+            "https://viola-telegraph-integration.vercel.app/ops/sync-collections"
