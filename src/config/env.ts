@@ -37,6 +37,25 @@ const optionalBool = (name: string): boolean => {
 
 const optionalString = (name: string): string => process.env[name] ?? '';
 
+const optionalChoice = <T extends string>(name: string, allowed: readonly T[], fallback: T): T => {
+  const value = process.env[name]?.trim().toLowerCase();
+  if (!value) return fallback;
+  if (!allowed.includes(value as T)) {
+    throw new Error(`Environment variable ${name} must be one of: ${allowed.join(', ')}`);
+  }
+  return value as T;
+};
+
+const optionalDate = (name: string): Date | undefined => {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`Environment variable ${name} must be an ISO-8601 date/time`);
+  }
+  return parsed;
+};
+
 const productIdMap = (() => {
   const raw = process.env.ACCURATE_PRODUCT_ID_MAP_JSON;
   if (!raw) return {} as Record<string, number>;
@@ -57,6 +76,7 @@ export const env = {
   // Admin UI protection — required to call sensitive admin routes.
   // If empty the routes remain open with a startup warning (backward compat).
   adminSecretToken: optionalString('ADMIN_SECRET_TOKEN'),
+  opsSecret: optionalString('OPS_SECRET'),
   shipmentCodePrefix: process.env.SHIPMENT_CODE_PREFIX,
   shipmentCodeStart: optionalInt('SHIPMENT_CODE_START') ?? 1,
   orderReferencePrefix: process.env.ORDER_REFERENCE_PREFIX ?? 'Loomlac',
@@ -113,6 +133,21 @@ export const env = {
     // REQUIRED when Odoo sync is enabled and returns are expected.
     // Run: Settings → Chart of Accounts, find the appropriate expense account, note its ID.
     returnChargeAccountId: optionalInt('ODOO_RETURN_CHARGE_ACCOUNT_ID')
+  },
+  metaDelivered: {
+    // A deliberate kill switch. A deploy is inert unless this is explicitly true.
+    enabled: optionalBool('META_DELIVERED_ENABLED'),
+    mode: optionalChoice('META_DELIVERED_MODE', ['test', 'live'] as const, 'test'),
+    pixelId: optionalString('META_PIXEL_ID'),
+    accessToken: optionalString('META_ACCESS_TOKEN'),
+    apiVersion: process.env.META_API_VERSION?.trim() || 'v25.0',
+    testEventCode: optionalString('META_TEST_EVENT_CODE'),
+    cutoverAt: optionalDate('META_DELIVERED_CUTOVER_AT'),
+    eventSourceUrl: process.env.META_EVENT_SOURCE_URL?.trim() || 'https://violaleather.com',
+    batchSize: optionalInt('META_DELIVERED_BATCH_SIZE') ?? 25,
+    leaseMs: optionalInt('META_DELIVERED_LEASE_MS') ?? 120_000,
+    requestTimeoutMs: optionalInt('META_REQUEST_TIMEOUT_MS') ?? 10_000,
+    maxAttempts: optionalInt('META_DELIVERED_MAX_ATTEMPTS') ?? 12
   }
 };
 

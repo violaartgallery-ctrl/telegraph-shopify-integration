@@ -14,6 +14,8 @@ import { ShipmentStatusSyncService } from './services/shipmentStatusSyncService.
 import { OdooClient } from './odoo/odooClient.js';
 import { OdooSyncService } from './odoo/odooSyncService.js';
 import { adminAuth } from './middleware/adminAuth.js';
+import { env } from './config/env.js';
+import { MetaDeliveryService } from './meta/metaDeliveryService.js';
 
 export const createAppServices = () => {
   const accurateClient = new AccurateClient();
@@ -21,13 +23,22 @@ export const createAppServices = () => {
   const accurateMapper = new AccurateMapper(zoneResolver);
   const odooSyncService = new OdooSyncService(new OdooClient());
   const shopifyOrderProcessor = new ShopifyOrderProcessor(accurateClient, accurateMapper, odooSyncService);
-  const shipmentStatusSyncService = new ShipmentStatusSyncService(accurateClient, odooSyncService);
+  const metaDeliveryService = new MetaDeliveryService({
+    ...env.metaDelivered,
+    testEventCode: env.metaDelivered.testEventCode || undefined
+  });
+  const shipmentStatusSyncService = new ShipmentStatusSyncService(
+    accurateClient,
+    odooSyncService,
+    metaDeliveryService
+  );
 
   return {
     accurateClient,
     shopifyOrderProcessor,
     shipmentStatusSyncService,
-    odooSyncService
+    odooSyncService,
+    metaDeliveryService
   };
 };
 
@@ -54,7 +65,7 @@ export const createApp = () => {
   // Scheduled ops (triggered by GitHub Actions every 30 min). Mounted before the
   // adminAuth guards because it lives under /ops (not /api) and self-guards via
   // OPS_SECRET.
-  app.use(createOpsRouter(services.shipmentStatusSyncService));
+  app.use(createOpsRouter(services.shipmentStatusSyncService, services.metaDeliveryService));
 
   // BUG-SEC-4 FIX: Protect all admin routes under /orders/* and /api/* with adminAuth.
   // Shopify webhook routes (/webhooks/*) are intentionally NOT protected here —

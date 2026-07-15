@@ -15,8 +15,10 @@ interface ShopifyGraphqlAddress {
   address2?: string | null;
   city?: string | null;
   province?: string | null;
+  provinceCode?: string | null;
   zip?: string | null;
   country?: string | null;
+  countryCodeV2?: string | null;
   phone?: string | null;
   company?: string | null;
 }
@@ -32,6 +34,9 @@ interface ShopifyGraphqlLineItem {
     id: string;
     sku?: string | null;
     title?: string | null;
+    product?: {
+      id: string;
+    } | null;
   } | null;
   discountedUnitPriceSet: MoneySet;
   discountAllocations?: Array<{
@@ -47,6 +52,8 @@ interface ShopifyGraphqlAttribute {
 interface ShopifyGraphqlOrder {
   id: string;
   legacyResourceId: string;
+  createdAt: string;
+  cancelledAt?: string | null;
   name: string;
   displayFinancialStatus?: string | null;
   displayFulfillmentStatus?: string | null;
@@ -64,6 +71,7 @@ interface ShopifyGraphqlOrder {
   shippingAddress?: ShopifyGraphqlAddress | null;
   billingAddress?: ShopifyGraphqlAddress | null;
   customer?: {
+    id: string;
     firstName?: string | null;
     lastName?: string | null;
     phone?: string | null;
@@ -88,6 +96,8 @@ const ORDER_FIELDS = `
   fragment TelegraphOrderFields on Order {
     id
     legacyResourceId
+    createdAt
+    cancelledAt
     name
     displayFinancialStatus
     displayFulfillmentStatus
@@ -125,8 +135,10 @@ const ORDER_FIELDS = `
       address2
       city
       province
+      provinceCode
       zip
       country
+      countryCodeV2
       phone
       company
     }
@@ -138,12 +150,15 @@ const ORDER_FIELDS = `
       address2
       city
       province
+      provinceCode
       zip
       country
+      countryCodeV2
       phone
       company
     }
     customer {
+      id
       firstName
       lastName
       phone
@@ -161,6 +176,9 @@ const ORDER_FIELDS = `
           id
           sku
           title
+          product {
+            id
+          }
         }
         discountedUnitPriceSet {
           shopMoney {
@@ -217,8 +235,10 @@ const mapAddress = (address?: ShopifyGraphqlAddress | null): ShopifyAddress | nu
         address2: address.address2,
         city: address.city,
         province: address.province,
+        province_code: address.provinceCode,
         zip: address.zip,
         country: address.country,
+        country_code: address.countryCodeV2,
         phone: address.phone,
         company: address.company
       }
@@ -240,6 +260,10 @@ const mapLineItems = (lineItems: ShopifyGraphqlLineItem[]): ShopifyLineItem[] =>
     current_quantity: item.currentQuantity,
     price: item.discountedUnitPriceSet.shopMoney.amount,
     variant_title: item.variantTitle,
+    variant_id: item.variant ? Number.parseInt(item.variant.id.replace(/\D/g, ''), 10) : null,
+    product_id: item.variant?.product
+      ? Number.parseInt(item.variant.product.id.replace(/\D/g, ''), 10)
+      : null,
     discount_allocations: item.discountAllocations?.map((allocation) => ({
       amount: allocation.allocatedAmountSet.shopMoney.amount
     }))
@@ -248,6 +272,8 @@ const mapLineItems = (lineItems: ShopifyGraphqlLineItem[]): ShopifyLineItem[] =>
 const mapOrder = (order: ShopifyGraphqlOrder): ShopifyOrder => ({
   id: Number.parseInt(order.legacyResourceId, 10),
   admin_graphql_api_id: order.id,
+  created_at: order.createdAt,
+  cancelled_at: order.cancelledAt,
   name: order.name,
   order_number: parseOrderNumber(order),
   financial_status: mapFinancialStatus(order.displayFinancialStatus),
@@ -272,6 +298,7 @@ const mapOrder = (order: ShopifyGraphqlOrder): ShopifyOrder => ({
   billing_address: mapAddress(order.billingAddress),
   customer: order.customer
     ? {
+        id: order.customer.id,
         first_name: order.customer.firstName,
         last_name: order.customer.lastName,
         phone: order.customer.phone,
