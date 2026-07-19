@@ -53,7 +53,8 @@ export const createApp = () => {
     response.setHeader('Access-Control-Allow-Origin', '*');
     response.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     // x-admin-secret is included so browser-based Shopify App Extension calls work
-    response.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Shopify-Hmac-Sha256,x-admin-secret');
+    response.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type,X-Shopify-Hmac-Sha256,x-admin-secret');
+    response.setHeader('Access-Control-Expose-Headers', 'X-Shopify-Retry-Invalid-Session-Request');
     if (request.method === 'OPTIONS') {
       response.status(204).end();
       return;
@@ -63,6 +64,33 @@ export const createApp = () => {
 
   app.get('/health', (_request, response) => {
     response.status(200).json({ ok: true });
+  });
+
+  // Shopify's documented fallback for an embedded document request that lost
+  // or outlived its id_token. App Bridge reloads the requested path with a fresh
+  // signed token; this route intentionally contains no business data.
+  app.get('/session-token-bounce', (request, response) => {
+    const reloadTarget = typeof request.query['shopify-reload'] === 'string'
+      ? request.query['shopify-reload']
+      : '';
+    const shop = typeof request.query.shop === 'string' ? request.query.shop.toLowerCase() : '';
+    if (
+      !/^\/orders(?:[/?]|$)/.test(reloadTarget) ||
+      reloadTarget.startsWith('//') ||
+      shop !== env.shopify.shopDomain.toLowerCase()
+    ) {
+      response.status(400).type('text').send('Invalid Shopify session refresh request.');
+      return;
+    }
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.setHeader('Content-Security-Policy', "frame-ancestors https://admin.shopify.com https://*.myshopify.com");
+    response.setHeader('Referrer-Policy', 'no-referrer');
+    response.type('html').send(`<!doctype html>
+<html><head>
+  <meta charset="utf-8" />
+  <meta name="shopify-api-key" content="${env.shopify.clientId}" />
+  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+</head><body></body></html>`);
   });
 
   // A signed self-request gives a long batch a fresh Vercel execution window.
@@ -120,6 +148,7 @@ export const createApp = () => {
   // they use their own HMAC signature verification.
   app.use('/orders', adminAuth);
   app.use('/api', adminAuth);
+  app.get('/', adminAuth);
 
   app.use(createAdminAppRouter(services.shopifyOrderProcessor, services.accurateClient, services.odooSyncService, services.shipmentStatusSyncService));
 

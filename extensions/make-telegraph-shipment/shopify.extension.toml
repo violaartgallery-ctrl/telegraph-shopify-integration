@@ -6,7 +6,7 @@ type = "admin_link"
 
 [[extensions.targeting]]
 target = "admin.order-details.action.link"
-url = "/orders/make-telegraph?adminToken=9ee18931cdbb2b4d9549795e28f4183e"
+url = "/orders/make-telegraph"
 
 [[extensions]]
 name = "Make Odoo Sales Order"
@@ -15,7 +15,7 @@ type = "admin_link"
 
 [[extensions.targeting]]
 target = "admin.order-details.action.link"
-url = "/orders/create-odoo-sales-order?adminToken=9ee18931cdbb2b4d9549795e28f4183e"
+url = "/orders/create-odoo-sales-order"
 
 [[extensions]]
 name = "Make Telegraph shipments"
@@ -24,7 +24,7 @@ type = "admin_link"
 
 [[extensions.targeting]]
 target = "admin.order-index.selection-action.link"
-url = "/orders/make-telegraph/bulk?adminToken=9ee18931cdbb2b4d9549795e28f4183e"
+url = "/orders/make-telegraph/bulk"
 
 [[extensions]]
 name = "Make Odoo Sales Orders"
@@ -33,4 +33,4 @@ type = "admin_link"
 
 [[extensions.targeting]]
 target = "admin.order-index.selection-action.link"
-url = "/orders/create-odoo-sales-order/bulk?adminToken=9ee18931cdbb2b4d9549795e28f4183e"
+url = "/orders/create-odoo-sales-order/bulk"
