@@ -51,3 +51,23 @@ jobs:
           curl --fail-with-body --silent --show-error --max-time 280 \
             -H "x-ops-secret: $OPS_SECRET" \
             "https://viola-telegraph-integration.vercel.app/ops/sync-collections"
+
+      - name: Resume interrupted production batches
+        if: always()
+        env:
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+        run: |
+          test -n "$OPS_SECRET"
+          curl --fail-with-body --silent --show-error --max-time 60 \
+            -H "x-ops-secret: $OPS_SECRET" \
+            "https://viola-telegraph-integration.vercel.app/ops/resume-production-jobs"
+
+      - name: Check production safety layers
+        if: always()
+        env:
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+        run: |
+          test -n "$OPS_SECRET"
+          curl --fail-with-body --silent --show-error --max-time 120 \
+            -H "x-ops-secret: $OPS_SECRET" \
+            "https://viola-telegraph-integration.vercel.app/ops/production-health"

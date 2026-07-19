@@ -1,0 +1,19 @@
+{
+  "payload": {
+    "export": "cart-validations-generate-run",
+    "target": "cart.validations.generate.run",
+    "input": {
+      "buyerJourney": { "step": "CHECKOUT_COMPLETION" },
+      "cart": {
+        "governorateId": { "value": "1" },
+        "areaId": { "value": "56" }
+      }
+    },
+    "output": {
+      "operations": [{ "validationAdd": { "errors": [{
+        "message": "لازم تختار المحافظة والمنطقة الصحيحتين قبل إتمام الطلب. ارجع إلى السلة، اختار بيانات الشحن، ثم كمّل الطلب.",
+        "target": "$.cart"
+      }] } }]
+    }
+  }
+}

@@ -1,30 +1,39 @@
 // @ts-check
 
+import { VALID_TELEGRAPH_LOCATION_PAIRS } from "./generated_location_pairs.js";
+
 /**
  * @typedef {import("../generated/api").CartValidationsGenerateRunInput} CartValidationsGenerateRunInput
  * @typedef {import("../generated/api").CartValidationsGenerateRunResult} CartValidationsGenerateRunResult
  */
 
 /**
- * Blocks checkout completion unless the Telegraph governorate + area are set on
- * the cart (the storefront picker writes them as cart attributes). Runs
- * server-side at checkout, so it can't be bypassed by express/dynamic checkout,
- * a direct /checkout URL, or disabled JavaScript — no order can be placed
- * without a real shipping zone.
+ * Blocks checkout unless the Telegraph governorate + area form a valid pair.
+ * The storefront picker writes the IDs as cart attributes, while this Function
+ * enforces the same location catalogue server-side for every checkout path.
  *
  * @param {CartValidationsGenerateRunInput} input
  * @returns {CartValidationsGenerateRunResult}
  */
 export function cartValidationsGenerateRun(input) {
+  const step = input.buyerJourney.step;
+  if (step !== "CHECKOUT_INTERACTION" && step !== "CHECKOUT_COMPLETION") {
+    return { operations: [] };
+  }
+
   const governorate = (input.cart.governorateId?.value ?? "").trim();
   const area = (input.cart.areaId?.value ?? "").trim();
+  const pair = `${governorate}:${area}`;
+  const isValidPair =
+    /^\d+$/.test(governorate) &&
+    /^\d+$/.test(area) &&
+    VALID_TELEGRAPH_LOCATION_PAIRS.includes(pair);
 
   const errors = [];
-  if (!governorate || !area) {
+  if (!isValidPair) {
     errors.push({
-      // Shown to the buyer at checkout; keep it actionable in Arabic.
       message:
-        "لازم تختار المحافظة والمنطقة (شركة الشحن) قبل إتمام الطلب. ارجع لصفحة السلة (Cart)، اختار المحافظة والمنطقة، وبعدين كمّل الطلب.",
+        "لازم تختار المحافظة والمنطقة الصحيحتين قبل إتمام الطلب. ارجع إلى السلة، اختار بيانات الشحن، ثم كمّل الطلب.",
       target: "$.cart",
     });
   }

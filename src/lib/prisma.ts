@@ -25,7 +25,12 @@ function isTransientConnectionError(error: unknown): boolean {
 
 const RETRY_DELAYS_MS = [250, 750, 1500];
 
-const basePrisma = new PrismaClient();
+export const basePrisma = new PrismaClient({
+  transactionOptions: {
+    maxWait: 15_000,
+    timeout: 20_000,
+  },
+});
 
 export const prisma = basePrisma.$extends({
   query: {

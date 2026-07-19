@@ -387,7 +387,7 @@ const summarizeOrder = async () => {
   });
 };
 
-const getLocations = async (accurateClient: AccurateClient) => {
+export const getLocations = async (accurateClient: AccurateClient) => {
   if (locationCache && Date.now() < locationCache.expiresAt) {
     return locationCache.data;
   }

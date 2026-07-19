@@ -1,544 +1,206 @@
 /**
- * Netlify Background Function — runs up to 15 minutes.
- * Triggered by the telegram-webhook function.
+ * Automatic, resumable production pipeline.
  *
- * Pipeline:
- *  1. Call Ayman Production Agent API → get Word doc + photos ZIP
- *  2. Send Word to Telegram
- *  3. Send photos ZIP to Telegram (if present)
- *  4. Send production summary
- *  5. If execute=true: create Telegraph shipments order by order
- *  6. Send final report
+ * Every invocation owns a short Neon-backed lease. Before Vercel's hard timeout
+ * it checkpoints progress and signs a request that starts a fresh invocation.
+ * No employee Continue button is involved.
  */
-
-interface LambdaEvent { body: string | null; }
-interface LambdaResult { statusCode: number; body: string; }
-interface JobPayload { chatId: number; execute: boolean; orderId?: string; }
-
-// Only telegramApi at top level — zero env dependencies, safe for module load.
-import { sendMessage, sendDocument, sendMessageWithButton } from '../../telegram/telegramApi.js';
-import type { ShopifyOrder } from '../../types/shopify.js';
+import { sendMessage } from '../../telegram/telegramApi.js';
 import {
-  loadJob,
-  saveJob,
-  clearJob,
-  type RunCursor,
+  checkpointJob,
+  claimJob,
+  completeRun,
+  createPreviewJob,
+  finishPreview,
+  markNeedsReview,
+  ProductionJobLeaseLostError,
+  retryJob,
+  type JobCursor,
   type PreviewCursor,
+  type RunCursor,
+  yieldJob,
 } from '../../services/productionJobStore.js';
+import { scheduleProductionContinuation } from '../../services/productionContinuation.js';
+import { sendCompleteProductionPreview } from '../../services/productionPreviewService.js';
+import { createExactBatchShipments } from '../../services/productionShippingService.js';
+import {
+  PermanentProductionError,
+  SoftDeadlineError,
+} from '../../services/productionPipelineErrors.js';
 
-// Soft deadline: stop cleanly at 4 min, leaving 60s margin before Vercel's 300s
-// hard cap so the pause message + Continue button always get sent in time.
-const JOB_DEADLINE_MS = 240_000;
+interface LambdaEvent { body: string | null }
+interface LambdaResult { statusCode: number; body: string }
+interface JobPayload { chatId: number; execute: boolean; orderId?: string }
 
-// Build the "Continue" button + prompt shown when a job pauses at the deadline.
-async function sendContinuePrompt(chatId: number, kind: 'run' | 'preview', progress: string): Promise<void> {
-  const what = kind === 'run' ? 'الشحن' : 'التجميعة';
-  await sendMessageWithButton(
-    chatId,
-    `⏸️ وقفت ${what} مؤقتًا قبل ما يوصل حد الوقت (عشان مفيش حاجة تضيع).\n${progress}\n\n▶️ دوس *إكمال* أكمّل من نفس المكان.`,
-    { text: '▶️ إكمال (Continue)', callback_data: `cont:${kind}` },
-    { parse_mode: 'Markdown' }
-  );
+const DEFAULT_PRODUCTION_RECIPIENT_CHAT_IDS = ['6776051391', '8615245657'];
+const DEFAULT_JOB_DEADLINE_MS = 235_000;
+const DEFAULT_MAX_AUTO_RETRIES = 8;
+
+function numericEnv(name: string, fallback: number, minimum: number, maximum: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
 }
 
-// ── Ayman Agent response type ──────────────────────────────────────────────────
-
-interface PhotoAttachment {
-  attachment_name: string;
-  attachment_url: string;
-  order_name: string;
-  comment_id: string;
-  position_label?: string | null;
+function jobDeadlineMs(): number {
+  return numericEnv('PRODUCTION_JOB_DEADLINE_MS', DEFAULT_JOB_DEADLINE_MS, 5_000, 250_000);
 }
 
-interface AymanEntry {
-  display_product: string;
-  display_color?: string;
-  total_quantity: number;
-  warnings?: string[];
-  photo_attachments?: PhotoAttachment[];
+function maxAutoRetries(): number {
+  return numericEnv('PRODUCTION_MAX_AUTO_RETRIES', DEFAULT_MAX_AUTO_RETRIES, 1, 20);
 }
 
-interface AymanOrderDetail {
-  order_name: string;
-  customer: string;
-  created_at: string;
-  items: Array<{
-    product: string; color: string; variant: string; quantity: number;
-    customizations: Array<[string, string]>; photo_urls: string[];
-  }>;
+export function productionRecipientChatIds(triggerChatId: number): string[] {
+  const configured = process.env.PRODUCTION_RECIPIENT_CHAT_IDS?.trim();
+  const recipients = configured ? configured.split(',') : DEFAULT_PRODUCTION_RECIPIENT_CHAT_IDS;
+  return [...new Set([String(triggerChatId), ...recipients.map((value) => value.trim())].filter(Boolean))];
 }
 
-interface AymanResponse {
-  wordBase64: string;
-  aiBase64?: string[];   // laser-ready welded outline .ai file(s) for RDWorks
-  ordersDetail?: AymanOrderDetail[]; // per-order summary data (lightweight)
-  productionEntries: AymanEntry[];
-  summary?: { totalOrders?: number; productionEntries?: number };
-  warnings?: string[];
+function retryDelayMs(attempt: number): number {
+  return Math.min(30_000, 2_000 * (2 ** Math.max(0, attempt - 1)));
 }
 
-// ── Ayman Agent integration ────────────────────────────────────────────────────
-
-async function fetchFromAymanAgent(orderId?: string): Promise<AymanResponse> {
-  const baseUrl = (process.env.AYMAN_AGENT_URL ?? 'https://viola-production-agent.vercel.app').replace(/\/$/, '');
-  const secret = process.env.AYMAN_AGENT_SECRET ?? '';
-
-  // Ayman agent migrated to Vercel: endpoint is /api/production (POST), not the
-  // old Netlify /.netlify/functions/production path (which now 404s).
-  const resp = await fetch(`${baseUrl}/api/production`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(secret ? { 'X-Agent-Secret': secret } : {}),
-    },
-    body: JSON.stringify({ mode: 'execute', skipPhotos: true, ...(orderId ? { orderId } : {}) }),
-  });
-
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`Ayman Agent HTTP ${resp.status}: ${body.slice(0, 500)}`);
-  }
-
-  let data: AymanResponse;
+async function scheduleNext(chatId: number, batchId: string, delayMs = 0): Promise<boolean> {
   try {
-    data = await resp.json() as AymanResponse;
-  } catch {
-    throw new Error('Ayman Agent returned invalid JSON');
-  }
-
-  if (!data.wordBase64) {
-    const hint = JSON.stringify({ summary: data.summary, warnings: (data.warnings ?? []).slice(0, 3) });
-    throw new Error(`Ayman Agent response missing wordBase64. Details: ${hint}`);
-  }
-
-  return data;
-}
-
-// ── Order filtering (used only for shipment step) ──────────────────────────────
-
-function hasConfirmedTag(order: ShopifyOrder): boolean {
-  const tags = (order.tags ?? '').toLowerCase().split(',').map((t) => t.trim());
-  return tags.includes('confirmed');
-}
-
-// ── Main pipeline ─────────────────────────────────────────────────────────────
-
-export async function runPipeline(
-  chatId: number,
-  execute: boolean,
-  orderId?: string,
-  resume = false
-): Promise<void> {
-  // Both flows are checkpointed: a soft deadline stops the run cleanly and saves
-  // a cursor; the user presses "Continue" to resume from exactly where it
-  // stopped (see productionJobStore). Split so each gets its OWN 300s budget:
-  //   execute=true  (/run)     → create Telegraph shipments only.
-  //   execute=false (/preview) → generate + send the production documents only.
-  const deadline = Date.now() + JOB_DEADLINE_MS;
-
-  let cursor = resume ? await loadJob(chatId) : null;
-  if (resume && !cursor) {
-    await sendMessage(chatId, 'ℹ️ مفيش حاجة موقوفة أكمّلها. ابعت /run أو /preview من الأول.');
-    return;
-  }
-  if (!cursor) {
-    cursor = execute
-      ? { kind: 'run', status: 'running', orderId, phase: 'shipping', processedOrderNames: [], createdShipmentIds: [], results: [], updatedAt: Date.now() }
-      : { kind: 'preview', status: 'running', orderId, docStep: 0, sentPhotoUrls: [], summaryDone: false, updatedAt: Date.now() };
-  } else {
-    cursor.status = 'running';
-  }
-  await saveJob(chatId, cursor);
-
-  // Any unexpected throw would otherwise leave the job stuck in 'running' (the
-  // Continue guard would block resume for JOB_STALE_MS). Catch it, flip the job
-  // back to 'paused', and offer Continue so the user can pick up immediately.
-  try {
-    if (cursor.kind === 'run') {
-      await createShipmentsForRun(chatId, cursor, deadline);
-    } else {
-      await sendProductionDocuments(chatId, cursor, deadline);
-    }
-  } catch (err) {
-    try {
-      cursor.status = 'paused';
-      await saveJob(chatId, cursor);
-    } catch { /* best-effort */ }
-    await sendMessage(chatId, `❌ حصل خطأ غير متوقع: ${String(err).slice(0, 200)}`);
-    await sendContinuePrompt(chatId, cursor.kind, 'حصل خطأ — تقدر تكمّل من نفس المكان.');
+    await scheduleProductionContinuation({ chatId, batchId, delayMs });
+    return true;
+  } catch (error) {
+    console.error('[production] Failed to dispatch automatic continuation', {
+      chatId,
+      batchId,
+      error: String(error),
+    });
+    await sendMessage(
+      chatId,
+      `🚨 Batch ${batchId}\nفشل إطلاق الـrequest التالي تلقائيًا. التقدم محفوظ في Neon، والـwatchdog هيحاول يشغله تاني. ابعت رقم الـBatch للدعم لو التنبيه اتكرر.`
+    );
+    return false;
   }
 }
 
-async function sendProductionDocuments(chatId: number, cursor: PreviewCursor, deadline: number): Promise<void> {
-  const orderId = cursor.orderId;
-  const mode = 'بريفيو';
-  const orderLabel = orderId ? ` (أوردر ${orderId} فقط)` : '';
-  const pastDeadline = (): boolean => Date.now() >= deadline;
+function copyCheckpointState(target: JobCursor, saved: JobCursor): void {
+  // pendingRun can be changed concurrently by the employee while this invocation
+  // is sending a file. Copying the stored value keeps that request in memory too.
+  target.pendingRun = saved.pendingRun;
+  target.attemptCount = saved.attemptCount;
+  target.updatedAt = saved.updatedAt;
+}
 
-  // Pause helper: persist where we stopped, then offer the Continue button.
-  const pause = async (progress: string): Promise<void> => {
-    cursor.status = 'paused';
-    await saveJob(chatId, cursor);
-    await sendContinuePrompt(chatId, 'preview', progress);
+export async function runPipeline(chatId: number, expectedBatchId?: string): Promise<void> {
+  const cursor = await claimJob(chatId, expectedBatchId);
+  if (!cursor?.executionToken) return;
+
+  const executionToken = cursor.executionToken;
+  const deadline = Date.now() + jobDeadlineMs();
+  const checkpoint = async (): Promise<void> => {
+    const saved = await checkpointJob(chatId, cursor, executionToken);
+    copyCheckpointState(cursor, saved);
   };
 
-  // ── Step 1: Call Ayman Agent (re-fetched each segment; needed for docs+photos)
-  await sendMessage(chatId, `📦 جاري جلب التجميعة من Ayman Agent...${orderLabel} (${mode})`);
-
-  let aymanData: AymanResponse;
   try {
-    aymanData = await fetchFromAymanAgent(orderId);
-  } catch (err) {
-    // Transient agent failure → keep the checkpoint and let the user retry via
-    // Continue instead of leaving the job stuck in 'running'.
-    await sendMessage(chatId, `❌ فشل Ayman Agent:\n${String(err).slice(0, 300)}`);
-    await pause('فشل جلب التجميعة — دوس إكمال أحاول تاني.');
-    return;
-  }
+    if (cursor.kind === 'preview') {
+      await sendCompleteProductionPreview({
+        chatId,
+        cursor,
+        deadline,
+        checkpoint,
+      });
 
-  const { wordBase64, productionEntries, summary, warnings } = aymanData;
-  const dateStr = new Date().toISOString().slice(0, 10);
+      await sendMessage(
+        chatId,
+        `✅ Preview Batch ${cursor.batchId} اكتمل بالكامل: كل الملفات والصور والملخص اتأكد إرسالهم.`
+      );
+      const next = await finishPreview(chatId, cursor, executionToken);
+      if (next.kind === 'run') {
+        await sendMessage(chatId, `🚚 طلب /run متسجل — هبدأ شحن نفس الـ${next.orderNumbers.length} أوردر تلقائيًا.`);
+        await scheduleNext(chatId, next.batchId);
+      } else {
+        await sendMessage(chatId, '🔒 الأوردرات اتثبتت. ابعت /run وقت ما تكون جاهز؛ الشحن هيستخدم نفس الـBatch بالضبط.');
+      }
+      return;
+    }
 
-  if (cursor.docStep === 0 && cursor.sentPhotoUrls.length === 0) {
-    await sendMessage(
+    await createExactBatchShipments({
       chatId,
-      `✅ لقيت ${summary?.totalOrders ?? '?'} أوردر — ${productionEntries.length} منتج\nبدأت الإرسال...`
-    );
-  }
+      cursor,
+      deadline,
+      checkpoint,
+    });
+    await completeRun(chatId, cursor, executionToken);
+    await sendMessage(chatId, `✅ Batch ${cursor.batchId} خلص بالكامل واتحفظ تقريره.`);
+  } catch (error) {
+    if (error instanceof ProductionJobLeaseLostError) {
+      // /cancel or another valid lease won. Stop silently; never recreate state.
+      return;
+    }
 
-  // ── Step 2: Send Word doc (docStep 1) ──────────────────────────────────────
-  if (cursor.docStep < 1) {
-    if (pastDeadline()) { await pause('لسه مبدأتش أبعت المستندات.'); return; }
-    const wordBuf = Buffer.from(wordBase64, 'base64');
-    await sendDocument(
-      chatId,
-      wordBuf,
-      `production_${dateStr}.docx`,
-      `قائمة الإنتاج ✅ — ${productionEntries.length} منتج`
-    );
-    cursor.docStep = 1;
-    await saveJob(chatId, cursor);
-  }
+    if (error instanceof SoftDeadlineError) {
+      try {
+        const saved = await yieldJob(chatId, cursor, executionToken, error.progress);
+        await sendMessage(
+          chatId,
+          `⏳ وصلت لنقطة النقل الآمنة في Batch ${saved.batchId}. التقدم محفوظ وهكمل تلقائيًا في request جديد — مش مطلوب منك تعمل حاجة.`
+        );
+        await scheduleNext(chatId, saved.batchId);
+      } catch (leaseError) {
+        if (!(leaseError instanceof ProductionJobLeaseLostError)) throw leaseError;
+      }
+      return;
+    }
 
-  // ── Step 2b: Build + send laser AI file(s) for RDWorks (docStep 2) ─────────
-  // Built here (not in the aggregator) because the welded .ai files are large and
-  // would blow past the aggregator's 6 MB response limit.
-  if (cursor.docStep < 2) {
-    if (pastDeadline()) { await pause('باقي: الليزر + البوكس + ورق الطباعة + الصور.'); return; }
+    if (error instanceof PermanentProductionError) {
+      try {
+        await markNeedsReview(chatId, cursor, executionToken, error.message);
+        await sendMessage(
+          chatId,
+          `🛑 Batch ${cursor.batchId} اتوقف بأمان للمراجعة، ومفيش خطوة ناقصة اتعلمت إنها نجحت.\nالسبب: ${error.message}\nابعت رقم الـBatch للدعم؛ وبعد التصحيح نكمل من الحالة المحفوظة أو نستخدم /cancel.`
+        );
+      } catch (leaseError) {
+        if (!(leaseError instanceof ProductionJobLeaseLostError)) throw leaseError;
+      }
+      return;
+    }
+
     try {
-      const { buildAiBuffers, buildBoxGridBuffers } = await import('../../services/aiWriter.js');
-      // Box products go to a 9×2 grid file; wallets/others stay linear.
-      const isBoxEntry = (e: unknown): boolean => {
-        const p = String((e as { display_product?: string })?.display_product || '').toLowerCase();
-        return p.includes('box') || p.includes('بوكس');
-      };
-      const entries = productionEntries as unknown[];
-      const linearEntries = entries.filter((e) => !isBoxEntry(e));
-      const boxEntries = entries.filter(isBoxEntry);
-      // Split by file size (~1.5 MB each) — the laser PC is weak, so keep files small.
-      const aiFiles = linearEntries.length ? await buildAiBuffers(linearEntries as never, { maxBytes: 1_500_000 }) : [];
-      const boxFiles = boxEntries.length ? await buildBoxGridBuffers(boxEntries as never) : [];
-      for (let i = 0; i < aiFiles.length; i++) {
-        const label = aiFiles.length > 1 ? `${i + 1}/${aiFiles.length}` : '';
-        await sendDocument(chatId, aiFiles[i]!, `laser_${dateStr}_${i + 1}.ai`, `ملف الليزر 🔪 ${label}`.trim());
-      }
-      for (let i = 0; i < boxFiles.length; i++) {
-        const label = boxFiles.length > 1 ? `${i + 1}/${boxFiles.length}` : '';
-        await sendDocument(chatId, boxFiles[i]!, `box_grid_${dateStr}_${i + 1}.ai`, `شبكة البوكسات 📦 ${label}`.trim());
-      }
-      if (aiFiles.length || boxFiles.length)
-        await sendMessage(chatId, `🔪 بعتّ ${aiFiles.length} ملف ليزر + ${boxFiles.length} شبكة بوكسات`);
-    } catch (err) {
-      await sendMessage(chatId, `⚠️ فشل توليد ملف الليزر: ${String(err).slice(0, 200)}`);
-    }
-    cursor.docStep = 2;
-    await saveJob(chatId, cursor);
-  }
-
-  // ── Step 2.5: Print-ready photo sheet (docStep 3) ─────────────────────────
-  // The "طباعة الصور" photos (no place on the product → excluded from the laser)
-  // are arranged on A4 at their per-product size and sent as one print-ready PDF.
-  if (cursor.docStep < 3) {
-    if (pastDeadline()) { await pause('باقي: ورق الطباعة + الصور.'); return; }
-    try {
-      const { buildPrintSheetPdf, kindForProduct } = await import('../../services/printSheet.js');
-      const printList: Array<{ url: string; kind: 'wallet' | 'keychain' }> = [];
-      const seenPrint = new Set<string>();
-      for (const entry of productionEntries) {
-        const kind = kindForProduct(entry.display_product);
-        for (const ph of entry.photo_attachments ?? []) {
-          if ((ph.position_label ?? '').trim()) continue; // has a place -> laser, not print
-          if (!ph.attachment_url || seenPrint.has(ph.attachment_url)) continue;
-          seenPrint.add(ph.attachment_url);
-          printList.push({ url: ph.attachment_url, kind });
-        }
-      }
-      if (printList.length) {
-        const photos: Array<{ buffer: Buffer; kind: 'wallet' | 'keychain' }> = [];
-        for (const p of printList) {
-          const r = await fetch(p.url);
-          if (r.ok) photos.push({ buffer: Buffer.from(await r.arrayBuffer()), kind: p.kind });
-        }
-        const pdf = await buildPrintSheetPdf(photos);
-        if (pdf) {
-          await sendDocument(chatId, Buffer.from(pdf), `print_sheets_${dateStr}.pdf`, 'ورق طباعة الصور 🖨️');
-        }
-      }
-    } catch (err) {
-      await sendMessage(chatId, `⚠️ فشل توليد ورق الطباعة: ${String(err).slice(0, 200)}`);
-    }
-    cursor.docStep = 3;
-    await saveJob(chatId, cursor);
-  }
-
-  // ── Step 3: Send photos individually (resumable via sent-URL set) ──────────
-  // Caption format the factory needs: "#orderNumber — productName color".
-  // We carry the entry's product/color (not the attachment filename, which is
-  // a generic "صورة الطبعة") so each photo is identifiable. Resume tracks WHICH
-  // urls were sent (not a positional index), so a re-fetch that reorders/adds/
-  // removes photos between segments can never skip or mis-caption a photo.
-  const allPhotoAttachments: Array<{ url: string; orderName: string; product: string }> = [];
-  for (const entry of productionEntries) {
-    const product = `${entry.display_product}${entry.display_color ? ` ${entry.display_color}` : ''}`.trim();
-    for (const ph of entry.photo_attachments ?? []) {
-      if (ph.attachment_url) {
-        allPhotoAttachments.push({ url: ph.attachment_url, orderName: ph.order_name, product });
-      }
-    }
-  }
-  const dedup = new Set<string>();
-  const uniquePhotos = allPhotoAttachments.filter((p) => {
-    if (dedup.has(p.url)) return false;
-    dedup.add(p.url);
-    return true;
-  });
-
-  const sent = new Set(cursor.sentPhotoUrls);
-  const pending = uniquePhotos.filter((p) => !sent.has(p.url));
-  if (pending.length > 0) {
-    await sendMessage(
-      chatId,
-      sent.size === 0
-        ? `📷 جاري إرسال ${pending.length} صورة...`
-        : `📷 بكمّل الصور — فاضل ${pending.length} (اتبعت ${sent.size}).`
-    );
-    const photoFailures: string[] = [];
-    for (let i = 0; i < pending.length; i++) {
-      if (pastDeadline()) {
-        await pause(`اتبعت ${cursor.sentPhotoUrls.length} صورة — فاضل ${pending.length - i}.`);
+      const nextAttempt = cursor.attemptCount + 1;
+      if (nextAttempt > maxAutoRetries()) {
+        await markNeedsReview(chatId, cursor, executionToken, error);
+        await sendMessage(
+          chatId,
+          `🛑 Batch ${cursor.batchId} محفوظ، لكنه فشل ${cursor.attemptCount + 1} مرات متتالية.\nآخر خطأ: ${String(error).slice(0, 300)}\nابعت رقم الـBatch للدعم للمراجعة؛ لن أخمّن أو أكرر شحنة.`
+        );
         return;
       }
-      const photo = pending[i]!;
-      try {
-        const photoResp = await fetch(photo.url);
-        if (photoResp.ok) {
-          const photoBuf = Buffer.from(await photoResp.arrayBuffer());
-          const rawExt = new URL(photo.url).pathname.split('.').pop() ?? 'jpg';
-          const ext = rawExt.length <= 5 ? rawExt : 'jpg';
-          const safeName = photo.orderName.replace(/[^a-zA-Z0-9_-]/g, '_');
-          await sendDocument(chatId, photoBuf, `${safeName}_photo_${cursor.sentPhotoUrls.length + 1}.${ext}`, `${photo.orderName} — ${photo.product}`);
-          // Mark this URL sent so a crash/resume never re-sends or skips it.
-          cursor.sentPhotoUrls.push(photo.url);
-          if (cursor.sentPhotoUrls.length % 10 === 0) await saveJob(chatId, cursor);
-        } else {
-          photoFailures.push(`${photo.orderName}: HTTP ${photoResp.status}`);
-        }
-      } catch (err) {
-        photoFailures.push(`${photo.orderName}: ${String(err).slice(0, 80)}`);
-      }
-    }
-    await saveJob(chatId, cursor);
-    if (photoFailures.length > 0) {
-      await sendMessage(chatId, `⚠️ فشل إرسال ${photoFailures.length} صورة:\n${photoFailures.slice(0, 5).join('\n')}`);
+
+      const saved = await retryJob(chatId, cursor, executionToken, error);
+      const delayMs = retryDelayMs(saved.attemptCount);
+      await sendMessage(
+        chatId,
+        `🔄 خطأ مؤقت في Batch ${saved.batchId} (محاولة ${saved.attemptCount}/${maxAutoRetries()}). التقدم محفوظ وهعيد المحاولة تلقائيًا بعد ${Math.ceil(delayMs / 1000)} ثانية.`
+      );
+      await scheduleNext(chatId, saved.batchId, delayMs);
+    } catch (leaseError) {
+      if (!(leaseError instanceof ProductionJobLeaseLostError)) throw leaseError;
     }
   }
-
-  // ── Step 4: Summary docs (orders-summary + production summary), sent once ──
-  if (!cursor.summaryDone) {
-    if (pastDeadline()) { await pause('باقي: ملف "تجميعة بالأوردر" + الملخص النهائي.'); return; }
-    // Per-order summary doc (customer + photos embedded) — built here so embedded
-    // photos never hit the 6 MB cap; image size is bounded inside the builder.
-    try {
-      const detail = aymanData.ordersDetail ?? [];
-      if (detail.length) {
-        const { buildOrdersSummaryBuffer } = await import('../../services/orderSummaryWriter.js');
-        const ordersBuf = await buildOrdersSummaryBuffer(detail as never);
-        await sendDocument(chatId, ordersBuf, `orders_${dateStr}.docx`, 'تجميعة بالأوردر 📋');
-      }
-    } catch (err) {
-      await sendMessage(chatId, `⚠️ فشل توليد ملف الأوردرات: ${String(err).slice(0, 200)}`);
-    }
-
-    // Plain text (NO Markdown): product names can contain _ * [ ` which would
-    // make Telegram reject the whole message and silently drop the summary.
-    const summaryLines = ['📋 ملخص التجميعة:'];
-    if (warnings?.length) {
-      summaryLines.push(`⚠️ تحذيرات: ${warnings.length}`);
-      for (const w of warnings.slice(0, 3)) {
-        summaryLines.push(`• ${String(w).slice(0, 120)}`);
-      }
-    }
-    for (const entry of productionEntries.slice(0, 20)) {
-      summaryLines.push(`• ${entry.total_quantity}x ${entry.display_product} ${entry.display_color ?? ''}`);
-    }
-    if (productionEntries.length > 20) {
-      summaryLines.push(`...و ${productionEntries.length - 20} منتج تاني`);
-    }
-    await sendMessage(chatId, summaryLines.join('\n'));
-    cursor.summaryDone = true;
-  }
-
-  // Everything sent — clear the checkpoint so the next /preview starts fresh.
-  await sendMessage(chatId, `✅ التجميعة كاملة اتبعتت. 🔒 بريفيو فقط — مش اتعملت أي شحنة.`);
-  await clearJob(chatId);
 }
 
-// Business-critical: create the Telegraph shipments for confirmed orders. Called
-// FIRST in runPipeline (execute mode) so the 300s function limit can only ever
-// truncate the regenerable documents, never the shipments.
-async function createShipmentsForRun(chatId: number, cursor: RunCursor, deadline: number): Promise<void> {
-  const orderId = cursor.orderId;
-  const pastDeadline = (): boolean => Date.now() >= deadline;
-  // Pause helper: persist accumulated progress, then offer the Continue button.
-  const pause = async (progress: string): Promise<void> => {
-    cursor.status = 'paused';
-    await saveJob(chatId, cursor);
-    await sendContinuePrompt(chatId, 'run', progress);
-  };
-
-  // ── Safety gate ────────────────────────────────────────────────────────────
-  if (process.env.TELEGRAPH_ENABLED?.trim().toLowerCase() !== 'true') {
-    await sendMessage(
-      chatId,
-      '⛔ TELEGRAPH\\_ENABLED مش مفعّل في الـ .env\nعدّل الـ .env في Vercel وأعد المحاولة.',
-      { parse_mode: 'Markdown' }
-    );
-    await clearJob(chatId);
-    return;
+/** Called by the signed internal Vercel endpoint. */
+export async function resumeProductionInvocation(
+  chatId: number,
+  batchId: string,
+  delayMs = 0
+): Promise<void> {
+  const boundedDelay = Math.min(30_000, Math.max(0, Number(delayMs) || 0));
+  if (boundedDelay) {
+    await new Promise((resolve) => setTimeout(resolve, boundedDelay));
   }
-
-  // ── Shipping phase (resumable via processedOrderNames) ─────────────────────
-  if (cursor.phase === 'shipping') {
-    const resuming = cursor.processedOrderNames.length > 0;
-    await sendMessage(chatId, resuming ? `🚚 بكمّل الشحن...` : `🚚 جاري جلب الأوردرات للشحن...`);
-
-    const { shopifyOrdersClient } = await import('../../shopify/shopifyOrdersClient.js');
-    let allOrders: ShopifyOrder[];
-    try {
-      const query = orderId
-        ? `name:#${orderId.replace(/^#/, '')} tag:confirmed fulfillment_status:unfulfilled`
-        : 'tag:confirmed fulfillment_status:unfulfilled';
-      allOrders = await shopifyOrdersClient.listRecentOrders(250, query);
-    } catch (err) {
-      // Transient fetch failure → keep progress and let the user retry via Continue.
-      await sendMessage(chatId, `❌ فشل في جلب الأوردرات للشحن: ${String(err).slice(0, 200)}`);
-      await pause('فشل جلب الأوردرات — دوس إكمال أحاول تاني.');
-      return;
-    }
-
-    // Skip orders already handled in a previous segment (belt-and-suspenders:
-    // shipped ones also drop out of the unfulfilled query on their own).
-    const orders = allOrders
-      .filter((o) => !o.test)
-      .filter((o) => !cursor.processedOrderNames.includes(o.name));
-
-    if (!orders.length && !cursor.processedOrderNames.length && !cursor.createdShipmentIds.length) {
-      await sendMessage(chatId, '✅ مفيش أوردرات confirmed للشحن دلوقتي.');
-      await clearJob(chatId);
-      return;
-    }
-
-    if (orders.length) {
-      await sendMessage(chatId, `🚚 ${resuming ? 'باقي' : 'بدأ الشحن —'} ${orders.length} أوردر...`);
-
-      // Dynamic import so Prisma only loads when actually shipping
-      const { createAppServices } = await import('../../app.js');
-      const { shopifyOrderProcessor } = createAppServices();
-
-      for (let idx = 0; idx < orders.length; idx++) {
-        if (pastDeadline()) {
-          await pause(`اتعامل مع ${cursor.processedOrderNames.length} أوردر — فاضل ${orders.length - idx}.`);
-          return;
-        }
-        const order = orders[idx]!;
-        try {
-          const result = await shopifyOrderProcessor.process(order, {
-            source: 'telegram-bot',
-            skipEligibility: false,
-          });
-          // Telegraph's print page resolves shipments by their NUMERIC id — collect
-          // ids (from new and already-shipped orders) for the waybill URL.
-          if (result.accurateShipmentId) cursor.createdShipmentIds.push(result.accurateShipmentId);
-          if (result.skipped) {
-            const reason = result.reason ?? 'skipped';
-            cursor.results.push({ orderName: order.name, ok: true, reason });
-            await sendMessage(chatId, `⏭️ ${order.name} — تم تخطيه: ${reason}`);
-          } else {
-            cursor.results.push({ orderName: order.name, ok: true });
-            await sendMessage(chatId, `✅ ${order.name} — تم الشحن بنجاح`);
-          }
-        } catch (err) {
-          const errMsg = String(err).slice(0, 200);
-          cursor.results.push({ orderName: order.name, ok: false, reason: errMsg });
-          await sendMessage(chatId, `❌ ${order.name} — فشل: ${errMsg}`);
-        }
-        cursor.processedOrderNames.push(order.name);
-        // Persist after EVERY order so a hard 300s kill (or crash) mid-segment
-        // never loses which orders shipped or their waybill ids — resume skips
-        // them and the print link stays complete.
-        await saveJob(chatId, cursor);
-      }
-    }
-
-    cursor.phase = 'finalize';
-    await saveJob(chatId, cursor);
-  }
-
-  // ── Finalize: waybill link + final report (from accumulated cursor data) ───
-  // Deterministic print URL (just shipment ids joined) — can never fail to build
-  // and opens Telegraph's own print page where the user is already logged in.
-  const uniqueShipmentIds = [...new Set(cursor.createdShipmentIds)];
-  if (uniqueShipmentIds.length > 0) {
-    const idsParam = uniqueShipmentIds.join(',');
-    const printUrl = `https://system.telegraphex.com/print/waybill/shipment/A4/3d/${idsParam}`;
-    await sendMessage(
-      chatId,
-      `🖨️ *بوالص الشحن (${uniqueShipmentIds.length}):*\n${printUrl}\n\n` +
-        `افتح اللينك ← هيفتح صفحة الطباعة الرسمية ← اطبع أو احفظ PDF (Ctrl+P).`,
-      { parse_mode: 'Markdown' }
-    );
-  } else {
-    await sendMessage(
-      chatId,
-      'ℹ️ مفيش بوالص للطباعة — يا إما مفيش أوردرات جاهزة، يا إما كلها اتشحنت ومالهاش كود شحنة محفوظ.'
-    );
-  }
-
-  const succeeded = cursor.results.filter((r) => r.ok);
-  const failed = cursor.results.filter((r) => !r.ok);
-  const reportLines = [
-    '📊 *تقرير نهائي*',
-    `✅ نجح: ${succeeded.length}`,
-    `❌ فشل: ${failed.length}`,
-  ];
-  if (failed.length) {
-    reportLines.push('\n*الأوردرات اللي فشلت:*');
-    for (const r of failed) {
-      reportLines.push(`• ${r.orderName}: ${r.reason?.slice(0, 100) ?? '?'}`);
-    }
-  }
-  await sendMessage(chatId, reportLines.join('\n'), { parse_mode: 'Markdown' });
-
-  // Done — clear the checkpoint so the next /run starts fresh.
-  await clearJob(chatId);
+  await runPipeline(chatId, batchId);
 }
 
-// ── Handler ───────────────────────────────────────────────────────────────────
-
+// Compatibility entrypoint for any old direct invocation. It now creates the
+// same preview-first durable workflow instead of running a second code path.
 export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
   if (!event.body) return { statusCode: 400, body: 'Missing body' };
-
   let payload: JobPayload;
   try {
     payload = JSON.parse(event.body) as JobPayload;
@@ -546,19 +208,11 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
     return { statusCode: 400, body: 'Invalid JSON' };
   }
 
-  const { chatId, execute, orderId } = payload;
-
-  try {
-    await runPipeline(chatId, execute, orderId);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('[background] Pipeline error:', msg);
-    try {
-      await sendMessage(chatId, `❌ حصل خطأ غير متوقع:\n${msg.slice(0, 300)}`);
-    } catch {
-      // ignore
-    }
-  }
-
+  const created = await createPreviewJob(payload.chatId, {
+    orderId: payload.orderId,
+    pendingRun: payload.execute,
+    recipientChatIds: productionRecipientChatIds(payload.chatId),
+  });
+  await runPipeline(payload.chatId, created.job.batchId);
   return { statusCode: 202, body: 'ok' };
 };
