@@ -4,6 +4,10 @@ import type { ShipmentStatusSyncService } from '../services/shipmentStatusSyncSe
 import { handler as drainOdooQueue } from '../netlify/functions/process-odoo-queue-background.js';
 import { logger } from '../lib/logger.js';
 import type { MetaDeliveryService } from '../meta/metaDeliveryService.js';
+import { listRecoverableJobs } from '../services/productionJobStore.js';
+import { scheduleProductionContinuation } from '../services/productionContinuation.js';
+import { checkProductionHealth } from '../services/productionHealthService.js';
+import { sendMessage } from '../telegram/telegramApi.js';
 
 /**
  * Ops endpoints triggered by an external scheduler (GitHub Actions every 30 min)
@@ -91,6 +95,41 @@ export const createOpsRouter = (
     }
   });
 
+  router.get('/ops/resume-production-jobs', async (request, response) => {
+    if (!guard(request, response)) return;
+    try {
+      const { prisma } = await import('../lib/prisma.js');
+      const paused = await prisma.failedPayload.findFirst({
+        where: { source: 'bot_control', reason: 'bot_paused' },
+      });
+      if (paused) {
+        response.json({ ok: true, paused: true, found: 0, dispatched: 0 });
+        return;
+      }
+
+      const jobs = await listRecoverableJobs();
+      let dispatched = 0;
+      const failures: string[] = [];
+      for (const { chatId, job } of jobs) {
+        try {
+          await scheduleProductionContinuation({ chatId, batchId: job.batchId });
+          dispatched += 1;
+        } catch (error) {
+          failures.push(`${job.batchId}: ${String(error).slice(0, 160)}`);
+        }
+      }
+      response.status(failures.length ? 503 : 200).json({
+        ok: failures.length === 0,
+        found: jobs.length,
+        dispatched,
+        failures,
+      });
+    } catch (error) {
+      logger.error('ops/resume-production-jobs failed', { reason: error instanceof Error ? error.message : String(error) });
+      response.status(500).json({ ok: false });
+    }
+  });
+
   router.get('/ops/meta-delivered/health', async (request, response) => {
     if (!strictGuard(request, response)) return;
     try {
@@ -103,6 +142,51 @@ export const createOpsRouter = (
       logger.error('ops/meta-delivered/health failed', {
         reason: error instanceof Error ? error.message : String(error)
       });
+      response.status(500).json({ ok: false });
+    }
+  });
+
+  router.get('/ops/production-health', async (request, response) => {
+    if (!guard(request, response)) return;
+    try {
+      const result = await checkProductionHealth();
+      const { prisma } = await import('../lib/prisma.js');
+      const stateWhere = { source: 'health_monitor', reason: 'production_health' } as const;
+      const previous = await prisma.failedPayload.findFirst({ where: stateWhere, orderBy: { id: 'desc' } });
+      const fingerprint = JSON.stringify({
+        theme: result.theme,
+        validation: result.validation,
+        fallback: result.vercelFallback,
+      });
+      const configured = process.env.PRODUCTION_ALERT_CHAT_IDS?.trim()
+        || process.env.PRODUCTION_RECIPIENT_CHAT_IDS?.trim()
+        || '6776051391,8615245657';
+      const recipients = [...new Set(configured.split(',').map((value) => value.trim()).filter(Boolean))];
+
+      if (!result.ok && previous?.payloadJson !== fingerprint) {
+        const alert = [
+          '🚨 تنبيه أمان Viola Production',
+          `Theme: ${result.theme.ok ? 'OK' : result.theme.error ?? 'FAILED'}`,
+          `Shopify Validation: ${result.validation.ok ? 'OK' : result.validation.error ?? 'FAILED'}`,
+          `Vercel locations fallback: ${result.vercelFallback.ok ? 'OK' : result.vercelFallback.error ?? 'FAILED'}`,
+          'لن يتم تخمين مناطق؛ راجع النظام قبل أي Run جديد.',
+        ].join('\n');
+        await Promise.all(recipients.map((recipient) => sendMessage(recipient, alert)));
+        await prisma.failedPayload.deleteMany({ where: stateWhere });
+        await prisma.failedPayload.create({
+          data: { ...stateWhere, payloadJson: fingerprint },
+        });
+      } else if (result.ok && previous) {
+        await Promise.all(recipients.map((recipient) => sendMessage(
+          recipient,
+          '✅ Viola Production health رجع سليم: Theme + Shopify Validation + Vercel fallback.'
+        )));
+        await prisma.failedPayload.deleteMany({ where: stateWhere });
+      }
+
+      response.status(result.ok ? 200 : 503).json(result);
+    } catch (error) {
+      logger.error('ops/production-health failed', { reason: error instanceof Error ? error.message : String(error) });
       response.status(500).json({ ok: false });
     }
   });

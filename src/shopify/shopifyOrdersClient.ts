@@ -85,6 +85,10 @@ interface ShopifyGraphqlOrder {
 interface ListOrdersResponse {
   orders: {
     nodes: ShopifyGraphqlOrder[];
+    pageInfo?: {
+      hasNextPage: boolean;
+      endCursor?: string | null;
+    };
   };
 }
 
@@ -208,6 +212,21 @@ const LIST_ORDERS_QUERY = `
   }
 `;
 
+const LIST_ALL_ORDERS_QUERY = `
+  ${ORDER_FIELDS}
+  query TelegraphAllOrders($first: Int!, $query: String, $after: String) {
+    orders(first: $first, query: $query, after: $after, sortKey: CREATED_AT, reverse: true) {
+      nodes {
+        ...TelegraphOrderFields
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
 const GET_ORDER_QUERY = `
   ${ORDER_FIELDS}
   query TelegraphOrder($id: ID!) {
@@ -315,6 +334,29 @@ export const shopifyOrdersClient = {
       query
     });
     return response.orders.nodes.map(mapOrder);
+  },
+
+  /** Read every matching order page, bounded to protect accidental broad scans. */
+  listAllMatchingOrders: async (
+    query: string,
+    options: { pageSize?: number; maxOrders?: number } = {}
+  ): Promise<ShopifyOrder[]> => {
+    const pageSize = Math.min(250, Math.max(1, options.pageSize ?? 250));
+    const maxOrders = Math.max(pageSize, options.maxOrders ?? 1000);
+    const orders: ShopifyOrder[] = [];
+    let after: string | null = null;
+
+    while (orders.length < maxOrders) {
+      const response: ListOrdersResponse = await requestShopifyAdmin<ListOrdersResponse>(LIST_ALL_ORDERS_QUERY, {
+        first: Math.min(pageSize, maxOrders - orders.length),
+        query,
+        after,
+      });
+      orders.push(...response.orders.nodes.map(mapOrder));
+      if (!response.orders.pageInfo?.hasNextPage || !response.orders.pageInfo.endCursor) break;
+      after = response.orders.pageInfo.endCursor;
+    }
+    return orders;
   },
 
   getOrderByGid: async (id: string): Promise<ShopifyOrder> => {

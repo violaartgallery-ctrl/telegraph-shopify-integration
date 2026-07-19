@@ -126,7 +126,14 @@ export class ShopifyOrderProcessor {
         requireTelegraphLocation: context?.requireTelegraphLocation,
         shipmentCode
       });
-      let shipment = await this.saveShipmentWithFreshCodeRetry(orderId, shipmentInput, shipmentCode);
+      // Crash-safe idempotency: Telegraph may create a shipment but the HTTP
+      // response can be lost before Neon records its id. On retry, recover the
+      // shipment by the already-reserved code + exact Shopify reference instead
+      // of allocating a second code and creating a duplicate shipment.
+      let shipment = shipmentCode
+        ? await this.findShipmentByPlannedCode(shipmentCode, shipmentInput.refNumber)
+        : null;
+      shipment ??= await this.saveShipmentWithFreshCodeRetry(orderId, shipmentInput, shipmentCode);
 
       if (!shipment) {
         throw new Error('Accurate saveShipment returned null');
@@ -185,6 +192,13 @@ export class ShopifyOrderProcessor {
       } catch (error) {
         if (!isDuplicateShipmentCodeError(error)) {
           throw error;
+        }
+
+        // A duplicate-code response can be the successful result of an earlier
+        // request whose response was interrupted. Re-check before rotating code.
+        if (shipmentCode) {
+          const recovered = await this.findShipmentByPlannedCode(shipmentCode, shipmentInput.refNumber);
+          if (recovered) return recovered;
         }
 
         shipmentCode = await shipmentCodeService.reserveFreshForOrder(orderId);
@@ -272,6 +286,30 @@ export class ShopifyOrderProcessor {
       }
       throw error;
     }
+  }
+
+  private async findShipmentByPlannedCode(
+    shipmentCode: string,
+    expectedReference?: string
+  ): Promise<{ id: number; code: string; refNumber?: string | null; status?: { code?: string | null; name?: string | null } | null } | null> {
+    let shipment: Awaited<ReturnType<AccurateClient['getShipment']>>;
+    try {
+      shipment = await this.accurateClient.getShipment({ code: shipmentCode });
+    } catch (error) {
+      if (!(error instanceof UnauthorizedError)) throw error;
+      const list = await this.accurateClient.listShipments({ search: shipmentCode }, 20, 1);
+      shipment = (list.data ?? []).find((candidate) => candidate.code === shipmentCode) ?? null;
+    }
+
+    if (!shipment) return null;
+    // Never adopt somebody else's shipment merely because a code collided.
+    if (!expectedReference || shipment.refNumber !== expectedReference) return null;
+    logger.warn('Recovered previously-created Telegraph shipment by planned code', {
+      shipmentCode,
+      expectedReference,
+      accurateShipmentId: shipment.id
+    });
+    return shipment;
   }
 
 }

@@ -1,0 +1,853 @@
+{%- comment -%} Note Box matching is now handled inside the block {%- endcomment -%}
+
+<section class="product-section" style="padding-top: {{ section.settings.padding_top }}px; padding-bottom: {{ section.settings.padding_bottom }}px;">
+  <div class="container">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="breadcrumb-sep">/</span>
+      {% if product.collections.size > 0 %}
+        <a href="{{ product.collections.first.url }}">{{ product.collections.first.title }}</a>
+        <span class="breadcrumb-sep">/</span>
+      {% endif %}
+      <span class="breadcrumb-current">{{ product.title }}</span>
+    </nav>
+    <div class="product-layout" style="{% if section.settings.image_position == 'right' %}direction: rtl;{% endif %}">
+      <!-- Gallery Carousel -->
+      <div class="product-gallery" style="direction: ltr;">
+        {% if product.images.size > 0 %}
+          <div class="pg-carousel">
+            <div class="pg-track">
+              {% for image in product.images %}
+                <div class="pg-slide {% if forloop.first %}active{% endif %}">
+                  <img src="{{ image | image_url: width: 900 }}" alt="{{ product.title | escape }} - {{ forloop.index }}" loading="{% if forloop.first %}eager{% else %}lazy{% endif %}">
+                </div>
+              {% endfor %}
+            </div>
+
+            {% if product.images.size > 1 %}
+              <button type="button" class="pg-arrow pg-prev" aria-label="Previous image">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+              </button>
+              <button type="button" class="pg-arrow pg-next" aria-label="Next image">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+              </button>
+
+              <div class="pg-dots">
+                {% for image in product.images %}
+                  <button type="button" class="pg-dot {% if forloop.first %}active{% endif %}" data-index="{{ forloop.index0 }}" aria-label="Image {{ forloop.index }}"></button>
+                {% endfor %}
+              </div>
+
+              <div class="pg-counter">
+                <span class="pg-current">1</span> / {{ product.images.size }}
+              </div>
+            {% endif %}
+          </div>
+        {% endif %}
+
+        {% if product.images.size > 1 and section.settings.show_thumbnails %}
+          <div class="product-thumbnails">
+            {% for image in product.images %}
+              <button data-slide="{{ forloop.index0 }}" class="{% if forloop.first %}active{% endif %}" aria-label="View image {{ forloop.index }}">
+                <img src="{{ image | image_url: width: 120 }}" alt="{{ product.title | escape }}" loading="lazy">
+              </button>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+
+      <!-- Info — blocks control the order -->
+      <div class="product-info" style="direction: ltr;">
+        {% for block in section.blocks %}
+
+          {%- case block.type -%}
+
+            {%- when 'title' -%}
+              <h1 style="{% if section.settings.title_color != blank %}color: {{ section.settings.title_color }};{% endif %}" {{ block.shopify_attributes }}>{{ product.title }}</h1>
+
+            {%- when 'vendor' -%}
+              {% if product.vendor != blank %}
+                <div style="font-size: 0.85rem; color: var(--color-text-light); margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em;" {{ block.shopify_attributes }}>{{ product.vendor }}</div>
+              {% endif %}
+
+            {%- when 'price' -%}
+              <div class="product-price" id="product-price" style="{% if section.settings.price_color != blank %}color: {{ section.settings.price_color }};{% endif %}" {{ block.shopify_attributes }}>
+                {{ product.selected_or_first_available_variant.price | money }}
+                {% if product.compare_at_price > product.price %}
+                  <span style="text-decoration: line-through; color: var(--color-text-light); font-size: 0.85em; margin-left: 0.5rem;">{{ product.compare_at_price | money }}</span>
+                  {% assign save_pct = product.compare_at_price | minus: product.price | times: 100 | divided_by: product.compare_at_price %}
+                  <span style="display: inline-block; background: #111111; color: #ffffff; font-size: 0.75rem; font-weight: 600; border-radius: 999px; padding: 0.2rem 0.6rem; margin-left: 0.5rem; vertical-align: middle;">Save {{ save_pct }}%</span>
+                {% endif %}
+              </div>
+
+            {%- when 'description' -%}
+              {% if product.description != blank %}
+                <div class="product-description" {{ block.shopify_attributes }}>{{ product.description }}</div>
+              {% endif %}
+
+            {%- when 'note_box' -%}
+              {%- assign show_note = false -%}
+              {%- if block.settings.note_show_all -%}
+                {%- assign show_note = true -%}
+              {%- endif -%}
+              {%- if block.settings.note_match_description and show_note == false -%}
+                {%- if product.description contains 'هنتواصل مع حضرتك على واتساب' -%}
+                  {%- assign show_note = true -%}
+                {%- endif -%}
+              {%- endif -%}
+              {%- if block.settings.note_product_handles != blank and show_note == false -%}
+                {%- assign note_handles = block.settings.note_product_handles | split: ',' -%}
+                {%- for h in note_handles -%}
+                  {%- assign clean_h = h | strip -%}
+                  {%- if product.handle == clean_h -%}{%- assign show_note = true -%}{%- break -%}{%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+              {%- if block.settings.note_tag != blank and show_note == false -%}
+                {%- if product.tags contains block.settings.note_tag -%}{%- assign show_note = true -%}{%- endif -%}
+              {%- endif -%}
+
+              {%- if show_note -%}
+                <div class="whatsapp-note" style="{% if block.settings.note_bg != blank %}background: {{ block.settings.note_bg }};{% endif %}{% if block.settings.note_border != blank %}border-color: {{ block.settings.note_border }}; border-left-color: {{ block.settings.note_border }};{% endif %}{% if block.settings.direction == 'rtl' %}direction: rtl; text-align: right;{% endif %}" {{ block.shopify_attributes }}>
+                  <div class="whatsapp-note-header" style="{% if block.settings.heading_color != blank %}color: {{ block.settings.heading_color }};{% endif %}">
+                    {% if block.settings.icon == 'whatsapp' %}
+                      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+                    {% elsif block.settings.icon == 'info' %}
+                      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" style="fill: {{ block.settings.note_border | default: '#D69E2E' }};"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                    {% elsif block.settings.icon == 'warning' %}
+                      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" style="fill: {{ block.settings.note_border | default: '#D69E2E' }};"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>
+                    {% endif %}
+                    {{ block.settings.note_heading | default: 'Note:' }}
+                  </div>
+                  <div class="whatsapp-note-body" style="{% if block.settings.body_color != blank %}color: {{ block.settings.body_color }};{% endif %}">{{ block.settings.note_text | default: 'Cross Bag for women hand-made from genuine leather with a unique minimalist design.' }}</div>
+                </div>
+              {%- endif -%}
+
+            {%- when 'variant_picker' -%}
+              <div class="product-form" id="product-form" {{ block.shopify_attributes }}>
+                {% for option in product.options_with_values %}
+                  <div class="variant-option-group" data-option-index="{{ forloop.index0 }}">
+                    <label class="option-label">{{ option.name }}</label>
+                    {%- assign option_name_lower = option.name | downcase -%}
+                    {%- if option_name_lower contains 'color' or option_name_lower contains 'colour' -%}
+                      <div class="color-img-swatches">
+                        {%- for value in option.values -%}
+                          {%- comment -%} Find the first variant with this color to get its image {%- endcomment -%}
+                          {%- assign swatch_img = '' -%}
+                          {%- assign swatch_img_index = -1 -%}
+                          {%- for variant in product.variants -%}
+                            {%- if variant.option1 == value and swatch_img == '' -%}
+                              {%- if variant.featured_image -%}
+                                {%- assign swatch_img = variant.featured_image | image_url: width: 120 -%}
+                                {%- comment -%} Find the index of this image in product.images {%- endcomment -%}
+                                {%- for img in product.images -%}
+                                  {%- if img.id == variant.featured_image.id -%}
+                                    {%- assign swatch_img_index = forloop.index0 -%}
+                                    {%- break -%}
+                                  {%- endif -%}
+                                {%- endfor -%}
+                              {%- endif -%}
+                            {%- endif -%}
+                          {%- endfor -%}
+
+                          {%- comment -%} Fallback color if no image {%- endcomment -%}
+                          {%- assign clr = value | downcase | strip -%}
+                          {%- assign bg = '#888' -%}
+                          {%- if clr == 'black' -%}{%- assign bg = '#1a1a1a' -%}
+                          {%- elsif clr == 'maroon' -%}{%- assign bg = '#800000' -%}
+                          {%- elsif clr == 'dark brown' -%}{%- assign bg = '#3e2723' -%}
+                          {%- elsif clr == 'brown' -%}{%- assign bg = '#6d4c41' -%}
+                          {%- elsif clr == 'havan' -%}{%- assign bg = '#c8a96e' -%}
+                          {%- elsif clr == 'dark navy' -%}{%- assign bg = '#1a237e' -%}
+                          {%- elsif clr == 'royal green' -%}{%- assign bg = '#1b5e20' -%}
+                          {%- elsif clr == 'green' -%}{%- assign bg = '#2e7d32' -%}
+                          {%- elsif clr == 'geometric' -%}{%- assign bg = '#6d4c41' -%}
+                          {%- elsif clr == 'black crocodile' -%}{%- assign bg = '#111' -%}
+                          {%- endif -%}
+
+                          <button
+                            type="button"
+                            class="color-img-swatch{% if forloop.first %} active{% endif %}"
+                            data-option-index="{{ forloop.parentloop.index0 }}"
+                            data-value="{{ value }}"
+                            data-slide-index="{{ swatch_img_index }}"
+                            title="{{ value }}"
+                            aria-label="{{ value }}"
+                          >
+                            {% if swatch_img != '' %}
+                              <img src="{{ swatch_img }}" alt="{{ value }}" loading="lazy">
+                            {% else %}
+                              <span class="color-img-fallback" style="background-color: {{ bg }};"></span>
+                            {% endif %}
+                          </button>
+                        {%- endfor -%}
+                      </div>
+                      <div class="selected-color-name">{{ option.selected_value | default: option.values.first }}</div>
+                    {%- else -%}
+                      <div class="size-pills">
+                        {%- for value in option.values -%}
+                          <button type="button" class="size-pill{% if forloop.first %} active{% endif %}" data-option-index="{{ forloop.parentloop.index0 }}" data-value="{{ value }}">{{ value }}</button>
+                        {%- endfor -%}
+                      </div>
+                    {%- endif -%}
+                  </div>
+                {% endfor %}
+                <input type="hidden" id="selected-variant-id" value="{{ product.selected_or_first_available_variant.id }}">
+              </div>
+
+            {%- when 'quantity_selector' -%}
+              <div class="quantity-selector" style="display: flex; align-items: center; gap: 0; margin-bottom: 1rem; max-width: 140px;" {{ block.shopify_attributes }}>
+                <button type="button" class="qty-btn qty-minus" style="width: 40px; height: 40px; border: 1px solid #e0e0e0; border-radius: 8px 0 0 8px; background: #ffffff; color: #111111; font-size: 1.2rem; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s;" aria-label="Decrease quantity">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+                <input type="number" id="product-quantity" name="quantity" value="1" min="1" readonly style="width: 50px; height: 40px; border-top: 1px solid #e0e0e0; border-bottom: 1px solid #e0e0e0; border-left: none; border-right: none; text-align: center; font-size: 0.95rem; font-weight: 600; color: #111111; background: #ffffff; -moz-appearance: textfield; appearance: textfield;">
+                <button type="button" class="qty-btn qty-plus" style="width: 40px; height: 40px; border: 1px solid #e0e0e0; border-radius: 0 8px 8px 0; background: #ffffff; color: #111111; font-size: 1.2rem; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s;" aria-label="Increase quantity">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+              </div>
+              <script>
+                (function(){
+                  var wrap = document.querySelector('.quantity-selector');
+                  if (!wrap) return;
+                  var input = wrap.querySelector('#product-quantity');
+                  wrap.querySelector('.qty-minus').addEventListener('click', function(){
+                    var v = parseInt(input.value, 10);
+                    if (v > 1) input.value = v - 1;
+                  });
+                  wrap.querySelector('.qty-plus').addEventListener('click', function(){
+                    input.value = parseInt(input.value, 10) + 1;
+                  });
+                })();
+              </script>
+
+            {%- when 'customization' -%}
+              {% render 'product-customization', product: product, block: block %}
+
+            {%- when 'buy_buttons' -%}
+              <div {{ block.shopify_attributes }}>
+                {% if product.available %}
+                  <button class="add-to-cart-main" id="add-to-cart-btn" data-variant-id="{{ product.selected_or_first_available_variant.id }}" style="{% if section.settings.atc_bg != blank %}background: {{ section.settings.atc_bg }};{% endif %}">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg>
+                    {{ section.settings.atc_text | default: 'Add to Cart' }}
+                  </button>
+                  {% if section.settings.show_buy_now %}
+                    <button type="button" class="buy-now-main" id="buy-now-btn" style="{% if section.settings.buy_now_bg != blank %}background: {{ section.settings.buy_now_bg }}; border-color: {{ section.settings.buy_now_bg }};{% endif %}">
+                      {{ section.settings.buy_now_text | default: 'Buy Now' }}
+                    </button>
+                  {% endif %}
+                {% else %}
+                  <button class="add-to-cart-main sold-out-main" disabled>{{ section.settings.sold_out_text | default: 'Sold Out' }}</button>
+                {% endif %}
+              </div>
+
+            {%- when 'trust_badges' -%}
+              <div class="trust-badges" style="display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: center; justify-content: flex-start; margin: 1rem 0 0.5rem; padding: 0.75rem 0;" {{ block.shopify_attributes }}>
+                <span style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; color: #888888;">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  Secure Checkout
+                </span>
+                <span style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; color: #888888;">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
+                  Free Shipping on 2+
+                </span>
+                <span style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; color: #888888;">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+                  Handcrafted Quality
+                </span>
+              </div>
+
+            {%- when 'share' -%}
+              <div style="margin-top: 1rem; display: flex; gap: 0.75rem; align-items: center;" {{ block.shopify_attributes }}>
+                <span style="font-size: 0.85rem; font-weight: 600; color: var(--color-text-light);">Share:</span>
+                <a href="https://wa.me/?text={{ product.title | url_encode }}%20{{ product.url | prepend: shop.url | url_encode }}" target="_blank" rel="noopener" style="color: #111111;" aria-label="WhatsApp">
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/></svg>
+                </a>
+                <a href="https://www.facebook.com/sharer/sharer.php?u={{ product.url | prepend: shop.url | url_encode }}" target="_blank" rel="noopener" style="color: #111111;" aria-label="Facebook">
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
+                </a>
+              </div>
+
+            {%- when 'custom_text' -%}
+              {% if block.settings.text != blank %}
+                <div style="font-size: {{ block.settings.font_size }}px; color: {{ block.settings.text_color | default: 'var(--color-text-light)' }}; line-height: 1.7; margin: {{ block.settings.margin_top }}px 0 {{ block.settings.margin_bottom }}px; {% if block.settings.direction == 'rtl' %}direction: rtl; text-align: right;{% endif %}" {{ block.shopify_attributes }}>
+                  {{ block.settings.text }}
+                </div>
+              {% endif %}
+
+            {%- when 'separator' -%}
+              <hr style="border: none; border-top: {{ block.settings.thickness }}px {{ block.settings.style }} {{ block.settings.color | default: 'var(--color-border)' }}; margin: {{ block.settings.spacing }}px 0;" {{ block.shopify_attributes }}>
+
+          {%- endcase -%}
+
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Sticky Mobile Add-to-Cart Bar -->
+<div id="sticky-atc-bar" style="display: none; position: fixed; bottom: 0; left: 0; right: 0; width: 100%; background: #ffffff; border-top: 1px solid #e0e0e0; padding: 0.75rem 1rem; z-index: 999; align-items: center; justify-content: space-between;">
+  <div style="font-size: 1rem; font-weight: 700; color: #111111;" id="sticky-atc-price">
+    {{ product.selected_or_first_available_variant.price | money }}
+  </div>
+  <button type="button" id="sticky-atc-btn" style="background: #111111; color: #ffffff; border: none; padding: 0.7rem 1.5rem; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer;">
+    Add to Cart
+  </button>
+</div>
+<style>
+  @media (min-width: 769px) {
+    #sticky-atc-bar { display: none !important; }
+  }
+  .breadcrumbs { font-size: 0.8rem; color: #888; margin-bottom: 1.25rem; font-family: var(--font-body); }
+  .breadcrumbs a { color: #888; text-decoration: none; transition: color 0.2s; }
+  .breadcrumbs a:hover { color: #111111; }
+  .breadcrumb-sep { margin: 0 0.4rem; color: #ccc; }
+  .breadcrumb-current { color: #111111; font-weight: 500; }
+</style>
+<script>
+  (function(){
+    var mainBtn = document.getElementById('add-to-cart-btn');
+    var stickyBar = document.getElementById('sticky-atc-bar');
+    var stickyBtn = document.getElementById('sticky-atc-btn');
+    if (!mainBtn || !stickyBar) return;
+
+    if ('IntersectionObserver' in window) {
+      var observer = new IntersectionObserver(function(entries){
+        entries.forEach(function(entry){
+          if (window.innerWidth <= 768) {
+            stickyBar.style.display = entry.isIntersecting ? 'none' : 'flex';
+          }
+        });
+      }, { threshold: 0 });
+      observer.observe(mainBtn);
+    }
+
+    if (stickyBtn) {
+      stickyBtn.addEventListener('click', function(){
+        mainBtn.click();
+      });
+    }
+  })();
+</script>
+
+<!-- Related Products -->
+<section class="section" style="background: #f5f5f5; padding: 2.5rem 0;">
+  <div class="container">
+    <h2 class="section-title" style="text-align: center; margin-bottom: 1.5rem; font-size: 1.35rem; color: #111111;">You May Also Like</h2>
+    <div class="products-grid" id="related-products" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.25rem;">
+    </div>
+  </div>
+</section>
+<style>
+  @media (max-width: 768px) {
+    #related-products { grid-template-columns: repeat(2, 1fr) !important; }
+  }
+</style>
+<script>
+  (function(){
+    var container = document.getElementById('related-products');
+    if (!container) return;
+    fetch('/recommendations/products.json?product_id={{ product.id }}&limit=4')
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        var products = data.products || [];
+        if (!products.length) {
+          container.parentElement.parentElement.style.display = 'none';
+          return;
+        }
+        var html = '';
+        products.forEach(function(p){
+          var img = p.featured_image ? p.featured_image : '';
+          var price = (p.price / 100).toFixed(2);
+          html += '<a href="' + p.url + '" style="text-decoration: none; color: #111111; display: block; background: #ffffff; border-radius: 8px; overflow: hidden; border: 1px solid #e0e0e0; transition: box-shadow 0.2s;">';
+          html += '<div style="aspect-ratio: 1/1; overflow: hidden; background: #f5f5f5;">';
+          if (img) html += '<img src="' + img + '" alt="' + (p.title || '') + '" loading="lazy" style="width: 100%; height: 100%; object-fit: cover;">';
+          html += '</div>';
+          html += '<div style="padding: 0.75rem;">';
+          html += '<div style="font-size: 0.85rem; font-weight: 600; color: #111111; margin-bottom: 0.25rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">' + (p.title || '') + '</div>';
+          html += '<div style="font-size: 0.85rem; color: #888888;">' + (Shopify.currency && Shopify.currency.active ? Shopify.currency.active : '') + ' ' + price + '</div>';
+          html += '</div></a>';
+        });
+        container.innerHTML = html;
+      })
+      .catch(function(){});
+  })();
+</script>
+
+<script type="application/json" id="product-variants-json">{{ product.variants | json }}</script>
+
+{% schema %}
+{
+  "name": "Product Page",
+  "blocks": [
+    {
+      "type": "title",
+      "name": "Product Title",
+      "limit": 1
+    },
+    {
+      "type": "vendor",
+      "name": "Vendor",
+      "limit": 1
+    },
+    {
+      "type": "price",
+      "name": "Price",
+      "limit": 1
+    },
+    {
+      "type": "description",
+      "name": "Description",
+      "limit": 1
+    },
+    {
+      "type": "variant_picker",
+      "name": "Variant Picker",
+      "limit": 1
+    },
+    {
+      "type": "quantity_selector",
+      "name": "Quantity Selector",
+      "limit": 1
+    },
+    {
+      "type": "customization",
+      "name": "Customization",
+      "limit": 1,
+      "settings": [
+        {
+          "type": "header",
+          "content": "Product rules"
+        },
+        {
+          "type": "textarea",
+          "id": "rules",
+          "label": "Customization rules",
+          "info": "One product per line. Format: product-handle | text: برا يمين, جوا شمال | image: صورة الطبعة"
+        },
+        {
+          "type": "text",
+          "id": "photo_fee_variant_id",
+          "label": "Photo print fee variant ID",
+          "info": "Create a Shopify product priced at 30 EGP, then paste its variant ID here. One fee item will be added per uploaded photo."
+        },
+        {
+          "type": "range",
+          "id": "photo_fee_amount",
+          "min": 0,
+          "max": 200,
+          "step": 5,
+          "unit": "EGP",
+          "label": "Photo print fee amount",
+          "default": 30
+        },
+        {
+          "type": "header",
+          "content": "Arabic copy"
+        },
+        {
+          "type": "text",
+          "id": "eyebrow",
+          "label": "Eyebrow",
+          "default": "تخصيص المنتج"
+        },
+        {
+          "type": "text",
+          "id": "heading",
+          "label": "Heading",
+          "default": "اكتب تفاصيل التخصيص"
+        },
+        {
+          "type": "text",
+          "id": "optional_label",
+          "label": "Optional label",
+          "default": "اختياري"
+        },
+        {
+          "type": "textarea",
+          "id": "help_text",
+          "label": "Help text",
+          "default": "اختار المكان اللي تحب تضيف عليه كتابة أو صورة، وسيتم إرسال التفاصيل مع الطلب."
+        },
+        {
+          "type": "text",
+          "id": "text_placeholder",
+          "label": "Text placeholder",
+          "default": "اكتب النص هنا"
+        },
+        {
+          "type": "text",
+          "id": "file_label",
+          "label": "File label",
+          "default": "ارفع الصورة"
+        },
+        {
+          "type": "text",
+          "id": "image_eyebrow",
+          "label": "Image section eyebrow",
+          "default": "طباعة الصور"
+        },
+        {
+          "type": "text",
+          "id": "image_heading",
+          "label": "Image section heading",
+          "default": "ارفع صور الطباعة"
+        },
+        {
+          "type": "textarea",
+          "id": "image_help_text",
+          "label": "Image section help text",
+          "default": "ارفع الصورة المطلوبة للطباعة، وسيتم إرسالها مع الطلب."
+        },
+        {
+          "type": "text",
+          "id": "photo_fee_note",
+          "label": "Photo fee note",
+          "default": "تكلفة طباعة الصورة الواحدة 30 ج"
+        },
+        {
+          "type": "text",
+          "id": "file_hint",
+          "label": "File hint",
+          "default": "PNG أو JPG"
+        },
+        {
+          "type": "number",
+          "id": "max_text_length",
+          "label": "Max text length",
+          "default": 500
+        }
+      ]
+    },
+    {
+      "type": "note_box",
+      "name": "WhatsApp Note Box",
+      "limit": 1,
+      "settings": [
+        {
+          "type": "header",
+          "content": "Which products show this note?"
+        },
+        {
+          "type": "checkbox",
+          "id": "note_match_description",
+          "label": "Products with Arabic WhatsApp text",
+          "default": true,
+          "info": "Auto-detects the Arabic confirmation text in description"
+        },
+        {
+          "type": "textarea",
+          "id": "note_product_handles",
+          "label": "Product handles (comma separated)",
+          "info": "e.g. magic-wallet, decorated-bag, envelope-bag"
+        },
+        {
+          "type": "text",
+          "id": "note_tag",
+          "label": "Products with this tag",
+          "info": "e.g. show-note"
+        },
+        {
+          "type": "checkbox",
+          "id": "note_show_all",
+          "label": "Show on ALL products",
+          "default": false
+        },
+        {
+          "type": "header",
+          "content": "Content"
+        },
+        {
+          "type": "select",
+          "id": "icon",
+          "label": "Icon",
+          "options": [
+            { "value": "whatsapp", "label": "WhatsApp" },
+            { "value": "info", "label": "Info" },
+            { "value": "warning", "label": "Warning" },
+            { "value": "none", "label": "None" }
+          ],
+          "default": "whatsapp"
+        },
+        {
+          "type": "text",
+          "id": "note_heading",
+          "label": "Heading",
+          "default": "Note:"
+        },
+        {
+          "type": "textarea",
+          "id": "note_text",
+          "label": "Body text",
+          "default": "Cross Bag for women hand-made from genuine leather with a unique minimalist design; style it with your favourite pieces to get an elegant yet simple look."
+        },
+        {
+          "type": "select",
+          "id": "direction",
+          "label": "Text direction",
+          "options": [
+            { "value": "ltr", "label": "Left to Right" },
+            { "value": "rtl", "label": "Right to Left (Arabic)" }
+          ],
+          "default": "ltr"
+        },
+        {
+          "type": "header",
+          "content": "Colors"
+        },
+        {
+          "type": "color",
+          "id": "note_bg",
+          "label": "Background",
+          "default": "#f5f5f5"
+        },
+        {
+          "type": "color",
+          "id": "note_border",
+          "label": "Border / accent color",
+          "default": "#111111"
+        },
+        {
+          "type": "color",
+          "id": "heading_color",
+          "label": "Heading color",
+          "default": "#111111"
+        },
+        {
+          "type": "color",
+          "id": "body_color",
+          "label": "Body text color",
+          "default": "#555555"
+        }
+      ]
+    },
+    {
+      "type": "buy_buttons",
+      "name": "Buy Buttons",
+      "limit": 1
+    },
+    {
+      "type": "trust_badges",
+      "name": "Trust Badges",
+      "limit": 1
+    },
+    {
+      "type": "share",
+      "name": "Share Buttons",
+      "limit": 1
+    },
+    {
+      "type": "custom_text",
+      "name": "Custom Text",
+      "settings": [
+        {
+          "type": "richtext",
+          "id": "text",
+          "label": "Text"
+        },
+        {
+          "type": "range",
+          "id": "font_size",
+          "min": 12,
+          "max": 20,
+          "step": 1,
+          "unit": "px",
+          "label": "Font size",
+          "default": 14
+        },
+        {
+          "type": "color",
+          "id": "text_color",
+          "label": "Text color"
+        },
+        {
+          "type": "select",
+          "id": "direction",
+          "label": "Text direction",
+          "options": [
+            { "value": "ltr", "label": "Left to Right" },
+            { "value": "rtl", "label": "Right to Left (Arabic)" }
+          ],
+          "default": "ltr"
+        },
+        {
+          "type": "range",
+          "id": "margin_top",
+          "min": 0,
+          "max": 40,
+          "step": 4,
+          "unit": "px",
+          "label": "Top margin",
+          "default": 8
+        },
+        {
+          "type": "range",
+          "id": "margin_bottom",
+          "min": 0,
+          "max": 40,
+          "step": 4,
+          "unit": "px",
+          "label": "Bottom margin",
+          "default": 8
+        }
+      ]
+    },
+    {
+      "type": "separator",
+      "name": "Separator Line",
+      "settings": [
+        {
+          "type": "select",
+          "id": "style",
+          "label": "Line style",
+          "options": [
+            { "value": "solid", "label": "Solid" },
+            { "value": "dashed", "label": "Dashed" },
+            { "value": "dotted", "label": "Dotted" }
+          ],
+          "default": "solid"
+        },
+        {
+          "type": "range",
+          "id": "thickness",
+          "min": 1,
+          "max": 4,
+          "step": 1,
+          "unit": "px",
+          "label": "Thickness",
+          "default": 1
+        },
+        {
+          "type": "color",
+          "id": "color",
+          "label": "Color"
+        },
+        {
+          "type": "range",
+          "id": "spacing",
+          "min": 4,
+          "max": 40,
+          "step": 4,
+          "unit": "px",
+          "label": "Spacing",
+          "default": 16
+        }
+      ]
+    }
+  ],
+  "settings": [
+    {
+      "type": "header",
+      "content": "Layout"
+    },
+    {
+      "type": "select",
+      "id": "image_position",
+      "label": "Image position",
+      "options": [
+        { "value": "left", "label": "Left" },
+        { "value": "right", "label": "Right" }
+      ],
+      "default": "left"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_thumbnails",
+      "label": "Show thumbnails",
+      "default": true
+    },
+    {
+      "type": "header",
+      "content": "Buttons"
+    },
+    {
+      "type": "text",
+      "id": "atc_text",
+      "label": "Add to Cart text",
+      "default": "Add to Cart"
+    },
+    {
+      "type": "color",
+      "id": "atc_bg",
+      "label": "Add to Cart color"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_buy_now",
+      "label": "Show Buy Now",
+      "default": true
+    },
+    {
+      "type": "text",
+      "id": "buy_now_text",
+      "label": "Buy Now text",
+      "default": "Buy Now"
+    },
+    {
+      "type": "color",
+      "id": "buy_now_bg",
+      "label": "Buy Now color"
+    },
+    {
+      "type": "text",
+      "id": "sold_out_text",
+      "label": "Sold Out text",
+      "default": "Sold Out"
+    },
+    {
+      "type": "header",
+      "content": "Colors"
+    },
+    {
+      "type": "color",
+      "id": "title_color",
+      "label": "Title color"
+    },
+    {
+      "type": "color",
+      "id": "price_color",
+      "label": "Price color"
+    },
+    {
+      "type": "header",
+      "content": "Spacing"
+    },
+    {
+      "type": "range",
+      "id": "padding_top",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "unit": "px",
+      "label": "Padding top",
+      "default": 40
+    },
+    {
+      "type": "range",
+      "id": "padding_bottom",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "unit": "px",
+      "label": "Padding bottom",
+      "default": 40
+    }
+  ],
+  "presets": [
+    {
+      "name": "Product Page",
+      "blocks": [
+        { "type": "title" },
+        { "type": "price" },
+        { "type": "description" },
+        { "type": "note_box" },
+        { "type": "variant_picker" },
+        { "type": "quantity_selector" },
+        { "type": "customization" },
+        { "type": "buy_buttons" },
+        { "type": "trust_badges" },
+        { "type": "share" }
+      ]
+    }
+  ]
+}
+{% endschema %}

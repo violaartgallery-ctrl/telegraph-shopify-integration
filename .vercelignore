@@ -15,4 +15,5 @@ tempnetlify_sites.json
 _*.json
 MANUAL_WORK_REQUIRED.*
 telegraph-locations.json
-.env.local
+.env
+.env.*

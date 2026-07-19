@@ -18,3 +18,10 @@ logs
 _*.cjs
 _legacy_*.csv
 _legacy_*.json
+.vercel
+.env*
+backups/
+theme-pull/
+theme-verify/
+tmp/
+/telegraph-locations.json

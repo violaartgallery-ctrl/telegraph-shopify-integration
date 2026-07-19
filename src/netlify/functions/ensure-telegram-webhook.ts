@@ -1,4 +1,4 @@
-const WEBHOOK_PATH = '/.netlify/functions/telegram-webhook';
+const WEBHOOK_PATH = '/telegram-webhook';
 
 interface TelegramApiResponse<T> {
   ok: boolean;

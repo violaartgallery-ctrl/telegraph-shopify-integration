@@ -4,4 +4,5 @@ export interface ShipResult {
   orderName: string;
   ok: boolean;
   reason?: string;
+  category?: 'shipped' | 'skipped' | 'needs_review';
 }

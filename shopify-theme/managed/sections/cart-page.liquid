@@ -1,0 +1,802 @@
+<section class="section" style="padding-top: {{ section.settings.padding_top }}px; padding-bottom: {{ section.settings.padding_bottom }}px;">
+  <div class="container" style="max-width: {{ section.settings.max_width }}px;">
+    <h1 class="section-title" style="{% if section.settings.title_color != blank %}color: {{ section.settings.title_color }};{% endif %}">{{ section.settings.title | default: 'Your Cart' }}</h1>
+
+    {% if cart.item_count > 0 %}
+      {% assign promo_cart_total = 0 %}
+      {% for item in cart.items %}
+        {% unless item.variant_id == 54003265929508 %}
+          {% assign promo_cart_total = promo_cart_total | plus: item.final_line_price %}
+        {% endunless %}
+      {% endfor %}
+      {% if section.settings.show_shipping_bar %}
+        {% assign threshold = section.settings.free_shipping_threshold | default: 1500 %}
+        {% assign threshold_cents = threshold | times: 100 %}
+        {% assign remaining_cents = threshold_cents | minus: promo_cart_total %}
+        {% assign progress = promo_cart_total | times: 100 | divided_by: threshold_cents %}
+        {% if progress > 100 %}{% assign progress = 100 %}{% endif %}
+        <div class="shipping-bar">
+          <div class="shipping-bar__text">
+            <svg class="shipping-bar__icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#111111" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
+            {% if promo_cart_total >= threshold_cents %}
+              <span>You've earned free shipping!</span>
+            {% else %}
+              <span>Spend <strong>{{ remaining_cents | money }}</strong> more for free shipping!</span>
+            {% endif %}
+          </div>
+          <div class="shipping-bar__track">
+            <div class="shipping-bar__fill" style="width: {{ progress }}%;"></div>
+          </div>
+        </div>
+      {% endif %}
+
+      <div class="cart-items-list">
+        {% for item in cart.items %}
+          <div class="cart-page-item" data-line-key="{{ item.key }}">
+            <div class="cart-page-img">
+              {% if item.image %}
+                <img src="{{ item.image | image_url: width: 160 }}" alt="{{ item.title | escape }}">
+              {% endif %}
+            </div>
+            <div class="cart-page-info">
+              <a href="{{ item.url }}" class="cart-page-name">{{ item.product.title }}</a>
+              {% unless item.variant.title == 'Default Title' %}
+                <div class="cart-page-variant">{{ item.variant.title }}</div>
+              {% endunless %}
+              {% if item.properties != blank %}
+                <div class="cart-line-properties">
+                  {% for property in item.properties %}
+                    {% assign property_first_char = property.first | slice: 0 %}
+                    {% if property.last != blank and property_first_char != '_' %}
+                      <div class="cart-line-property">
+                        <strong>{{ property.first }}:</strong>
+                        {% if property.last contains '/uploads/' %}
+                          <a href="{{ property.last }}" target="_blank" rel="noopener">عرض الملف</a>
+                        {% else %}
+                          <span>{{ property.last }}</span>
+                        {% endif %}
+                      </div>
+                    {% endif %}
+                  {% endfor %}
+                </div>
+              {% endif %}
+              <div class="cart-page-price-single">{{ item.original_price | money }} each</div>
+
+              <div class="cart-page-controls">
+                <div class="cart-page-qty">
+                  <button type="button" class="cpq-btn cpq-minus" data-key="{{ item.key }}" data-qty="{{ item.quantity | minus: 1 }}" aria-label="Decrease">−</button>
+                  <span class="cpq-num">{{ item.quantity }}</span>
+                  <button type="button" class="cpq-btn cpq-plus" data-key="{{ item.key }}" data-qty="{{ item.quantity | plus: 1 }}" aria-label="Increase">+</button>
+                </div>
+                <button type="button" class="cpq-remove" data-key="{{ item.key }}" aria-label="Remove">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                  Remove
+                </button>
+              </div>
+            </div>
+            <div class="cart-page-line-price" data-line-price>{{ item.line_price | money }}</div>
+          </div>
+        {% endfor %}
+      </div>
+
+      <div class="cart-page-footer">
+        <div class="cart-page-total">
+          <span>Total</span>
+          <span data-cart-total>{{ cart.total_price | money }}</span>
+        </div>
+        <div class="cart-page-delivery" data-telegraph-cart data-locations-url="{{ 'telegraph-locations.json' | asset_url }}">
+          <h3 class="cart-page-delivery__title">بيانات الشحن</h3>
+          <p class="cart-page-delivery__hint">اختار المحافظة والمنطقة قبل ما تكمّل الطلب.</p>
+          <div class="cart-page-delivery__grid">
+            <select class="cart-page-delivery__select" data-telegraph-governorate aria-label="المحافظة">
+              <option value="">اختار المحافظة</option>
+            </select>
+            <select class="cart-page-delivery__select" data-telegraph-area aria-label="المنطقة" disabled>
+              <option value="">اختار المنطقة</option>
+            </select>
+          </div>
+          <div class="cart-page-delivery__status" data-telegraph-status aria-live="polite">
+            جاري التحقق من بيانات الشحن...
+          </div>
+        </div>
+        <div class="cart-page-actions">
+          <a href="/checkout"
+             class="cart-page-checkout is-locked"
+             data-telegraph-checkout
+             aria-disabled="true" tabindex="-1"
+             style="{% if section.settings.checkout_bg != blank %}background: {{ section.settings.checkout_bg }};{% endif %}">
+            {{ section.settings.checkout_text | default: 'Checkout' }}
+          </a>
+          {% if section.settings.show_continue_shopping %}
+            <a href="{{ section.settings.continue_link | default: '/collections/all' }}" class="cart-page-continue">
+              {{ section.settings.continue_text | default: 'Continue Shopping' }}
+            </a>
+          {% endif %}
+        </div>
+        <div class="trust-badges">
+          <div class="trust-badges__item">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+            <span>Secure Checkout</span>
+          </div>
+          <div class="trust-badges__item">
+            <span>Cash on Delivery</span>
+          </div>
+          <div class="trust-badges__item">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+            <span>Visa</span>
+          </div>
+          <div class="trust-badges__item">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+            <span>Mastercard</span>
+          </div>
+        </div>
+      </div>
+
+    {% else %}
+      <div style="text-align: center; padding: 4rem 0;">
+        <p style="color: var(--color-text-light); margin-bottom: 1.5rem; font-size: 1.1rem;">{{ section.settings.empty_text | default: 'Your cart is empty' }}</p>
+        <a href="{{ section.settings.continue_link | default: '/collections/all' }}" class="hero-cta" style="display: inline-flex;">{{ section.settings.empty_cta | default: 'Continue Shopping' }}</a>
+      </div>
+    {% endif %}
+  </div>
+</section>
+
+<style>
+  .cart-items-list {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+  .cart-page-item {
+    display: flex;
+    gap: 1rem;
+    padding: 1rem;
+    align-items: flex-start;
+    border-bottom: 1px solid var(--color-border);
+    transition: opacity 0.25s, transform 0.25s;
+  }
+  .cart-page-item:last-child { border-bottom: none; }
+  .cart-page-img {
+    width: 90px; height: 90px; border-radius: var(--radius-sm);
+    overflow: hidden; flex-shrink: 0; background: var(--color-surface);
+  }
+  .cart-page-img img { width: 100%; height: 100%; object-fit: cover; }
+  .cart-page-info { flex: 1; min-width: 0; }
+  .cart-page-name {
+    font-weight: 600; font-family: var(--font-heading); font-size: 0.95rem;
+    color: var(--color-primary); display: block; margin-bottom: 0.15rem;
+  }
+  .cart-page-variant { font-size: 0.82rem; color: var(--color-text-light); }
+  .cart-page-price-single { font-size: 0.82rem; color: var(--color-text-light); margin-bottom: 0.5rem; }
+  .cart-page-controls { display: flex; align-items: center; gap: 1rem; }
+  .cart-page-qty {
+    display: flex; align-items: center;
+    border: 1px solid var(--color-border); border-radius: 8px; overflow: hidden;
+  }
+  .cpq-btn {
+    width: 34px; height: 34px;
+    display: flex; align-items: center; justify-content: center;
+    background: none; border: none; font-size: 1.1rem; font-weight: 600;
+    color: var(--color-text); cursor: pointer; transition: background 0.2s;
+    font-family: var(--font-heading);
+  }
+  .cpq-btn:hover { background: var(--color-surface); }
+  .cpq-num {
+    width: 36px; text-align: center; font-size: 0.9rem;
+    font-weight: 600; font-family: var(--font-heading);
+  }
+  .cpq-remove {
+    display: flex; align-items: center; gap: 0.3rem;
+    background: none; border: none; color: #999;
+    font-size: 0.8rem; cursor: pointer; transition: color 0.2s;
+    font-family: var(--font-heading);
+  }
+  .cpq-remove:hover { color: #111111; }
+  .cpq-remove svg { width: 16px; height: 16px; }
+  .cart-page-line-price {
+    font-weight: 700; color: var(--color-accent); font-size: 1rem;
+    white-space: nowrap; flex-shrink: 0;
+  }
+
+  .cart-page-footer { padding: 1.5rem 0; }
+  .cart-page-total {
+    display: flex; justify-content: space-between;
+    font-size: 1.25rem; font-weight: 700; margin-bottom: 1rem;
+    font-family: var(--font-heading);
+  }
+  .cart-page-actions { display: flex; flex-direction: column; gap: 0.5rem; align-items: flex-end; }
+  .cart-page-checkout {
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 1rem 2.5rem; background: var(--color-primary); color: #fff;
+    border-radius: var(--radius-xl); font-weight: 700; font-size: 1rem;
+    font-family: var(--font-heading); transition: all var(--transition);
+  }
+  .cart-page-checkout:hover { background: var(--color-accent); transform: scale(1.02); }
+  /* Locked = no shipping zone chosen yet. Server-rendered + toggled by JS. */
+  .cart-page-checkout.is-locked {
+    opacity: 0.45; pointer-events: none; cursor: not-allowed;
+    filter: grayscale(1); box-shadow: none;
+  }
+  .cart-page-continue {
+    font-size: 0.88rem; color: var(--color-accent); font-weight: 500;
+    text-decoration: underline; text-underline-offset: 3px;
+  }
+  /* Delivery-zone picker (required before checkout) */
+  .cart-page-delivery {
+    border: 1px solid var(--color-border, #e2e2e2); border-radius: 12px;
+    padding: 0.9rem 1rem; margin: 0 0 1rem; background: #fff; text-align: right;
+  }
+  .cart-page-delivery__title { margin: 0 0 0.25rem; font-weight: 800; font-size: 1rem; color: var(--color-primary, #111); }
+  .cart-page-delivery__hint { margin: 0 0 0.7rem; font-size: 0.82rem; color: var(--color-text-light, #777); }
+  .cart-page-delivery__grid { display: grid; gap: 0.6rem; }
+  .cart-page-delivery__select {
+    width: 100%; min-height: 44px; border: 1px solid #d0d0d0; border-radius: 8px;
+    background: #fff; font: inherit; font-size: 0.9rem; padding: 0.55rem 0.7rem;
+  }
+  .cart-page-delivery__select:disabled { background: #f5f5f5; color: #999; }
+  .cart-page-delivery__status { margin-top: 0.55rem; min-height: 18px; font-size: 0.8rem; font-weight: 700; color: #b42318; }
+  .cart-page-delivery__status.is-ok { color: #166534; }
+
+  /* Free Shipping Progress Bar */
+  .shipping-bar {
+    background: #f5f5f5;
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 1rem;
+  }
+  .shipping-bar__text {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: #111111;
+    margin-bottom: 0.5rem;
+  }
+  .shipping-bar__icon {
+    flex-shrink: 0;
+  }
+  .shipping-bar__track {
+    width: 100%;
+    height: 8px;
+    background: #e0e0e0;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .shipping-bar__fill {
+    height: 100%;
+    background: #111111;
+    border-radius: 4px;
+    transition: width 0.4s ease;
+  }
+
+  /* Trust Badges */
+  .trust-badges {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 1rem;
+    border-top: 1px solid #e0e0e0;
+    padding-top: 1rem;
+  }
+  .trust-badges__item {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.75rem;
+    color: #888888;
+  }
+
+  @media (max-width: 768px) {
+    .cart-page-item { gap: 0.75rem; padding: 0.75rem; }
+    .cart-page-img { width: 70px; height: 70px; }
+    .cart-page-name { font-size: 0.85rem; }
+    .cart-page-line-price { font-size: 0.88rem; }
+    .cart-page-controls { gap: 0.5rem; }
+    .cpq-btn { width: 30px; height: 30px; font-size: 1rem; }
+    .cpq-num { width: 30px; font-size: 0.82rem; }
+    .cart-page-actions { align-items: stretch; }
+    .cart-page-checkout { text-align: center; }
+  }
+</style>
+
+<script>
+(function() {
+  var PHOTO_PRINTING_FEE_VARIANT_ID = '54003265929508';
+
+  function isPhotoPrintingFeeItem(item) {
+    if (!item) return false;
+    if (String(item.variant_id || item.id || '') === PHOTO_PRINTING_FEE_VARIANT_ID) return true;
+    var props = item.properties || {};
+    return props._viola_fee_type === 'photo_printing' || props._exclude_from_promos === 'true';
+  }
+
+  function getPromoCartItemCount(cart) {
+    return (cart.items || []).reduce(function(count, item) {
+      return isPhotoPrintingFeeItem(item) ? count : count + (item.quantity || 0);
+    }, 0);
+  }
+
+  // Quantity +/-
+  document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.cpq-btn');
+    if (!btn) return;
+    e.preventDefault();
+    var key = btn.getAttribute('data-key');
+    var qty = parseInt(btn.getAttribute('data-qty'));
+    if (qty < 0) qty = 0;
+    var item = btn.closest('.cart-page-item');
+    var numEl = item.querySelector('.cpq-num');
+    var minusBtn = item.querySelector('.cpq-minus');
+    var plusBtn = item.querySelector('.cpq-plus');
+
+    if (qty === 0) {
+      item.style.opacity = '0'; item.style.transform = 'translateX(30px)'; item.style.pointerEvents = 'none';
+    } else {
+      numEl.textContent = qty;
+      minusBtn.setAttribute('data-qty', qty - 1);
+      plusBtn.setAttribute('data-qty', qty + 1);
+    }
+
+    fetch('/cart/change.js', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: key, quantity: qty })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(cart) {
+      var promoItemCount = getPromoCartItemCount(cart);
+      document.querySelectorAll('.cart-count').forEach(function(el) { el.textContent = promoItemCount; });
+      var totalEl = document.querySelector('[data-cart-total]');
+      if (totalEl) totalEl.textContent = 'LE ' + (cart.total_price / 100).toFixed(2) + ' EGP';
+      if (qty > 0) {
+        var serverItem = cart.items.find(function(i) { return i.key === key; });
+        if (serverItem) {
+          var priceEl = item.querySelector('[data-line-price]');
+          if (priceEl) priceEl.textContent = 'LE ' + (serverItem.line_price / 100).toFixed(2) + ' EGP';
+        }
+      }
+      if (qty === 0) {
+        setTimeout(function() {
+          if (item.parentNode) item.parentNode.removeChild(item);
+          if (cart.items.length === 0) location.reload();
+        }, 300);
+      }
+    });
+  });
+
+  // Remove
+  document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.cpq-remove');
+    if (!btn) return;
+    e.preventDefault();
+    var key = btn.getAttribute('data-key');
+    var item = btn.closest('.cart-page-item');
+    item.style.opacity = '0'; item.style.transform = 'translateX(30px)'; item.style.pointerEvents = 'none';
+
+    fetch('/cart/change.js', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: key, quantity: 0 })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(cart) {
+      var promoItemCount = getPromoCartItemCount(cart);
+      document.querySelectorAll('.cart-count').forEach(function(el) { el.textContent = promoItemCount; });
+      var totalEl = document.querySelector('[data-cart-total]');
+      if (totalEl) totalEl.textContent = 'LE ' + (cart.total_price / 100).toFixed(2) + ' EGP';
+      setTimeout(function() {
+        if (item.parentNode) item.parentNode.removeChild(item);
+        if (cart.items.length === 0) location.reload();
+      }, 300);
+    });
+  });
+})();
+</script>
+
+<script>
+/* Delivery-zone picker for the cart page. Populates the governorate/area
+   dropdowns from the static locations asset, saves the choice to cart
+   attributes in sequence, and keeps every Checkout path locked until the
+   latest complete choice has been confirmed by Shopify. */
+(function(){
+  var root = document.querySelector('[data-telegraph-cart]');
+  if (!root) return;
+  var govSel = root.querySelector('[data-telegraph-governorate]');
+  var areaSel = root.querySelector('[data-telegraph-area]');
+  var statusEl = root.querySelector('[data-telegraph-status]');
+  var checkoutBtn = document.querySelector('[data-telegraph-checkout]');
+  var url = {{ 'telegraph-locations.json' | asset_url | json }};
+  var initialCartAttributes = {{ cart.attributes | json }};
+  var fallbackUrl = 'https://viola-telegraph-integration.vercel.app/api/accurate/locations';
+  var locationsLoadTimeoutMs = 6000;
+  var fallbackLoadTimeoutMs = 8000;
+  var cartSaveTimeoutMs = 8000;
+  var sel = { gid: '', g: '', aid: '', a: '' };
+  var locations = [];
+  var checkoutReady = false;
+  var selectionRevision = 0;
+  var saveQueue = Promise.resolve();
+  var EXPRESS_SELECTOR = '.shopify-payment-button, [data-shopify="payment-button"], .additional-checkout-buttons, .dynamic-checkout__content';
+  var CHECKOUT_CANDIDATE_SELECTOR = 'a[href], button[name="checkout"], input[name="checkout"], [data-telegraph-checkout], [data-telegraph-checkout-trigger], ' + EXPRESS_SELECTOR;
+
+  function opt(v, l, on) { var o = document.createElement('option'); o.value = v; o.textContent = l; if (on) o.selected = true; return o; }
+  function selectionComplete(value) { return Boolean(value.gid && value.aid); }
+  function snapshotSelection() { return { gid: sel.gid, g: sel.g, aid: sel.aid, a: sel.a }; }
+  function fetchJsonWithTimeout(requestUrl, timeoutMs, label, options) {
+    var controller = typeof window.AbortController === 'function' ? new window.AbortController() : null;
+    var requestOptions = {};
+    Object.keys(options || {}).forEach(function(key) { requestOptions[key] = options[key]; });
+    if (!requestOptions.credentials) requestOptions.credentials = 'same-origin';
+    if (controller) requestOptions.signal = controller.signal;
+    var timeoutId;
+    var request = fetch(requestUrl, requestOptions).then(function(response) {
+      return responseJson(response, label);
+    });
+    var timeout = new Promise(function(resolve, reject) {
+      timeoutId = window.setTimeout(function() {
+        if (controller) controller.abort();
+        reject(new Error(label + ' timed out after ' + timeoutMs + 'ms'));
+      }, timeoutMs);
+    });
+    return Promise.race([request, timeout]).then(function(payload) {
+      window.clearTimeout(timeoutId);
+      return payload;
+    }, function(error) {
+      window.clearTimeout(timeoutId);
+      throw error;
+    });
+  }
+  function pathIsCheckout(rawUrl) {
+    if (!rawUrl) return false;
+    try {
+      return /\/checkouts?(?:\/|$)/i.test(new URL(rawUrl, window.location.href).pathname);
+    } catch (error) {
+      return /\/checkouts?(?:[/?#]|$)/i.test(rawUrl);
+    }
+  }
+  function isCheckoutTrigger(element) {
+    if (!element) return false;
+    if (typeof element.matches === 'function' && element.matches(EXPRESS_SELECTOR)) return true;
+    if (element.hasAttribute('data-telegraph-checkout') || element.hasAttribute('data-telegraph-checkout-trigger')) return true;
+    if (String(element.getAttribute('name') || '').toLowerCase() === 'checkout') return true;
+    return pathIsCheckout(element.getAttribute('href')) || pathIsCheckout(element.getAttribute('formaction'));
+  }
+  function checkoutTriggerFrom(target) {
+    if (!target || typeof target.closest !== 'function') return null;
+    var express = target.closest(EXPRESS_SELECTOR);
+    if (express) return express;
+    var candidate = target.closest(CHECKOUT_CANDIDATE_SELECTOR);
+    return isCheckoutTrigger(candidate) ? candidate : null;
+  }
+  function syncCheckoutTriggers() {
+    document.querySelectorAll(CHECKOUT_CANDIDATE_SELECTOR).forEach(function(element) {
+      if (!isCheckoutTrigger(element)) return;
+      if (!checkoutReady) {
+        element.classList.add('telegraph-checkout-disabled');
+        element.setAttribute('aria-disabled', 'true');
+        element.setAttribute('data-telegraph-cart-locked', 'true');
+      } else if (element.hasAttribute('data-telegraph-cart-locked')) {
+        element.classList.remove('telegraph-checkout-disabled');
+        element.removeAttribute('aria-disabled');
+        element.removeAttribute('data-telegraph-cart-locked');
+      }
+    });
+  }
+  function setCheckoutReady(ready, message) {
+    checkoutReady = Boolean(ready);
+    if (checkoutBtn) {
+      checkoutBtn.classList.toggle('is-locked', !checkoutReady);
+      if (!checkoutReady) { checkoutBtn.setAttribute('aria-disabled', 'true'); checkoutBtn.setAttribute('tabindex', '-1'); }
+      else { checkoutBtn.removeAttribute('aria-disabled'); checkoutBtn.removeAttribute('tabindex'); }
+    }
+    syncCheckoutTriggers();
+    if (statusEl) {
+      statusEl.textContent = message || (checkoutReady ? 'تم حفظ بيانات الشحن ✓' : 'لازم تختار المحافظة والمنطقة قبل الدفع');
+      statusEl.classList.toggle('is-ok', checkoutReady);
+    }
+  }
+  function responseJson(response, label) {
+    if (!response.ok) throw new Error(label + ' failed with HTTP ' + response.status);
+    return response.json();
+  }
+  function saveSnapshot(snapshot) {
+    return fetchJsonWithTimeout('/cart/update.js', cartSaveTimeoutMs, 'Cart update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attributes: {
+        'Telegraph Governorate ID': snapshot.gid, 'Telegraph Governorate': snapshot.g,
+        'Telegraph Area ID': snapshot.aid, 'Telegraph Area': snapshot.a
+      } })
+    }).then(function(cart) {
+      var attributes = (cart && cart.attributes) || {};
+      var matches = String(attributes['Telegraph Governorate ID'] || '') === String(snapshot.gid) &&
+        String(attributes['Telegraph Governorate'] || '') === String(snapshot.g) &&
+        String(attributes['Telegraph Area ID'] || '') === String(snapshot.aid) &&
+        String(attributes['Telegraph Area'] || '') === String(snapshot.a);
+      if (!matches) throw new Error('Cart attributes did not match the latest selection');
+      return cart;
+    });
+  }
+  function queueSave() {
+    var revision = ++selectionRevision;
+    var snapshot = snapshotSelection();
+    setCheckoutReady(false, 'جاري حفظ بيانات الشحن...');
+
+    var task = saveQueue.catch(function() {}).then(function() {
+      return saveSnapshot(snapshot);
+    });
+    saveQueue = task.catch(function() {});
+
+    task.then(function() {
+      if (revision !== selectionRevision) return;
+      if (selectionComplete(snapshot)) setCheckoutReady(true, 'تم حفظ بيانات الشحن ✓');
+      else setCheckoutReady(false, 'لازم تختار المحافظة والمنطقة قبل الدفع');
+    }, function() {
+      if (revision !== selectionRevision) return;
+      setCheckoutReady(false, 'تعذر حفظ بيانات الشحن. تأكد من الإنترنت وحدّث الصفحة ثم حاول مرة أخرى.');
+    });
+  }
+  function zoneById(id) {
+    return locations.find(function(zone) { return String(zone.id) === String(id); });
+  }
+  function selectedZone() { return zoneById(govSel.value); }
+  function selectedArea(zone, id) {
+    return zone ? zone.subzones.find(function(area) { return String(area.id) === String(id); }) : null;
+  }
+  function renderGovernorates() {
+    govSel.innerHTML = '';
+    govSel.appendChild(opt('', 'اختار المحافظة', !sel.gid));
+    locations.forEach(function(zone) {
+      govSel.appendChild(opt(String(zone.id), zone.name, String(zone.id) === String(sel.gid)));
+    });
+  }
+  function renderAreas() {
+    var zone = selectedZone();
+    areaSel.innerHTML = '';
+    areaSel.disabled = !zone;
+    areaSel.appendChild(opt('', zone ? 'اختار المنطقة' : 'اختار المحافظة الأول', !sel.aid));
+    if (!zone) return;
+    zone.subzones.forEach(function(area) {
+      areaSel.appendChild(opt(String(area.id), area.name, String(area.id) === String(sel.aid)));
+    });
+  }
+  function restoreValidSelection(attributes) {
+    var zone = zoneById(attributes['Telegraph Governorate ID'] || '');
+    var area = zone ? selectedArea(zone, attributes['Telegraph Area ID'] || '') : null;
+    sel.gid = zone ? String(zone.id) : '';
+    sel.g = zone ? zone.name : '';
+    sel.aid = area ? String(area.id) : '';
+    sel.a = area ? area.name : '';
+  }
+  function locationsFromPayload(payload, label) {
+    var valid = ((payload && payload.locations) || []).filter(function(zone) {
+      return zone && Array.isArray(zone.subzones) && zone.subzones.length > 0;
+    });
+    if (!valid.length) throw new Error(label + ' returned no valid delivery zones');
+    return valid;
+  }
+  function loadLocationSource(sourceUrl, timeoutMs, label) {
+    return fetchJsonWithTimeout(sourceUrl, timeoutMs, label).then(function(payload) {
+      return locationsFromPayload(payload, label);
+    });
+  }
+  function loadLocations() {
+    return loadLocationSource(url, locationsLoadTimeoutMs, 'Locations asset').catch(function() {
+      return loadLocationSource(fallbackUrl, fallbackLoadTimeoutMs, 'Vercel locations fallback');
+    });
+  }
+  function attributesMatchSelection(attributes, snapshot) {
+    return String(attributes['Telegraph Governorate ID'] || '') === String(snapshot.gid) &&
+      String(attributes['Telegraph Governorate'] || '') === String(snapshot.g) &&
+      String(attributes['Telegraph Area ID'] || '') === String(snapshot.aid) &&
+      String(attributes['Telegraph Area'] || '') === String(snapshot.a);
+  }
+  function canonicalizeStoredSelection(snapshot) {
+    var task = saveQueue.catch(function() {}).then(function() {
+      return saveSnapshot(snapshot);
+    });
+    saveQueue = task.catch(function() {});
+  }
+  function nudgeToPicker() {
+    root.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    var target = sel.gid ? areaSel : govSel;
+    if (target && typeof target.focus === 'function') target.focus({ preventScroll: true });
+  }
+
+  // Start fail-closed. Valid stored attributes are restored and unlocked only
+  // after they are checked against the current locations asset.
+  setCheckoutReady(false, 'جاري التحقق من بيانات الشحن...');
+
+  // Cart attributes are already available in Liquid on this server-rendered
+  // page. Avoid a second /cart.js request becoming another checkout blocker.
+  loadLocations().then(function(loadedLocations) {
+    locations = loadedLocations;
+
+    var storedAttributes = initialCartAttributes || {};
+    restoreValidSelection(storedAttributes);
+    renderGovernorates();
+    renderAreas();
+
+    govSel.addEventListener('change', function() {
+      var zone = selectedZone();
+      sel.gid = zone ? String(zone.id) : '';
+      sel.g = zone ? zone.name : '';
+      sel.aid = '';
+      sel.a = '';
+      renderAreas();
+      queueSave();
+    });
+    areaSel.addEventListener('change', function() {
+      var zone = selectedZone();
+      var area = selectedArea(zone, areaSel.value);
+      sel.aid = area ? String(area.id) : '';
+      sel.a = area ? area.name : '';
+      queueSave();
+    });
+
+    // IDs are the server-side checkout contract. If they are valid members of
+    // the current dataset, do not make a buyer wait on an unnecessary write.
+    // Stale display names are repaired in the serialized queue in the background.
+    var restored = snapshotSelection();
+    if (selectionComplete(restored)) {
+      setCheckoutReady(true, 'تم حفظ بيانات الشحن ✓');
+      if (!attributesMatchSelection(storedAttributes, restored)) canonicalizeStoredSelection(restored);
+    } else {
+      setCheckoutReady(false, 'لازم تختار المحافظة والمنطقة قبل الدفع');
+    }
+  }).catch(function() {
+    setCheckoutReady(false, 'تعذر تحميل بيانات الشحن. حدّث الصفحة وحاول مرة أخرى قبل الدفع.');
+  });
+
+  // Cart-page guard: cover the main button, dynamically rendered drawer links,
+  // direct /checkout links, and checkout form submissions while locked.
+  document.addEventListener('click', function(e){
+    if (checkoutReady || !checkoutTriggerFrom(e.target)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    nudgeToPicker();
+  }, true);
+  document.addEventListener('submit', function(e) {
+    if (checkoutReady) return;
+    var form = e.target;
+    if (!form || typeof form.getAttribute !== 'function') return;
+    var submitter = e.submitter || document.activeElement;
+    var goesToCheckout = pathIsCheckout(form.getAttribute('action')) ||
+      pathIsCheckout(submitter && submitter.getAttribute ? submitter.getAttribute('formaction') : '') ||
+      isCheckoutTrigger(submitter);
+    if (!goesToCheckout) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    nudgeToPicker();
+  }, true);
+
+  if ('MutationObserver' in window) {
+    new MutationObserver(function() {
+      if (!checkoutReady) syncCheckoutTriggers();
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+})();
+</script>
+
+{% schema %}
+{
+  "name": "Cart Page",
+  "settings": [
+    {
+      "type": "header",
+      "content": "Content"
+    },
+    {
+      "type": "text",
+      "id": "title",
+      "label": "Page title",
+      "default": "Your Cart"
+    },
+    {
+      "type": "text",
+      "id": "checkout_text",
+      "label": "Checkout button text",
+      "default": "Checkout"
+    },
+    {
+      "type": "color",
+      "id": "checkout_bg",
+      "label": "Checkout button color"
+    },
+    {
+      "type": "text",
+      "id": "empty_text",
+      "label": "Empty cart message",
+      "default": "Your cart is empty"
+    },
+    {
+      "type": "text",
+      "id": "empty_cta",
+      "label": "Empty cart button text",
+      "default": "Continue Shopping"
+    },
+    {
+      "type": "header",
+      "content": "Free Shipping Bar"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_shipping_bar",
+      "label": "Show free shipping progress bar",
+      "default": true
+    },
+    {
+      "type": "range",
+      "id": "free_shipping_threshold",
+      "min": 0,
+      "max": 2000,
+      "step": 50,
+      "unit": "EGP",
+      "label": "Free shipping threshold",
+      "default": 1500
+    },
+    {
+      "type": "header",
+      "content": "Continue Shopping"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_continue_shopping",
+      "label": "Show continue shopping link",
+      "default": true
+    },
+    {
+      "type": "text",
+      "id": "continue_text",
+      "label": "Continue text",
+      "default": "Continue Shopping"
+    },
+    {
+      "type": "url",
+      "id": "continue_link",
+      "label": "Continue link"
+    },
+    {
+      "type": "header",
+      "content": "Style"
+    },
+    {
+      "type": "color",
+      "id": "title_color",
+      "label": "Title color"
+    },
+    {
+      "type": "range",
+      "id": "max_width",
+      "min": 600,
+      "max": 1200,
+      "step": 50,
+      "unit": "px",
+      "label": "Max width",
+      "default": 800
+    },
+    {
+      "type": "range",
+      "id": "padding_top",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "unit": "px",
+      "label": "Padding top",
+      "default": 40
+    },
+    {
+      "type": "range",
+      "id": "padding_bottom",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "unit": "px",
+      "label": "Padding bottom",
+      "default": 40
+    }
+  ],
+  "presets": [{ "name": "Cart Page" }]
+}
+{% endschema %}
