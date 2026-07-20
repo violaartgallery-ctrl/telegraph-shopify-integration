@@ -1,6 +1,7 @@
 import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { shipmentRepository } from '../services/shipmentRepository.js';
+import { requestShopifyAdmin } from '../shopify/shopifyAdminGraphql.js';
 import type { ShopifyLineItem, ShopifyOrder } from '../types/shopify.js';
 import { OdooClient, type OdooRecord } from './odooClient.js';
 
@@ -242,6 +243,8 @@ const sleep = async (ms: number): Promise<void> =>
   await new Promise((resolve) => setTimeout(resolve, ms));
 
 export class OdooSyncService {
+  private readonly shopifyVariantSkuCache = new Map<string, string | null>();
+
   constructor(private readonly odooClient: OdooClient) {}
 
   private assertEnabled(): void {
@@ -273,7 +276,7 @@ export class OdooSyncService {
     this.assertEnabled();
     const products = [];
     for (const line of activeLineItems(order)) {
-      const sku = line.sku?.trim();
+      const sku = await this.resolveShopifyLineSku(line);
       if (!sku) {
         products.push({ title: line.title, sku, ready: false, reason: 'missing-shopify-sku' });
         continue;
@@ -345,7 +348,12 @@ export class OdooSyncService {
       return { id: existingSaleOrder.id, name: existingSaleOrder.name, created: false };
     }
 
-    const claimed = await shipmentRepository.claimOdooSalesOrderCreation(String(order.id));
+    // The V7 queue already atomically moved this record to odoo-so-creating.
+    // Claiming again through the legacy helper changes it to
+    // sales-order-creating and can orphan it if Vercel stops mid-call.
+    const claimed = options.skipDbStatusUpdate
+      ? true
+      : await shipmentRepository.claimOdooSalesOrderCreation(String(order.id));
     if (!claimed) {
       const createdByParallelRun = await this.waitForParallelSaleOrderCreation(String(order.id), order);
       if (createdByParallelRun) {
@@ -597,9 +605,15 @@ export class OdooSyncService {
     const [existingBill] = await this.odooClient.searchRead<InvoiceRecord>(
       'account.move',
       [['move_type', '=', 'in_invoice'], ['ref', '=', reference]],
-      ['name', 'state', 'payment_state', 'amount_residual'],
+      ['name', 'state', 'payment_state', 'amount_total', 'amount_residual'],
       { limit: 1, order: 'id desc' }
     );
+    if (existingBill && Math.abs(Number(existingBill.amount_total ?? 0) - returnCharge) > 0.01) {
+      throw new Error(
+        `Existing Odoo return bill ${existingBill.name ?? existingBill.id} amount ` +
+        `${Number(existingBill.amount_total ?? 0)} does not match Telegraph charge ${returnCharge}`
+      );
+    }
     const bill = existingBill ?? await this.createReturnShippingBill(reference, returnCharge);
     if (bill.state === 'draft') {
       await this.odooClient.call('account.move', 'action_post', [[bill.id]]);
@@ -677,6 +691,39 @@ export class OdooSyncService {
       throw new Error(`Multiple Odoo products found for SKU ${sku}`);
     }
     return products[0];
+  }
+
+  /**
+   * Historical Shopify order JSON keeps the SKU value from checkout time. If a
+   * variant was fixed later, old orders still contain `sku: null`. Resolve the
+   * current variant SKU by its immutable variant id before giving up; no title
+   * or colour guessing is ever used.
+   */
+  private async resolveShopifyLineSku(line: ShopifyLineItem): Promise<string | undefined> {
+    const orderSnapshotSku = line.sku?.trim();
+    if (orderSnapshotSku) return orderSnapshotSku;
+    if (!line.variant_id) return undefined;
+
+    const variantId = String(line.variant_id);
+    if (this.shopifyVariantSkuCache.has(variantId)) {
+      return this.shopifyVariantSkuCache.get(variantId) ?? undefined;
+    }
+
+    const response = await requestShopifyAdmin<{
+      productVariant: { sku?: string | null; inventoryItem?: { sku?: string | null } | null } | null;
+    }>(`
+      query ResolveVariantSku($id: ID!) {
+        productVariant(id: $id) {
+          sku
+          inventoryItem { sku }
+        }
+      }
+    `, { id: `gid://shopify/ProductVariant/${variantId}` });
+    const sku = response.productVariant?.sku?.trim()
+      || response.productVariant?.inventoryItem?.sku?.trim()
+      || null;
+    this.shopifyVariantSkuCache.set(variantId, sku);
+    return sku ?? undefined;
   }
 
   private async getSaleOrderForOperations(saleOrderId: number): Promise<OdooRecord & { name?: string; picking_ids?: number[]; mrp_production_ids?: number[] }> {
@@ -871,7 +918,7 @@ export class OdooSyncService {
   private async buildSaleOrderLines(order: ShopifyOrder): Promise<Array<[number, number, Record<string, unknown>]>> {
     const lines = [];
     for (const line of activeLineItems(order)) {
-      const sku = line.sku?.trim();
+      const sku = await this.resolveShopifyLineSku(line);
       if (!sku) {
         throw new Error(`Shopify line "${line.title}" has no SKU`);
       }

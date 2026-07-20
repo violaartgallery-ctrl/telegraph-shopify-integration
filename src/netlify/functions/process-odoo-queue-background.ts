@@ -1,12 +1,11 @@
 /**
- * Netlify Background Function — runs up to 15 minutes.
- * Triggered by the lightweight scheduled `process-odoo-queue` function every
- * 30 minutes (and on-demand by the local test script).
+ * Checkpointed Odoo queue worker shared by Vercel, Netlify compatibility, and
+ * the local recovery script. Each invocation is intentionally short; the
+ * scheduler calls it again while `hasMore` is true.
  *
- * Drains the ENTIRE Odoo queue in one wake instead of one order per run. This
- * removes the old 1-order-per-run ceiling (which capped throughput at ~16–32
- * orders/day) so 30–80 orders/day is handled comfortably, while keeping Neon
- * compute woken only once per 30-min tick.
+ * The previous 13-minute drain was awaited by a Vercel function that can only
+ * live for 5 minutes, so GitHub always timed out at 280 seconds under load.
+ * Short idempotent checkpoints avoid that hard cut while preserving throughput.
  *
  * Stages per order (one stage advanced per pass; a record re-appears in the
  * next fetch for its next stage, so the loop carries each order through all 3):
@@ -22,11 +21,9 @@ import { shipmentRepository } from '../../services/shipmentRepository.js';
 import { logger } from '../../lib/logger.js';
 import type { ShopifyOrder } from '../../types/shopify.js';
 
-// Fetch a small batch per pass; the outer loop keeps fetching until the queue is
-// empty or the time budget runs out. Small batches keep each DB read cheap.
-const BATCH_SIZE = 10;
-// 13 min — comfortably inside Netlify's 15-min background-function limit.
-const BUDGET_MS = 13 * 60 * 1000;
+const DEFAULT_BATCH_SIZE = 5;
+const DEFAULT_BUDGET_MS = 75_000;
+const DEFAULT_MAX_STEPS = 15;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,9 +41,15 @@ interface LambdaResult {
   body: string;
 }
 
+export interface OdooQueueDrainOptions {
+  batchSize?: number;
+  budgetMs?: number;
+  maxSteps?: number;
+}
+
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
-export const handler = async (): Promise<LambdaResult> => {
+export const handler = async (options: OdooQueueDrainOptions = {}): Promise<LambdaResult> => {
   const { odooSyncService } = createAppServices();
   if (!odooSyncService) {
     logger.warn('process-odoo-queue-background: Odoo not configured, skipping');
@@ -54,6 +57,9 @@ export const handler = async (): Promise<LambdaResult> => {
   }
 
   const startTime = Date.now();
+  const batchSize = Math.max(1, Math.min(options.batchSize ?? DEFAULT_BATCH_SIZE, 10));
+  const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? DEFAULT_BUDGET_MS, 120_000));
+  const maxSteps = Math.max(1, Math.min(options.maxSteps ?? DEFAULT_MAX_STEPS, 30));
   const results: StageResult[] = [];
   let budgetHit = false;
 
@@ -74,17 +80,19 @@ export const handler = async (): Promise<LambdaResult> => {
     // get an odooRetryAt in the future, so they drop out of the queue and the
     // loop terminates instead of spinning.
     while (true) {
-      if (Date.now() - startTime >= BUDGET_MS) {
+      if (Date.now() - startTime >= budgetMs || results.length >= maxSteps) {
         budgetHit = true;
         logger.info('process-odoo-queue-background: budget reached, remaining records retry next tick');
         break;
       }
 
-      const queue = await shipmentRepository.findPendingOdooQueue(BATCH_SIZE);
+      const queue = await shipmentRepository.findPendingOdooQueue(
+        Math.min(batchSize, maxSteps - results.length)
+      );
       if (queue.length === 0) break;
 
       for (const record of queue) {
-        if (Date.now() - startTime >= BUDGET_MS) {
+        if (Date.now() - startTime >= budgetMs || results.length >= maxSteps) {
           budgetHit = true;
           break;
         }
@@ -93,10 +101,19 @@ export const handler = async (): Promise<LambdaResult> => {
       if (budgetHit) break;
     }
 
-    logger.info('process-odoo-queue-background: done', { processed: results.length, budgetHit });
+    const remaining = await shipmentRepository.countPendingOdooQueue();
+    logger.info('process-odoo-queue-background: done', { processed: results.length, budgetHit, remaining });
     return {
       statusCode: 200,
-      body: JSON.stringify({ ok: true, processed: results.length, budgetHit, results })
+      body: JSON.stringify({
+        ok: true,
+        processed: results.length,
+        budgetHit,
+        remaining,
+        hasMore: remaining > 0,
+        elapsedMs: Date.now() - startTime,
+        results
+      })
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

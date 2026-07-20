@@ -1,73 +1,145 @@
 name: vercel-scheduled-sync
 
-# Free 30-min timer that replaces Netlify scheduled functions. Pings the Vercel
-# /ops endpoints (idempotent) — drain Odoo queue, sync shipment status → invoices
-# + mark paid, and the collections safety sweep.
+# GitHub documents that schedules at :00/:30 are the most likely to be delayed
+# or dropped. Keep the 30-minute cadence but move it away from peak minutes.
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '7,37 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: viola-production-financial-sync
+  cancel-in-progress: false
+
 jobs:
-  sync:
+  status-sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BASE: https://viola-telegraph-integration.vercel.app
+      OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
+      - name: Validate scheduler secret
+        run: test -n "$OPS_SECRET"
+
       - name: Drain Meta Delivered outbox
-        env:
-          OPS_SECRET: ${{ secrets.OPS_SECRET }}
         run: |
           set -euo pipefail
-          BASE=https://viola-telegraph-integration.vercel.app
-          test -n "$OPS_SECRET"
-          curl --fail-with-body --silent --show-error --max-time 280 \
+          curl --fail-with-body --silent --show-error --max-time 110 \
             -X POST -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/meta-delivered/drain"
-
-      - name: Process Odoo queue
-        if: always()
-        env:
-          OPS_SECRET: ${{ secrets.OPS_SECRET }}
-        run: |
-          test -n "$OPS_SECRET"
-          curl --fail-with-body --silent --show-error --max-time 280 \
-            -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration.vercel.app/ops/process-odoo-queue"
 
       - name: Sync open shipments
         if: always()
-        env:
-          OPS_SECRET: ${{ secrets.OPS_SECRET }}
         run: |
-          test -n "$OPS_SECRET"
-          curl --fail-with-body --silent --show-error --max-time 280 \
-            -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration.vercel.app/ops/sync-open-shipments"
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error --max-time 110 \
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-open-shipments"
 
       - name: Sync collection reports
         if: always()
-        env:
-          OPS_SECRET: ${{ secrets.OPS_SECRET }}
         run: |
-          test -n "$OPS_SECRET"
-          curl --fail-with-body --silent --show-error --max-time 280 \
-            -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration.vercel.app/ops/sync-collections"
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error --max-time 110 \
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-collections"
+
+      - name: Discover all returned shipments by exact code
+        id: discover_returns
+        if: always()
+        run: |
+          set -euo pipefail
+          page=1
+          complete=false
+          for _ in $(seq 1 50); do
+            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/sync-returns?apply=1&page=$page&pages=1")
+            echo "$response" | jq -c '{scanned,carrierReturns,exactMatches,queued,alreadyComplete,notInDb,ambiguous,failed,nextPage,scanComplete}'
+            if [ "$(echo "$response" | jq -r '.scanComplete')" = "true" ]; then
+              complete=true
+              break
+            fi
+            page=$(echo "$response" | jq -er '.nextPage')
+          done
+          test "$complete" = "true"
+
+      - name: Process return actions in resumable batches
+        id: process_returns
+        if: always()
+        run: |
+          set -euo pipefail
+          drained=false
+          for _ in $(seq 1 65); do
+            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/process-return-queue?apply=1&limit=4")
+            echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,elapsedMs}'
+            if [ "$(echo "$response" | jq -r '.hasMore')" != "true" ]; then drained=true; break; fi
+            sleep 2
+          done
+          test "$drained" = "true"
+
+      - name: Process Shopify payment actions in resumable batches
+        if: ${{ always() && steps.discover_returns.outcome == 'success' && steps.process_returns.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          drained=false
+          for _ in $(seq 1 30); do
+            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/process-shopify-payment-queue?apply=1&limit=6")
+            echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,elapsedMs}'
+            if [ "$(echo "$response" | jq -r '.hasMore')" != "true" ]; then drained=true; break; fi
+            sleep 2
+          done
+          test "$drained" = "true"
 
       - name: Resume interrupted production batches
         if: always()
-        env:
-          OPS_SECRET: ${{ secrets.OPS_SECRET }}
         run: |
-          test -n "$OPS_SECRET"
+          set -euo pipefail
           curl --fail-with-body --silent --show-error --max-time 60 \
-            -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration.vercel.app/ops/resume-production-jobs"
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/resume-production-jobs"
 
-      - name: Check production safety layers
-        if: always()
-        env:
-          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+  odoo-queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASE: https://viola-telegraph-integration.vercel.app
+      OPS_SECRET: ${{ secrets.OPS_SECRET }}
+    steps:
+      - name: Drain Odoo in short checkpoints
         run: |
+          set -euo pipefail
+          test -n "$OPS_SECRET"
+          drained=false
+          for _ in $(seq 1 25); do
+            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/process-odoo-queue")
+            echo "$response" | jq -c '{processed,budgetHit,remaining,hasMore,elapsedMs}'
+            if [ "$(echo "$response" | jq -r '.hasMore')" != "true" ]; then drained=true; break; fi
+            sleep 2
+          done
+          test "$drained" = "true"
+
+  health:
+    if: always()
+    needs: [status-sync, odoo-queue]
+    runs-on: ubuntu-latest
+    env:
+      BASE: https://viola-telegraph-integration.vercel.app
+      OPS_SECRET: ${{ secrets.OPS_SECRET }}
+    steps:
+      - name: Check production safety layers
+        run: |
+          set -euo pipefail
           test -n "$OPS_SECRET"
           curl --fail-with-body --silent --show-error --max-time 120 \
-            -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration.vercel.app/ops/production-health"
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/production-health"
+
+      - name: Check financial queue safety
+        if: always()
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error --max-time 60 \
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/financial-health"

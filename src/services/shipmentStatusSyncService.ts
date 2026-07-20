@@ -1,4 +1,9 @@
-import { AccurateClient, type AccuratePaymentShipmentEntry } from '../accurate/accurateClient.js';
+import { createHash } from 'node:crypto';
+import {
+  AccurateClient,
+  type AccuratePaymentShipmentEntry,
+  type AccurateShipmentSummary
+} from '../accurate/accurateClient.js';
 import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { UnauthorizedError } from '../lib/errors.js';
@@ -6,11 +11,41 @@ import { shopifyStatusSyncClient } from '../shopify/shopifyStatusSyncClient.js';
 import { projectAccurateStatusToShopify } from './accurateStatusMapper.js';
 import { failedPayloadService } from './failedPayloadService.js';
 import { shipmentRepository } from './shipmentRepository.js';
-import { OdooSyncService } from '../odoo/odooSyncService.js';
+import { calculateTelegraphReturnCharge, OdooSyncService } from '../odoo/odooSyncService.js';
 import type { AccurateSnapshotData } from './shipmentRepository.js';
 import type { MetaDeliveryService, MetaDeliverySource } from '../meta/metaDeliveryService.js';
 
 const RETURNED_STATUS_CODES = new Set(['RTRN', 'RTS', 'RJCT']);
+
+const normalizedNumber = (value?: number | null): string | null => {
+  if (value === undefined || value === null || !Number.isFinite(Number(value))) return null;
+  return Number(value).toFixed(2);
+};
+
+const fingerprint = (parts: unknown[]): string =>
+  createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+
+export const buildReturnSyncFingerprint = (shipment: Pick<AccurateShipmentSummary,
+  'code' | 'deliveredOrReturnedDate' | 'paidToCustomer' | 'customerDue' |
+  'returnFees' | 'returningDueFees' | 'returnedValue' | 'status' | 'returnStatus'
+>): string => fingerprint([
+  'return-v1',
+  shipment.code,
+  shipment.status?.code?.trim().toUpperCase() ?? null,
+  shipment.returnStatus?.code?.trim().toUpperCase() ?? null,
+  shipment.deliveredOrReturnedDate ?? null,
+  Boolean(shipment.paidToCustomer),
+  normalizedNumber(shipment.customerDue),
+  normalizedNumber(shipment.returnFees),
+  normalizedNumber(shipment.returningDueFees),
+  normalizedNumber(shipment.returnedValue)
+]);
+
+export const buildShopifyPaymentFingerprint = (collectedAmount: number): string =>
+  fingerprint(['shopify-payment-v1', normalizedNumber(collectedAmount)]);
+
+const sleep = async (ms: number): Promise<void> =>
+  await new Promise((resolve) => setTimeout(resolve, ms));
 
 const actualShipmentDates = (shipment: {
   deliveredOrReturnedDate?: string | null;
@@ -86,12 +121,20 @@ export class ShipmentStatusSyncService {
    * Time-budgeted for Netlify; processes up to `maxActions` per run. Returns a
    * summary. Designed to run on a cron — keeps collections recorded going forward.
    */
-  async syncCollectionsFromReports(opts: { maxActions?: number; budgetMs?: number } = {}): Promise<{ scanned: number; recorded: number; shopifyPaid: number; skipped: number; notInDb: number; failed: number }> {
+  async syncCollectionsFromReports(opts: { maxActions?: number; budgetMs?: number } = {}): Promise<{
+    scanned: number;
+    recorded: number;
+    shopifyPaid: number;
+    shopifyQueued: number;
+    skipped: number;
+    notInDb: number;
+    failed: number;
+  }> {
     const maxActions = opts.maxActions ?? 6;
     const budgetMs = opts.budgetMs ?? 23_000;
     const start = Date.now();
     const DELIVERED = new Set(['DTR']);
-    const summary = { scanned: 0, recorded: 0, shopifyPaid: 0, skipped: 0, notInDb: 0, failed: 0 };
+    const summary = { scanned: 0, recorded: 0, shopifyPaid: 0, shopifyQueued: 0, skipped: 0, notInDb: 0, failed: 0 };
     let page = 1;
     let actions = 0;
     while (actions < maxActions && Date.now() - start < budgetMs) {
@@ -147,6 +190,16 @@ export class ShipmentStatusSyncService {
             customerDue: Number(sh.customerDue ?? 0),
             ...actualShipmentDates(sh)
           }, 'accurate-report');
+          await shipmentRepository.supersedeReturnSync(
+            rec.id,
+            'Superseded because Telegraph currently reports a collected delivery'
+          );
+          if (await shipmentRepository.queueShopifyPaymentSync(
+            rec.id,
+            buildShopifyPaymentFingerprint(Number(sh.collectedAmount ?? 0))
+          )) {
+            summary.shopifyQueued++;
+          }
           // Meta must observe carrier truth even when accounting already finished.
           if (rec.odooInvoiceId && (rec.odooPaymentId || rec.odooSalePaymentId)) {
             summary.skipped++;
@@ -159,10 +212,6 @@ export class ShipmentStatusSyncService {
           await this.odooSyncService.syncCollectedShipment(rec.id);
           summary.recorded++;
           actions++;
-          try {
-            await this.recordShopifyPayment({ id: rec.id, shopifyOrderId: rec.shopifyOrderId }, Number(sh.collectedAmount ?? 0));
-            summary.shopifyPaid++;
-          } catch { /* shopify discount scope etc. — Odoo already recorded */ }
         } catch (e) {
           summary.failed++;
           logger.error('syncCollectionsFromReports: failed', { code, reason: e instanceof Error ? e.message : String(e) });
@@ -250,6 +299,26 @@ export class ShipmentStatusSyncService {
       ...actualShipmentDates(shipment)
     }, 'accurate-status');
 
+    const isReturn = projection.collectionStatus === 'returned' ||
+      projection.collectionStatus === 'returned-settled';
+    if (isReturn) {
+      await shipmentRepository.supersedeShopifyPaymentSync(
+        record.id,
+        'Superseded because Telegraph now reports an explicit return'
+      );
+    } else {
+      await shipmentRepository.supersedeReturnSync(
+        record.id,
+        `Superseded because Telegraph now reports ${projection.collectionStatus}`
+      );
+      if (projection.collectionStatus !== 'collected') {
+        await shipmentRepository.supersedeShopifyPaymentSync(
+          record.id,
+          `Superseded because Telegraph now reports ${projection.collectionStatus}`
+        );
+      }
+    }
+
     await shopifyStatusSyncClient.syncShipmentState({
       orderId: record.shopifyOrderId,
       shipmentStatus: projection.shipmentStatus,
@@ -314,24 +383,14 @@ export class ShipmentStatusSyncService {
     }
 
     if (projection.collectionStatus === 'collected') {
-      await this.recordShopifyPayment(record, Number(shipment.collectedAmount ?? 0));
+      await shipmentRepository.queueShopifyPaymentSync(
+        record.id,
+        buildShopifyPaymentFingerprint(Number(shipment.collectedAmount ?? 0))
+      );
     }
 
-    if (projection.collectionStatus === 'returned' || projection.collectionStatus === 'returned-settled') {
-      if (this.odooSyncService) {
-        try {
-          await this.odooSyncService.syncReturnedShipmentCharge(record.id);
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : 'Unknown Odoo return charge sync error';
-          logger.error('Failed to sync returned shipment charge to Odoo', {
-            recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
-          });
-          await failedPayloadService.save({
-            source: 'odoo-return-charge-sync', externalId: record.shopifyOrderId, reason, payload: record
-          });
-        }
-      }
-      await this.cancelShopifyOrderForReturn(record, projection.collectionStatus);
+    if (isReturn) {
+      await shipmentRepository.queueReturnSync(record.id, buildReturnSyncFingerprint(shipment));
     }
 
     if (projection.collectionStatus === 'delivered-not-collected') {
@@ -339,91 +398,37 @@ export class ShipmentStatusSyncService {
     }
   }
 
-  /**
-   * Phase 1 + discount-aware Shopify payment recording.
-   * - Compares the actual collected amount with the Shopify order total.
-   * - Equal (or higher) → straight SALE transaction for the total.
-   * - Lower → add a line-item discount for the gap, then SALE for collected.
-   * - Idempotent: fetchOrderPaymentState skips already-paid orders.
-   */
-  private async recordShopifyPayment(record: { id: number; shopifyOrderId: string }, collectedAmount: number): Promise<void> {
-    try {
-      const first = await shopifyStatusSyncClient.recordCustomerPayment({
-        orderId: record.shopifyOrderId,
-        amount: collectedAmount
-      });
-      if (first.skipped) {
-        if (first.reason === 'needs-discount' && first.needsDiscountFor && first.total) {
-          // Phase 1 (Case B): collected < shopifyTotal → apply discount + pay collected
-          try {
-            await shopifyStatusSyncClient.applyOrderDiscountAndPay({
-              orderId: record.shopifyOrderId,
-              discountAmount: first.needsDiscountFor,
-              paymentAmount: collectedAmount,
-              discountDescription: 'Telegraph collection adjustment'
-            });
-            logger.info('Shopify discount applied + payment recorded', {
-              shopifyOrderId: record.shopifyOrderId,
-              total: first.total,
-              discount: first.needsDiscountFor,
-              paid: collectedAmount
-            });
-          } catch (discountError) {
-            const reason = discountError instanceof Error ? discountError.message : 'Unknown discount error';
-            logger.error('Failed to apply Shopify discount before payment', {
-              recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
-            });
-            await failedPayloadService.save({
-              source: 'shopify-mark-as-paid', externalId: record.shopifyOrderId, reason, payload: record
-            });
-          }
-        } else {
-          logger.info('Shopify payment skipped', { shopifyOrderId: record.shopifyOrderId, reason: first.reason });
-        }
-      } else {
-        logger.info('Shopify payment recorded', {
-          shopifyOrderId: record.shopifyOrderId, transactionId: first.transactionId, amount: collectedAmount
-        });
-      }
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : 'Unknown Shopify payment recording error';
-      logger.error('Failed to record Shopify customer payment', {
-        recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
-      });
-      await failedPayloadService.save({
-        source: 'shopify-mark-as-paid', externalId: record.shopifyOrderId, reason, payload: record
-      });
-    }
-  }
-
-  /** Phase 2: cancel a Shopify order when Telegraph returns it. Idempotent. */
-  private async cancelShopifyOrderForReturn(
+  /** Execute one idempotent Shopify payment action and let the durable queue own retries. */
+  private async performShopifyPayment(
     record: { id: number; shopifyOrderId: string },
-    collectionStatus: string
-  ): Promise<void> {
-    try {
-      const result = await shopifyStatusSyncClient.cancelOrder({
-        orderId: record.shopifyOrderId,
-        reason: 'OTHER',
-        refund: false,
-        restock: true,
-        notifyCustomer: false,
-        staffNote: 'Telegraph returned shipment (' + collectionStatus + ')'
-      });
-      if (result.skipped) {
-        logger.info('Shopify cancel skipped', { shopifyOrderId: record.shopifyOrderId, reason: result.reason });
-      } else {
-        logger.info('Shopify order cancelled for return', { shopifyOrderId: record.shopifyOrderId, collectionStatus });
-      }
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : 'Unknown Shopify cancel error';
-      logger.error('Failed to cancel Shopify order for return', {
-        recordId: record.id, shopifyOrderId: record.shopifyOrderId, reason
-      });
-      await failedPayloadService.save({
-        source: 'shopify-order-cancel', externalId: record.shopifyOrderId, reason, payload: record
-      });
+    collectedAmount: number
+  ): Promise<{ transactionId?: string; reason?: string }> {
+    const first = await shopifyStatusSyncClient.recordCustomerPayment({
+      orderId: record.shopifyOrderId,
+      amount: collectedAmount
+    });
+    if (!first.skipped) {
+      return { transactionId: first.transactionId };
     }
+    if (first.reason === 'needs-discount' && first.needsDiscountFor && first.total) {
+      const result = await shopifyStatusSyncClient.applyOrderDiscountAndPay({
+        orderId: record.shopifyOrderId,
+        discountAmount: first.needsDiscountFor,
+        paymentAmount: collectedAmount,
+        discountDescription: 'Telegraph collection adjustment'
+      });
+      logger.info('Shopify discount applied + payment recorded', {
+        shopifyOrderId: record.shopifyOrderId,
+        total: first.total,
+        discount: first.needsDiscountFor,
+        paid: collectedAmount
+      });
+      return { transactionId: result.transactionId };
+    }
+    if (first.reason === 'already-paid' || first.reason === 'order-cancelled') {
+      return { reason: first.reason };
+    }
+    throw new Error(`Shopify payment was not recorded: ${first.reason ?? 'unknown reason'}`);
   }
 
   /** Phase 2: flag a delivered-but-not-collected order for human follow-up. */
@@ -469,31 +474,451 @@ export class ShipmentStatusSyncService {
       }
     }
 
-    try {
-      // For payment-entry-driven sync the actual collected amount lives on the DB record.
-      const dbRec = await shipmentRepository.findById(record.id);
-      const collectedAmount = Number(dbRec?.collectedAmount ?? 0);
-      if (collectedAmount > 0) {
-        await this.recordShopifyPayment({ id: record.id, shopifyOrderId: record.shopifyOrderId }, collectedAmount);
-        return;
-      }
-      logger.info('Shopify payment skipped from financials path (no collectedAmount)', {
-        shopifyOrderId: record.shopifyOrderId
-      });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : 'Unknown Shopify mark-as-paid error';
-      logger.error('Failed to mark Shopify order as paid from payment entry', {
-        recordId: record.id,
-        shopifyOrderId: record.shopifyOrderId,
-        reason
-      });
-      await failedPayloadService.save({
-        source: 'shopify-mark-as-paid',
-        externalId: record.shopifyOrderId,
-        reason,
-        payload: record
-      });
+    // For payment-entry-driven sync the actual collected amount lives on the DB
+    // record. Queue the Shopify side separately so a Shopify outage never rolls
+    // back or delays the Odoo accounting result.
+    const dbRec = await shipmentRepository.findById(record.id);
+    const collectedAmount = Number(dbRec?.collectedAmount ?? 0);
+    if (collectedAmount > 0) {
+      await shipmentRepository.supersedeReturnSync(
+        record.id,
+        'Superseded because an approved Telegraph collection was received'
+      );
+      await shipmentRepository.queueShopifyPaymentSync(
+        record.id,
+        buildShopifyPaymentFingerprint(collectedAmount)
+      );
+      return;
     }
+    logger.info('Shopify payment queue skipped from financials path (no collectedAmount)', {
+      shopifyOrderId: record.shopifyOrderId
+    });
+  }
+
+  /**
+   * Scan Telegraph report pages for explicit returns. Matching is deliberately
+   * by the exact shipment code stored in our DB; order-number/ref fallbacks are
+   * not allowed in a financial recovery path.
+   */
+  async discoverReturnedShipmentsFromReports(options: {
+    startPage?: number;
+    pages?: number;
+    first?: number;
+    budgetMs?: number;
+    apply?: boolean;
+  } = {}): Promise<{
+    apply: boolean;
+    scanned: number;
+    carrierReturns: number;
+    exactMatches: number;
+    needsSync: number;
+    queued: number;
+    alreadyComplete: number;
+    notInDb: number;
+    ambiguous: number;
+    failed: number;
+    nextPage: number | null;
+    lastPage: number;
+    scanComplete: boolean;
+    elapsedMs: number;
+  }> {
+    const apply = options.apply ?? false;
+    const startPage = Math.max(1, options.startPage ?? 1);
+    const pages = Math.max(1, Math.min(options.pages ?? 1, 3));
+    const first = Math.max(10, Math.min(options.first ?? 100, 100));
+    const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? 70_000, 100_000));
+    const startedAt = Date.now();
+    const summary = {
+      apply,
+      scanned: 0,
+      carrierReturns: 0,
+      exactMatches: 0,
+      needsSync: 0,
+      queued: 0,
+      alreadyComplete: 0,
+      notInDb: 0,
+      ambiguous: 0,
+      failed: 0,
+      nextPage: startPage as number | null,
+      lastPage: startPage,
+      scanComplete: false,
+      elapsedMs: 0
+    };
+
+    for (let offset = 0; offset < pages; offset += 1) {
+      if (offset > 0 && Date.now() - startedAt >= budgetMs) break;
+      const page = startPage + offset;
+      const result = await this.accurateClient.listShipments({}, first, page);
+      summary.lastPage = result.paginatorInfo.lastPage;
+      summary.scanned += result.data.length;
+      const returned = result.data.filter((shipment) => {
+        const statusCode = shipment.status?.code?.trim().toUpperCase() ?? '';
+        const returnStatusCode = shipment.returnStatus?.code?.trim().toUpperCase() ?? '';
+        return RETURNED_STATUS_CODES.has(statusCode) || RETURNED_STATUS_CODES.has(returnStatusCode);
+      });
+      summary.carrierReturns += returned.length;
+
+      const codes = [...new Set(returned.map((shipment) => shipment.code).filter(Boolean))];
+      const records = codes.length > 0 ? await shipmentRepository.findByShipmentCodes(codes) : [];
+      const byCode = new Map<string, typeof records>();
+      for (const record of records) {
+        if (!record.accurateShipmentCode) continue;
+        const matches = byCode.get(record.accurateShipmentCode) ?? [];
+        matches.push(record);
+        byCode.set(record.accurateShipmentCode, matches);
+      }
+
+      for (const shipment of returned) {
+        const matches = byCode.get(shipment.code) ?? [];
+        if (matches.length === 0) {
+          summary.notInDb++;
+          continue;
+        }
+        if (matches.length !== 1) {
+          summary.ambiguous++;
+          continue;
+        }
+        const record = matches[0]!;
+        summary.exactMatches++;
+        const projection = projectAccurateStatusToShopify({
+          statusCode: shipment.status?.code,
+          statusName: shipment.status?.name,
+          returnStatusCode: shipment.returnStatus?.code,
+          returnStatusName: shipment.returnStatus?.name,
+          collected: shipment.collected,
+          paidToCustomer: shipment.paidToCustomer,
+          cancelled: shipment.cancelled,
+          customerDue: shipment.customerDue
+        });
+        if (!['returned', 'returned-settled'].includes(projection.collectionStatus)) {
+          summary.failed++;
+          continue;
+        }
+        const returnFingerprint = buildReturnSyncFingerprint(shipment);
+        const needsSync =
+          !['returned', 'returned-settled'].includes(record.collectionStatus ?? '') ||
+          record.returnSyncStatus !== 'completed' ||
+          record.returnSyncFingerprint !== returnFingerprint;
+        if (!needsSync) {
+          summary.alreadyComplete++;
+          continue;
+        }
+        summary.needsSync++;
+        if (!apply) continue;
+
+        try {
+          await this.persistAccurateSnapshot(record.id, {
+            accurateStatus: projection.shipmentStatus,
+            accurateStatusCode: shipment.status?.code ?? null,
+            accurateReturnStatus: shipment.returnStatus?.name ?? shipment.returnStatus?.code ?? null,
+            accurateReturnStatusCode: shipment.returnStatus?.code ?? null,
+            accurateIsTerminal: true,
+            collectionStatus: projection.collectionStatus,
+            trackingUrl: shipment.trackingUrl,
+            collectedAmount: shipment.collectedAmount,
+            pendingCollectionAmount: shipment.pendingCollectionAmount,
+            returnedValue: shipment.returnedValue,
+            deliveryFees: shipment.deliveryFees,
+            returnFees: shipment.returnFees,
+            returningDueFees: shipment.returningDueFees,
+            customerDue: shipment.customerDue,
+            ...actualShipmentDates(shipment)
+          }, 'accurate-report');
+          await shipmentRepository.supersedeShopifyPaymentSync(
+            record.id,
+            'Superseded because Telegraph report discovery confirmed an explicit return'
+          );
+          if (await shipmentRepository.queueReturnSync(record.id, returnFingerprint)) {
+            summary.queued++;
+          }
+        } catch (error) {
+          summary.failed++;
+          await failedPayloadService.save({
+            source: 'accurate-return-discovery',
+            externalId: shipment.code,
+            reason: error instanceof Error ? error.message : String(error),
+            payload: { shipmentCode: shipment.code, recordId: record.id }
+          });
+        }
+      }
+
+      if (!result.paginatorInfo.hasMorePages) {
+        summary.nextPage = null;
+        summary.scanComplete = true;
+        break;
+      }
+      summary.nextPage = page + 1;
+    }
+
+    summary.elapsedMs = Date.now() - startedAt;
+    return summary;
+  }
+
+  /** Process claimed return actions. Odoo billing and Shopify cancellation are independently idempotent. */
+  async processReturnQueue(options: { limit?: number; budgetMs?: number; apply?: boolean } = {}): Promise<{
+    apply: boolean;
+    found: number;
+    processed: number;
+    skipped: number;
+    failed: number;
+    recovered: number;
+    remaining: number;
+    hasMore: boolean;
+    actions: Array<{ order: string; shipmentCode?: string | null; charge: number; status: string }>;
+    elapsedMs: number;
+  }> {
+    const apply = options.apply ?? false;
+    const limit = Math.max(1, Math.min(options.limit ?? 4, 10));
+    const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? 70_000, 100_000));
+    const startedAt = Date.now();
+    const recovered = apply ? await shipmentRepository.recoverStuckReturnSync(10) : 0;
+    const records = await shipmentRepository.findPendingReturnSync(limit);
+    let processed = 0;
+    let skipped = 0;
+    let failed = 0;
+    const actions: Array<{ order: string; shipmentCode?: string | null; charge: number; status: string }> = [];
+
+    for (const candidate of records) {
+      if (Date.now() - startedAt >= budgetMs) break;
+      const charge = calculateTelegraphReturnCharge(candidate);
+      const action = {
+        order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
+        shipmentCode: candidate.accurateShipmentCode,
+        charge,
+        status: apply ? 'pending' : 'preview'
+      };
+      actions.push(action);
+      if (!apply) continue;
+      if (!await shipmentRepository.claimReturnSync(candidate.id)) {
+        skipped++;
+        action.status = 'claimed-by-other';
+        continue;
+      }
+
+      const record = await shipmentRepository.findById(candidate.id);
+      if (!record || !['returned', 'returned-settled'].includes(record.collectionStatus ?? '')) {
+        await shipmentRepository.supersedeReturnSync(
+          candidate.id,
+          'Superseded because the record no longer has an explicit returned collection status'
+        );
+        skipped++;
+        action.status = 'superseded';
+        continue;
+      }
+
+      const errors: string[] = [];
+      const projection = projectAccurateStatusToShopify({
+        statusCode: record.accurateStatusCode,
+        statusName: record.accurateStatus,
+        returnStatusCode: record.accurateReturnStatusCode,
+        returnStatusName: record.accurateReturnStatus,
+        paidToCustomer: record.collectionStatus === 'returned-settled',
+        customerDue: record.customerDue
+      });
+
+      try {
+        await shopifyStatusSyncClient.syncShipmentState({
+          orderId: record.shopifyOrderId,
+          shipmentStatus: projection.shipmentStatus,
+          collectionStatus: record.collectionStatus!,
+          collectedAmount: record.collectedAmount,
+          returnedValue: record.returnedValue,
+          trackingUrl: record.trackingUrl,
+          tags: projection.tags,
+          syncSummary: buildStatusNote({
+            shipmentCode: record.accurateShipmentCode,
+            shipmentStatus: projection.shipmentStatus,
+            collectionStatus: record.collectionStatus!,
+            collectedAmount: record.collectedAmount,
+            pendingCollectionAmount: record.pendingCollectionAmount,
+            returnedValue: record.returnedValue,
+            deliveryFees: record.deliveryFees,
+            returnFees: record.returnFees,
+            returningDueFees: record.returningDueFees,
+            customerDue: record.customerDue,
+            trackingUrl: record.trackingUrl
+          })
+        });
+      } catch (error) {
+        errors.push(`Shopify status: ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      if (charge > 0) {
+        if (!this.odooSyncService) {
+          errors.push('Odoo return-charge service is unavailable');
+        } else {
+          try {
+            await this.odooSyncService.syncReturnedShipmentCharge(record.id);
+          } catch (error) {
+            errors.push(`Odoo return bill: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+
+      try {
+        await shopifyStatusSyncClient.cancelOrder({
+          orderId: record.shopifyOrderId,
+          reason: 'OTHER',
+          refund: false,
+          restock: true,
+          notifyCustomer: false,
+          staffNote: `Telegraph returned shipment (${record.collectionStatus})`
+        });
+        let state = await shopifyStatusSyncClient.fetchOrderPaymentState(record.shopifyOrderId);
+        for (const delay of [500, 1_500, 2_500]) {
+          if (state?.cancelledAt) break;
+          await sleep(delay);
+          state = await shopifyStatusSyncClient.fetchOrderPaymentState(record.shopifyOrderId);
+        }
+        if (!state?.cancelledAt) errors.push('Shopify cancellation was not confirmed');
+      } catch (error) {
+        errors.push(`Shopify cancel: ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      const after = await shipmentRepository.findById(record.id);
+      if (charge > 0 && !after?.odooReturnBillId) {
+        errors.push('Odoo return bill id was not persisted after billing');
+      }
+
+      if (errors.length > 0) {
+        const reason = errors.join(' | ');
+        await shipmentRepository.failReturnSync(record.id, reason);
+        await failedPayloadService.save({
+          source: 'return-sync-worker',
+          externalId: record.accurateShipmentCode ?? record.shopifyOrderId,
+          reason,
+          payload: { recordId: record.id, shopifyOrderName: record.shopifyOrderName, charge }
+        });
+        failed++;
+        action.status = 'retry-scheduled';
+      } else {
+        await shipmentRepository.completeReturnSync(record.id);
+        processed++;
+        action.status = 'completed';
+      }
+    }
+
+    const remaining = await shipmentRepository.countDueReturnSync();
+    return {
+      apply,
+      found: records.length,
+      processed,
+      skipped,
+      failed,
+      recovered,
+      remaining,
+      hasMore: remaining > 0,
+      actions,
+      elapsedMs: Date.now() - startedAt
+    };
+  }
+
+  async processShopifyPaymentQueue(options: { limit?: number; budgetMs?: number; apply?: boolean } = {}): Promise<{
+    apply: boolean;
+    found: number;
+    processed: number;
+    skipped: number;
+    failed: number;
+    recovered: number;
+    remaining: number;
+    hasMore: boolean;
+    actions: Array<{ order: string; amount: number; status: string }>;
+    elapsedMs: number;
+  }> {
+    const apply = options.apply ?? false;
+    const limit = Math.max(1, Math.min(options.limit ?? 6, 12));
+    const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? 70_000, 100_000));
+    const startedAt = Date.now();
+    const recovered = apply ? await shipmentRepository.recoverStuckShopifyPaymentSync(10) : 0;
+    const records = await shipmentRepository.findPendingShopifyPaymentSync(limit);
+    let processed = 0;
+    let skipped = 0;
+    let failed = 0;
+    const actions: Array<{ order: string; amount: number; status: string }> = [];
+
+    for (const candidate of records) {
+      if (Date.now() - startedAt >= budgetMs) break;
+      const amount = Number(candidate.collectedAmount ?? 0);
+      const action = {
+        order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
+        amount,
+        status: apply ? 'pending' : 'preview'
+      };
+      actions.push(action);
+      if (!apply) continue;
+      if (!await shipmentRepository.claimShopifyPaymentSync(candidate.id)) {
+        skipped++;
+        action.status = 'claimed-by-other';
+        continue;
+      }
+
+      const current = await shipmentRepository.findById(candidate.id);
+      const currentAmount = Number(current?.collectedAmount ?? 0);
+      const currentFingerprint = buildShopifyPaymentFingerprint(currentAmount);
+      const explicitReturn = RETURNED_STATUS_CODES.has(current?.accurateStatusCode?.trim().toUpperCase() ?? '') ||
+        RETURNED_STATUS_CODES.has(current?.accurateReturnStatusCode?.trim().toUpperCase() ?? '');
+      if (!current || current.collectionStatus !== 'collected' || currentAmount <= 0 || explicitReturn) {
+        await shipmentRepository.supersedeShopifyPaymentSync(
+          candidate.id,
+          'Superseded because the latest carrier snapshot is not a payable collection'
+        );
+        skipped++;
+        action.status = 'superseded';
+        continue;
+      }
+      if (current.shopifyPaymentFingerprint !== currentFingerprint) {
+        await shipmentRepository.replaceClaimedShopifyPaymentSync(candidate.id, currentFingerprint);
+        skipped++;
+        action.amount = currentAmount;
+        action.status = 'requeued-new-amount';
+        continue;
+      }
+      action.amount = currentAmount;
+
+      try {
+        const result = await this.performShopifyPayment(current, currentAmount);
+        const state = await shopifyStatusSyncClient.fetchOrderPaymentState(current.shopifyOrderId);
+        const complete = Boolean(
+          state?.cancelledAt ||
+          (state?.displayFinancialStatus && /paid/i.test(state.displayFinancialStatus) && state.totalOutstanding <= 0.01)
+        );
+        if (!complete) {
+          throw new Error(`Shopify payment not confirmed (status=${state?.displayFinancialStatus ?? 'missing'}, outstanding=${state?.totalOutstanding ?? 'n/a'})`);
+        }
+        await shipmentRepository.completeShopifyPaymentSync(candidate.id, result.transactionId);
+        processed++;
+        action.status = result.reason ?? 'completed';
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        await shipmentRepository.failShopifyPaymentSync(candidate.id, reason);
+        await failedPayloadService.save({
+          source: 'shopify-payment-worker',
+          externalId: current.shopifyOrderId,
+          reason,
+          payload: { recordId: current.id, shopifyOrderName: current.shopifyOrderName, amount: currentAmount }
+        });
+        failed++;
+        action.status = 'retry-scheduled';
+      }
+    }
+
+    const remaining = await shipmentRepository.countDueShopifyPaymentSync();
+    return {
+      apply,
+      found: records.length,
+      processed,
+      skipped,
+      failed,
+      recovered,
+      remaining,
+      hasMore: remaining > 0,
+      actions,
+      elapsedMs: Date.now() - startedAt
+    };
+  }
+
+  async getFinancialQueueHealth() {
+    return await shipmentRepository.getFinancialQueueHealth();
   }
 
   private async syncApprovedPaymentEntry(entry: AccuratePaymentShipmentEntry): Promise<'processed' | 'skipped'> {
@@ -675,10 +1100,10 @@ export class ShipmentStatusSyncService {
     return { paymentsChecked, processed, skipped, failed };
   }
 
-  async syncOpenShipments(): Promise<{ processed: number; failed: number; skipped: number }> {
-    // Time-budget guard: stop before Netlify cuts us off.
+  async syncOpenShipments(options: { budgetMs?: number; batchSize?: number } = {}): Promise<{ processed: number; failed: number; skipped: number }> {
+    // Time-budget guard: stop well before the hosting request is cut off.
     // Records not reached this run remain open and retry next scheduled run.
-    const budgetMs = env.syncTimeBudgetMs;
+    const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? env.syncTimeBudgetMs, 100_000));
     const startTime = Date.now();
 
     // Concurrency: process up to 5 shipments in parallel per batch.
@@ -687,7 +1112,8 @@ export class ShipmentStatusSyncService {
     // instead of ~20s sequentially — safely within the 23s budget.
     const CONCURRENCY = 5;
 
-    const openShipments = await shipmentRepository.findOpenShipments(env.syncOpenShipmentsBatchSize);
+    const batchSize = Math.max(1, Math.min(options.batchSize ?? env.syncOpenShipmentsBatchSize, 100));
+    const openShipments = await shipmentRepository.findOpenShipments(batchSize);
     let processed = 0;
     let failed = 0;
     let skipped = 0;

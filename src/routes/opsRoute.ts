@@ -13,8 +13,8 @@ import { sendMessage } from '../telegram/telegramApi.js';
  * Ops endpoints triggered by an external scheduler (GitHub Actions every 30 min)
  * instead of Netlify scheduled functions / Vercel crons (Hobby is daily-only).
  * Each handler is the same work the old crons did and stays within Vercel's 300s
- * budget. Mounted OUTSIDE /api so it is not behind adminAuth; protected instead by
- * a shared secret (OPS_SECRET) when that env var is set.
+ * budget. Mounted OUTSIDE /api so it is not behind adminAuth; every operation is
+ * fail-closed behind the shared OPS_SECRET.
  */
 export const createOpsRouter = (
   shipmentStatusSyncService: ShipmentStatusSyncService,
@@ -22,17 +22,8 @@ export const createOpsRouter = (
 ) => {
   const router = Router();
 
-  const guard = (request: Request, response: Response): boolean => {
-    const secret = process.env.OPS_SECRET?.trim();
-    if (!secret) return true; // no secret configured → open (same as old Netlify crons)
-    const provided = request.header('x-ops-secret') ?? (request.query.key as string | undefined);
-    if (provided === secret) return true;
-    response.status(401).json({ ok: false, message: 'Invalid ops secret' });
-    return false;
-  };
-
-  // Meta delivery sends are a financial/advertising side effect and therefore
-  // never fail open, even on an accidentally incomplete deployment.
+  // Ops routes can create shipments, invoices, payments, returns, and alerts,
+  // so an incomplete deployment must fail closed rather than expose a write path.
   const strictGuard = (request: Request, response: Response): boolean => {
     const secret = process.env.OPS_SECRET?.trim();
     if (!secret) {
@@ -45,21 +36,32 @@ export const createOpsRouter = (
     return false;
   };
 
-  router.get('/ops/process-odoo-queue', async (request, response) => {
-    if (!guard(request, response)) return;
+  const queryInt = (request: Request, name: string, fallback: number): number => {
+    const raw = typeof request.query[name] === 'string' ? request.query[name] : '';
+    const value = Number.parseInt(raw, 10);
+    return Number.isFinite(value) ? value : fallback;
+  };
+
+  const queryApply = (request: Request): boolean =>
+    ['1', 'true', 'yes'].includes(String(request.query.apply ?? '').toLowerCase());
+
+  const processOdooQueue = async (request: Request, response: Response) => {
+    if (!strictGuard(request, response)) return;
     try {
-      const result = await drainOdooQueue();
+      const result = await drainOdooQueue({ batchSize: 5, budgetMs: 75_000, maxSteps: 15 });
       response.status(result.statusCode).send(result.body);
     } catch (error) {
       logger.error('ops/process-odoo-queue failed', { reason: error instanceof Error ? error.message : String(error) });
       response.status(500).json({ ok: false });
     }
-  });
+  };
+  router.get('/ops/process-odoo-queue', processOdooQueue);
+  router.post('/ops/process-odoo-queue', processOdooQueue);
 
   router.get('/ops/sync-open-shipments', async (request, response) => {
-    if (!guard(request, response)) return;
+    if (!strictGuard(request, response)) return;
     try {
-      const result = await shipmentStatusSyncService.syncOpenShipments();
+      const result = await shipmentStatusSyncService.syncOpenShipments({ budgetMs: 70_000, batchSize: 100 });
       response.json({ ok: true, ...result });
     } catch (error) {
       logger.error('ops/sync-open-shipments failed', { reason: error instanceof Error ? error.message : String(error) });
@@ -68,12 +70,69 @@ export const createOpsRouter = (
   });
 
   router.get('/ops/sync-collections', async (request, response) => {
-    if (!guard(request, response)) return;
+    if (!strictGuard(request, response)) return;
     try {
-      const result = await shipmentStatusSyncService.syncCollectionsFromReports();
+      const result = await shipmentStatusSyncService.syncCollectionsFromReports({ maxActions: 12, budgetMs: 70_000 });
       response.json({ ok: true, ...result });
     } catch (error) {
       logger.error('ops/sync-collections failed', { reason: error instanceof Error ? error.message : String(error) });
+      response.status(500).json({ ok: false });
+    }
+  });
+
+  router.post('/ops/sync-returns', async (request, response) => {
+    if (!strictGuard(request, response)) return;
+    try {
+      const result = await shipmentStatusSyncService.discoverReturnedShipmentsFromReports({
+        startPage: queryInt(request, 'page', 1),
+        pages: queryInt(request, 'pages', 1),
+        budgetMs: 70_000,
+        apply: queryApply(request)
+      });
+      response.json({ ok: true, ...result });
+    } catch (error) {
+      logger.error('ops/sync-returns failed', { reason: error instanceof Error ? error.message : String(error) });
+      response.status(500).json({ ok: false });
+    }
+  });
+
+  router.post('/ops/process-return-queue', async (request, response) => {
+    if (!strictGuard(request, response)) return;
+    try {
+      const result = await shipmentStatusSyncService.processReturnQueue({
+        limit: queryInt(request, 'limit', 4),
+        budgetMs: 70_000,
+        apply: queryApply(request)
+      });
+      response.json({ ok: true, ...result });
+    } catch (error) {
+      logger.error('ops/process-return-queue failed', { reason: error instanceof Error ? error.message : String(error) });
+      response.status(500).json({ ok: false });
+    }
+  });
+
+  router.post('/ops/process-shopify-payment-queue', async (request, response) => {
+    if (!strictGuard(request, response)) return;
+    try {
+      const result = await shipmentStatusSyncService.processShopifyPaymentQueue({
+        limit: queryInt(request, 'limit', 6),
+        budgetMs: 70_000,
+        apply: queryApply(request)
+      });
+      response.json({ ok: true, ...result });
+    } catch (error) {
+      logger.error('ops/process-shopify-payment-queue failed', { reason: error instanceof Error ? error.message : String(error) });
+      response.status(500).json({ ok: false });
+    }
+  });
+
+  router.get('/ops/financial-health', async (request, response) => {
+    if (!strictGuard(request, response)) return;
+    try {
+      const result = await shipmentStatusSyncService.getFinancialQueueHealth();
+      response.status(result.ok ? 200 : 503).json(result);
+    } catch (error) {
+      logger.error('ops/financial-health failed', { reason: error instanceof Error ? error.message : String(error) });
       response.status(500).json({ ok: false });
     }
   });
@@ -96,7 +155,7 @@ export const createOpsRouter = (
   });
 
   router.get('/ops/resume-production-jobs', async (request, response) => {
-    if (!guard(request, response)) return;
+    if (!strictGuard(request, response)) return;
     try {
       const { prisma } = await import('../lib/prisma.js');
       const paused = await prisma.failedPayload.findFirst({
@@ -147,7 +206,7 @@ export const createOpsRouter = (
   });
 
   router.get('/ops/production-health', async (request, response) => {
-    if (!guard(request, response)) return;
+    if (!strictGuard(request, response)) return;
     try {
       const result = await checkProductionHealth();
       const { prisma } = await import('../lib/prisma.js');

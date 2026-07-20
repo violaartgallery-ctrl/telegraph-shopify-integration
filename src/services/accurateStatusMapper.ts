@@ -46,6 +46,13 @@ export const projectAccurateStatusToShopify = (input: {
   if (input.cancelled) {
     tags.push('accurate-cancelled');
     collectionStatus = 'cancelled';
+  // A shipment can keep its original DTR status while Telegraph later adds a
+  // returnStatus. The explicit return must win; otherwise a real return is
+  // incorrectly frozen as collected/delivered forever.
+  } else if (returnedStatusCodes.has(statusCode) || returnedStatusCodes.has(returnStatusCode)) {
+    tags.push('accurate-returned');
+    collectionStatus = input.paidToCustomer ? 'returned-settled' : 'returned';
+    tags.push(input.paidToCustomer ? 'accurate-returned-settled' : 'accurate-returned-unsettled');
   } else if (deliveredStatusCodes.has(statusCode) && customerDue < 0) {
     tags.push('accurate-delivered', 'accurate-payment-review');
     collectionStatus = 'payment-review';
@@ -53,10 +60,6 @@ export const projectAccurateStatusToShopify = (input: {
     tags.push('accurate-delivered');
     collectionStatus = input.collected ? 'collected' : 'delivered-not-collected';
     tags.push(input.collected ? 'accurate-collected' : 'accurate-delivered-not-collected');
-  } else if (returnedStatusCodes.has(statusCode) || returnedStatusCodes.has(returnStatusCode)) {
-    tags.push('accurate-returned');
-    collectionStatus = input.paidToCustomer ? 'returned-settled' : 'returned';
-    tags.push(input.paidToCustomer ? 'accurate-returned-settled' : 'accurate-returned-unsettled');
   } else if (statusCode === 'OTD') {
     tags.push('accurate-out-for-delivery');
   } else if (deliveryExceptionStatusCodes.has(statusCode)) {
