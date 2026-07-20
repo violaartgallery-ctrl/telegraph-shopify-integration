@@ -410,11 +410,12 @@ export class ShipmentStatusSyncService {
     if (!first.skipped) {
       return { transactionId: first.transactionId };
     }
-    if (first.reason === 'needs-discount' && first.needsDiscountFor && first.total) {
+    if (first.reason === 'needs-discount' && first.needsDiscountFor && first.total && first.currencyCode) {
       const result = await shopifyStatusSyncClient.applyOrderDiscountAndPay({
         orderId: record.shopifyOrderId,
         discountAmount: first.needsDiscountFor,
         paymentAmount: collectedAmount,
+        currencyCode: first.currencyCode,
         discountDescription: 'Telegraph collection adjustment'
       });
       logger.info('Shopify discount applied + payment recorded', {
