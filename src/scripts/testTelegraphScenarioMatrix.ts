@@ -1,6 +1,7 @@
 import { projectAccurateStatusToShopify } from '../services/accurateStatusMapper.js';
 import { calculateTelegraphMerchantPaymentAmount, calculateTelegraphReturnCharge } from '../odoo/odooSyncService.js';
 import { buildReturnSyncFingerprint, buildShopifyPaymentFingerprint } from '../services/shipmentStatusSyncService.js';
+import { calculateOrderEditDiscountCapacity } from '../shopify/shopifyStatusSyncClient.js';
 
 interface Scenario {
   name: string;
@@ -218,11 +219,26 @@ assert(
   buildShopifyPaymentFingerprint(819) === buildShopifyPaymentFingerprint(819.001),
   'payment fingerprint must use currency precision'
 );
+assert(
+  calculateOrderEditDiscountCapacity({
+    editableSubtotalSet: { shopMoney: { amount: '0.00' } },
+    uneditableSubtotalSet: { shopMoney: { amount: '1030.00' } }
+  }) === 1030,
+  'fulfilled line subtotal must remain discountable'
+);
+assert(
+  calculateOrderEditDiscountCapacity({
+    editableSubtotalSet: { shopMoney: { amount: '400.00' } },
+    uneditableSubtotalSet: { shopMoney: { amount: '600.00' } }
+  }) === 1000,
+  'mixed fulfilled and unfulfilled subtotal must be combined'
+);
 
 console.log(JSON.stringify({
   ok: true,
   statusScenarios: scenarios.length,
   returnChargeScenarios: returnChargeCases.length,
   paymentAmountScenarios: paymentAmountCases.length,
+  fulfilledDiscountCapacity: true,
   idempotencyFingerprints: true
 }, null, 2));

@@ -3,6 +3,13 @@ import { requestShopifyAdmin, requestShopifyAdminRest } from './shopifyAdminGrap
 
 const orderRestId = (orderGid: string): string => orderGid.split('/').pop() ?? orderGid;
 
+export const calculateOrderEditDiscountCapacity = (line: {
+  editableSubtotalSet?: { shopMoney?: { amount?: string | null } | null } | null;
+  uneditableSubtotalSet?: { shopMoney?: { amount?: string | null } | null } | null;
+}): number =>
+  Number(line.editableSubtotalSet?.shopMoney?.amount ?? 0) +
+  Number(line.uneditableSubtotalSet?.shopMoney?.amount ?? 0);
+
 const METAFIELDS_SET_MUTATION = `
   mutation SetAccurateMetafields($metafields: [MetafieldsSetInput!]!) {
     metafieldsSet(metafields: $metafields) {
@@ -101,6 +108,7 @@ const ORDER_EDIT_BEGIN_MUTATION = `
               id
               quantity
               editableSubtotalSet { shopMoney { amount } }
+              uneditableSubtotalSet { shopMoney { amount } }
             }
           }
         }
@@ -114,6 +122,10 @@ const ORDER_EDIT_ADD_LINE_DISCOUNT_MUTATION = `
   mutation TelegraphOrderEditAddDiscount($id: ID!, $lineItemId: ID!, $discount: OrderEditAppliedDiscountInput!) {
     orderEditAddLineItemDiscount(id: $id, lineItemId: $lineItemId, discount: $discount) {
       calculatedLineItem { id }
+      calculatedOrder {
+        id
+        totalOutstandingSet { shopMoney { amount } }
+      }
       userErrors { field message }
     }
   }
@@ -455,6 +467,7 @@ export const shopifyStatusSyncClient = {
                 id: string;
                 quantity: number;
                 editableSubtotalSet: { shopMoney: { amount: string } };
+                uneditableSubtotalSet: { shopMoney: { amount: string } };
               };
             }>;
           };
@@ -467,30 +480,38 @@ export const shopifyStatusSyncClient = {
     }
     const calc = begin.orderEditBegin.calculatedOrder;
     if (!calc) throw new Error('orderEditBegin returned no calculatedOrder');
-    const editableLines = calc.lineItems.edges.map((edge) => edge.node);
-    if (editableLines.length === 0) throw new Error('orderEditBegin: order has no line items to discount');
+    const discountableLines = calc.lineItems.edges.map((edge) => edge.node);
+    if (discountableLines.length === 0) throw new Error('orderEditBegin: order has no line items to discount');
 
-    const totalEditableSubtotal = editableLines.reduce(
-      (total, line) => total + Number(line.editableSubtotalSet?.shopMoney?.amount ?? 0),
+    // Since API 2025-10 Shopify supports discounts on both fulfilled and
+    // unfulfilled lines. A fulfilled line has editableSubtotal=0 and its value
+    // in uneditableSubtotal, but it is still discountable by this mutation.
+    const totalDiscountableSubtotal = discountableLines.reduce(
+      (total, line) => total + calculateOrderEditDiscountCapacity(line),
       0
     );
-    if (Number(params.discountAmount) > totalEditableSubtotal + 0.01) {
+    if (Number(params.discountAmount) > totalDiscountableSubtotal + 0.01) {
       throw new Error(
-        `Shopify order edit has only ${totalEditableSubtotal.toFixed(2)} editable subtotal ` +
+        `Shopify order edit has only ${totalDiscountableSubtotal.toFixed(2)} discountable subtotal ` +
         `for discount ${Number(params.discountAmount).toFixed(2)}`
       );
     }
 
-    // 2. Add fixed discounts without ever exceeding a line's editable subtotal.
+    // 2. Add fixed discounts without ever exceeding a line's full subtotal.
     let remainingDiscount = Number(params.discountAmount);
-    for (const line of editableLines) {
+    let stagedOutstanding: number | null = null;
+    for (const line of discountableLines) {
       if (remainingDiscount <= 0.01) break;
-      const editableSubtotal = Number(line.editableSubtotalSet?.shopMoney?.amount ?? 0);
-      const lineDiscount = Math.min(remainingDiscount, editableSubtotal);
+      const discountCapacity = calculateOrderEditDiscountCapacity(line);
+      const lineDiscount = Math.min(remainingDiscount, discountCapacity);
       if (lineDiscount <= 0.01) continue;
       const add = await requestShopifyAdmin<{
         orderEditAddLineItemDiscount: {
           calculatedLineItem: { id: string } | null;
+          calculatedOrder: {
+            id: string;
+            totalOutstandingSet: { shopMoney: { amount: string } };
+          } | null;
           userErrors: Array<{ field?: string[] | null; message: string }>;
         };
       }>(ORDER_EDIT_ADD_LINE_DISCOUNT_MUTATION, {
@@ -504,10 +525,23 @@ export const shopifyStatusSyncClient = {
       if (add.orderEditAddLineItemDiscount.userErrors.length > 0) {
         throw new Error('orderEditAddLineItemDiscount: ' + add.orderEditAddLineItemDiscount.userErrors.map((e) => e.message).join('; '));
       }
+      stagedOutstanding = Number(
+        add.orderEditAddLineItemDiscount.calculatedOrder?.totalOutstandingSet?.shopMoney?.amount ?? NaN
+      );
       remainingDiscount = Number((remainingDiscount - lineDiscount).toFixed(2));
     }
     if (remainingDiscount > 0.01) {
       throw new Error(`Shopify order edit cannot safely apply the remaining discount ${remainingDiscount.toFixed(2)}`);
+    }
+    if (
+      stagedOutstanding === null ||
+      !Number.isFinite(stagedOutstanding) ||
+      Math.abs(stagedOutstanding - Number(params.paymentAmount)) > 0.01
+    ) {
+      throw new Error(
+        `Shopify staged total ${stagedOutstanding !== null && Number.isFinite(stagedOutstanding) ? stagedOutstanding.toFixed(2) : 'missing'} ` +
+        `does not match collected amount ${Number(params.paymentAmount).toFixed(2)}`
+      );
     }
 
     // 3. Commit the edit so the order total drops by `discountAmount`.
@@ -523,6 +557,13 @@ export const shopifyStatusSyncClient = {
     });
     if (commit.orderEditCommit.userErrors.length > 0) {
       throw new Error('orderEditCommit: ' + commit.orderEditCommit.userErrors.map((e) => e.message).join('; '));
+    }
+    const committedTotal = Number(commit.orderEditCommit.order?.currentTotalPriceSet?.shopMoney?.amount ?? NaN);
+    if (!Number.isFinite(committedTotal) || Math.abs(committedTotal - Number(params.paymentAmount)) > 0.01) {
+      throw new Error(
+        `Shopify committed total ${Number.isFinite(committedTotal) ? committedTotal.toFixed(2) : 'missing'} ` +
+        `does not match collected amount ${Number(params.paymentAmount).toFixed(2)}`
+      );
     }
 
     // 4. Create the SALE transaction for the actual collected amount (REST, see recordCustomerPayment).
