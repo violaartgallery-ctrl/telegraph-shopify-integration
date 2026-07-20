@@ -1,9 +1,11 @@
 import { projectAccurateStatusToShopify } from '../services/accurateStatusMapper.js';
 import { calculateTelegraphMerchantPaymentAmount, calculateTelegraphReturnCharge } from '../odoo/odooSyncService.js';
+import { buildReturnSyncFingerprint, buildShopifyPaymentFingerprint } from '../services/shipmentStatusSyncService.js';
 
 interface Scenario {
   name: string;
   statusCode: string;
+  returnStatusCode?: string;
   collected?: boolean;
   paidToCustomer?: boolean;
   cancelled?: boolean;
@@ -104,6 +106,26 @@ const scenarios: Scenario[] = [
     expectedTags: ['accurate-returned', 'accurate-returned-settled']
   },
   {
+    name: 'delivered status later overridden by explicit return status',
+    statusCode: 'DTR',
+    returnStatusCode: 'RTRN',
+    collected: true,
+    paidToCustomer: false,
+    expectedCollectionStatus: 'returned',
+    expectedTerminal: true,
+    expectedTags: ['accurate-returned', 'accurate-returned-unsettled']
+  },
+  {
+    name: 'cancelled carrier flag still overridden by explicit returned status',
+    statusCode: 'RTRN',
+    cancelled: true,
+    paidToCustomer: true,
+    customerDue: -65,
+    expectedCollectionStatus: 'returned-settled',
+    expectedTerminal: true,
+    expectedTags: ['accurate-returned', 'accurate-cancelled', 'accurate-returned-settled']
+  },
+  {
     name: 'rejected',
     statusCode: 'RJCT',
     expectedCollectionStatus: 'returned',
@@ -123,6 +145,7 @@ const scenarios: Scenario[] = [
 for (const scenario of scenarios) {
   const projection = projectAccurateStatusToShopify({
     statusCode: scenario.statusCode,
+    returnStatusCode: scenario.returnStatusCode,
     statusName: scenario.name,
     collected: scenario.collected,
     paidToCustomer: scenario.paidToCustomer,
@@ -172,9 +195,34 @@ for (const testCase of paymentAmountCases) {
   assert(actual === testCase.expected, `${testCase.name}: expected ${testCase.expected}, got ${actual}`);
 }
 
+const returnFingerprintInput = {
+  code: 'VI-TEST-RETURN',
+  deliveredOrReturnedDate: '2026-07-20T12:00:00Z',
+  paidToCustomer: false,
+  customerDue: -65,
+  returnFees: 65,
+  returningDueFees: 65,
+  returnedValue: 0,
+  status: { code: 'DTR', name: 'Delivered' },
+  returnStatus: { code: 'RTRN', name: 'Returned' }
+};
+assert(
+  buildReturnSyncFingerprint(returnFingerprintInput) === buildReturnSyncFingerprint({ ...returnFingerprintInput }),
+  'same return snapshot must generate the same idempotency fingerprint'
+);
+assert(
+  buildReturnSyncFingerprint(returnFingerprintInput) !== buildReturnSyncFingerprint({ ...returnFingerprintInput, customerDue: -66 }),
+  'a changed return charge must generate a new idempotency fingerprint'
+);
+assert(
+  buildShopifyPaymentFingerprint(819) === buildShopifyPaymentFingerprint(819.001),
+  'payment fingerprint must use currency precision'
+);
+
 console.log(JSON.stringify({
   ok: true,
   statusScenarios: scenarios.length,
   returnChargeScenarios: returnChargeCases.length,
-  paymentAmountScenarios: paymentAmountCases.length
+  paymentAmountScenarios: paymentAmountCases.length,
+  idempotencyFingerprints: true
 }, null, 2));

@@ -60,11 +60,11 @@ interface ShipmentLookupResponse {
   } | null;
 }
 
-type ShipmentSummary = NonNullable<ShipmentLookupResponse['shipment']>;
+export type AccurateShipmentSummary = NonNullable<ShipmentLookupResponse['shipment']>;
 interface ListShipmentsResponse {
   listShipments: {
     paginatorInfo: PaginatorInfo;
-    data: ShipmentSummary[];
+    data: AccurateShipmentSummary[];
   };
 }
 

@@ -74,6 +74,15 @@ const validDate = (value?: string | null): Date | undefined => {
   return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 };
 
+const retryDelayMinutes = (attempt: number): number => {
+  if (attempt <= 1) return 2;
+  if (attempt === 2) return 5;
+  if (attempt === 3) return 15;
+  if (attempt === 4) return 60;
+  if (attempt === 5) return 240;
+  return 720;
+};
+
 export const shipmentRepository = {
   findByShopifyOrderId: async (shopifyOrderId: string) =>
     await prisma.shipmentRecord.findUnique({ where: { shopifyOrderId } }),
@@ -512,6 +521,23 @@ export const shipmentRepository = {
       take: limit
     }),
 
+  countPendingOdooQueue: async (): Promise<number> =>
+    await prisma.shipmentRecord.count({
+      where: {
+        accurateShipmentId: { not: null },
+        rawOrderJson: { not: null },
+        OR: [
+          { odooSyncStatus: 'odoo-so-pending' },
+          { odooSyncStatus: 'odoo-stock-pending' },
+          { odooSyncStatus: 'odoo-delivery-pending' },
+          {
+            odooSyncStatus: 'odoo-failed-retryable',
+            OR: [{ odooRetryAt: null }, { odooRetryAt: { lte: new Date() } }]
+          }
+        ]
+      }
+    }),
+
   /**
    * Atomically claim an order for a specific stage transition.
    * Returns true if this worker successfully claimed it (no other worker did).
@@ -673,7 +699,7 @@ export const shipmentRepository = {
   recoverStuckProcessingRecords: async (stuckThresholdMinutes = 10): Promise<number> => {
     const stuckBefore = new Date(Date.now() - stuckThresholdMinutes * 60_000);
 
-    const [r1, r2, r3] = await Promise.all([
+    const [r1, r2, r3, legacyWithoutSo, legacyWithSo] = await Promise.all([
       prisma.shipmentRecord.updateMany({
         where: { odooSyncStatus: 'odoo-so-creating',        odooSyncedAt: { lt: stuckBefore } },
         data:  { odooSyncStatus: 'odoo-so-pending' }
@@ -685,9 +711,389 @@ export const shipmentRepository = {
       prisma.shipmentRecord.updateMany({
         where: { odooSyncStatus: 'odoo-delivery-confirming', odooSyncedAt: { lt: stuckBefore } },
         data:  { odooSyncStatus: 'odoo-delivery-pending' }
+      }),
+      // Older ensureSalesOrder() code replaced the queue-owned processing state
+      // with this legacy value. Recover only records that actually have a
+      // Telegraph shipment so manual Odoo-only records are left untouched.
+      prisma.shipmentRecord.updateMany({
+        where: {
+          odooSyncStatus: 'sales-order-creating',
+          odooSyncedAt: { lt: stuckBefore },
+          accurateShipmentId: { not: null },
+          rawOrderJson: { not: null },
+          odooSaleOrderId: null
+        },
+        data: { odooSyncStatus: 'odoo-so-pending' }
+      }),
+      prisma.shipmentRecord.updateMany({
+        where: {
+          odooSyncStatus: 'sales-order-creating',
+          odooSyncedAt: { lt: stuckBefore },
+          accurateShipmentId: { not: null },
+          rawOrderJson: { not: null },
+          odooSaleOrderId: { not: null }
+        },
+        data: { odooSyncStatus: 'odoo-stock-pending' }
       })
     ]);
 
-    return r1.count + r2.count + r3.count;
+    return r1.count + r2.count + r3.count + legacyWithoutSo.count + legacyWithSo.count;
+  },
+
+  queueReturnSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    const staleBefore = new Date(Date.now() - 10 * 60_000);
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: { in: ['returned', 'returned-settled'] },
+        OR: [
+          { returnSyncStatus: null },
+          { returnSyncFingerprint: null },
+          { returnSyncFingerprint: { not: fingerprint } }
+        ],
+        NOT: {
+          returnSyncStatus: 'processing',
+          returnSyncClaimedAt: { gte: staleBefore }
+        }
+      },
+      data: {
+        returnSyncStatus: 'pending',
+        returnSyncFingerprint: fingerprint,
+        returnSyncAttemptCount: 0,
+        returnSyncRetryAt: null,
+        returnSyncLastError: null,
+        returnSyncClaimedAt: null
+      }
+    });
+    return result.count === 1;
+  },
+
+  recoverStuckReturnSync: async (stuckThresholdMinutes = 10): Promise<number> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        returnSyncStatus: 'processing',
+        returnSyncClaimedAt: { lt: new Date(Date.now() - stuckThresholdMinutes * 60_000) }
+      },
+      data: {
+        returnSyncStatus: 'retryable',
+        returnSyncRetryAt: new Date(),
+        returnSyncClaimedAt: null,
+        returnSyncLastError: 'Recovered after an interrupted return-sync worker'
+      }
+    });
+    return result.count;
+  },
+
+  findPendingReturnSync: async (limit: number) =>
+    await prisma.shipmentRecord.findMany({
+      where: {
+        collectionStatus: { in: ['returned', 'returned-settled'] },
+        OR: [
+          { returnSyncStatus: 'pending' },
+          {
+            returnSyncStatus: 'retryable',
+            OR: [{ returnSyncRetryAt: null }, { returnSyncRetryAt: { lte: new Date() } }]
+          }
+        ]
+      },
+      orderBy: [{ returnSyncRetryAt: 'asc' }, { returnedAt: 'asc' }, { id: 'asc' }],
+      take: limit
+    }),
+
+  claimReturnSync: async (recordId: number): Promise<boolean> => {
+    const now = new Date();
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: { in: ['returned', 'returned-settled'] },
+        OR: [
+          { returnSyncStatus: 'pending' },
+          {
+            returnSyncStatus: 'retryable',
+            OR: [{ returnSyncRetryAt: null }, { returnSyncRetryAt: { lte: now } }]
+          }
+        ]
+      },
+      data: { returnSyncStatus: 'processing', returnSyncClaimedAt: now }
+    });
+    return result.count === 1;
+  },
+
+  completeReturnSync: async (recordId: number) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        returnSyncStatus: 'completed',
+        returnSyncAttemptCount: 0,
+        returnSyncRetryAt: null,
+        returnSyncLastError: null,
+        returnSyncClaimedAt: null
+      }
+    }),
+
+  failReturnSync: async (recordId: number, error: string) => {
+    const current = await prisma.shipmentRecord.findUnique({
+      where: { id: recordId },
+      select: { returnSyncAttemptCount: true }
+    });
+    const attempt = (current?.returnSyncAttemptCount ?? 0) + 1;
+    const permanentlyFailed = attempt >= 7;
+    return await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        returnSyncStatus: permanentlyFailed ? 'failed' : 'retryable',
+        returnSyncAttemptCount: attempt,
+        returnSyncRetryAt: permanentlyFailed
+          ? null
+          : new Date(Date.now() + retryDelayMinutes(attempt) * 60_000),
+        returnSyncLastError: error.slice(0, 2_000),
+        returnSyncClaimedAt: null
+      }
+    });
+  },
+
+  countDueReturnSync: async (): Promise<number> =>
+    await prisma.shipmentRecord.count({
+      where: {
+        collectionStatus: { in: ['returned', 'returned-settled'] },
+        OR: [
+          { returnSyncStatus: 'pending' },
+          {
+            returnSyncStatus: 'retryable',
+            OR: [{ returnSyncRetryAt: null }, { returnSyncRetryAt: { lte: new Date() } }]
+          }
+        ]
+      }
+    }),
+
+  supersedeReturnSync: async (recordId: number, reason: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        returnSyncStatus: { in: ['pending', 'retryable', 'processing', 'failed'] }
+      },
+      data: {
+        returnSyncStatus: 'superseded',
+        returnSyncRetryAt: null,
+        returnSyncClaimedAt: null,
+        returnSyncLastError: reason.slice(0, 2_000)
+      }
+    });
+    return result.count === 1;
+  },
+
+  queueShopifyPaymentSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    const staleBefore = new Date(Date.now() - 10 * 60_000);
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: 'collected',
+        OR: [
+          { shopifyPaymentSyncStatus: null },
+          { shopifyPaymentFingerprint: null },
+          { shopifyPaymentFingerprint: { not: fingerprint } }
+        ],
+        NOT: {
+          shopifyPaymentSyncStatus: 'processing',
+          shopifyPaymentClaimedAt: { gte: staleBefore }
+        }
+      },
+      data: {
+        shopifyPaymentSyncStatus: 'pending',
+        shopifyPaymentFingerprint: fingerprint,
+        shopifyPaymentAttemptCount: 0,
+        shopifyPaymentRetryAt: null,
+        shopifyPaymentLastError: null,
+        shopifyPaymentClaimedAt: null
+      }
+    });
+    return result.count === 1;
+  },
+
+  recoverStuckShopifyPaymentSync: async (stuckThresholdMinutes = 10): Promise<number> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        shopifyPaymentSyncStatus: 'processing',
+        shopifyPaymentClaimedAt: { lt: new Date(Date.now() - stuckThresholdMinutes * 60_000) }
+      },
+      data: {
+        shopifyPaymentSyncStatus: 'retryable',
+        shopifyPaymentRetryAt: new Date(),
+        shopifyPaymentClaimedAt: null,
+        shopifyPaymentLastError: 'Recovered after an interrupted Shopify-payment worker'
+      }
+    });
+    return result.count;
+  },
+
+  findPendingShopifyPaymentSync: async (limit: number) =>
+    await prisma.shipmentRecord.findMany({
+      where: {
+        collectionStatus: 'collected',
+        collectedAmount: { gt: 0 },
+        OR: [
+          { shopifyPaymentSyncStatus: 'pending' },
+          {
+            shopifyPaymentSyncStatus: 'retryable',
+            OR: [{ shopifyPaymentRetryAt: null }, { shopifyPaymentRetryAt: { lte: new Date() } }]
+          }
+        ]
+      },
+      orderBy: [{ shopifyPaymentRetryAt: 'asc' }, { deliveredAt: 'asc' }, { id: 'asc' }],
+      take: limit
+    }),
+
+  claimShopifyPaymentSync: async (recordId: number): Promise<boolean> => {
+    const now = new Date();
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: 'collected',
+        collectedAmount: { gt: 0 },
+        OR: [
+          { shopifyPaymentSyncStatus: 'pending' },
+          {
+            shopifyPaymentSyncStatus: 'retryable',
+            OR: [{ shopifyPaymentRetryAt: null }, { shopifyPaymentRetryAt: { lte: now } }]
+          }
+        ]
+      },
+      data: { shopifyPaymentSyncStatus: 'processing', shopifyPaymentClaimedAt: now }
+    });
+    return result.count === 1;
+  },
+
+  completeShopifyPaymentSync: async (recordId: number, transactionId?: string) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        shopifyPaymentSyncStatus: 'completed',
+        shopifyPaymentAttemptCount: 0,
+        shopifyPaymentRetryAt: null,
+        shopifyPaymentLastError: null,
+        shopifyPaymentClaimedAt: null,
+        shopifyPaymentSyncedAt: new Date(),
+        ...(transactionId ? { shopifyPaymentTransactionId: transactionId } : {})
+      }
+    }),
+
+  failShopifyPaymentSync: async (recordId: number, error: string) => {
+    const current = await prisma.shipmentRecord.findUnique({
+      where: { id: recordId },
+      select: { shopifyPaymentAttemptCount: true }
+    });
+    const attempt = (current?.shopifyPaymentAttemptCount ?? 0) + 1;
+    const permanentlyFailed = attempt >= 7;
+    return await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        shopifyPaymentSyncStatus: permanentlyFailed ? 'failed' : 'retryable',
+        shopifyPaymentAttemptCount: attempt,
+        shopifyPaymentRetryAt: permanentlyFailed
+          ? null
+          : new Date(Date.now() + retryDelayMinutes(attempt) * 60_000),
+        shopifyPaymentLastError: error.slice(0, 2_000),
+        shopifyPaymentClaimedAt: null
+      }
+    });
+  },
+
+  countDueShopifyPaymentSync: async (): Promise<number> =>
+    await prisma.shipmentRecord.count({
+      where: {
+        collectionStatus: 'collected',
+        collectedAmount: { gt: 0 },
+        OR: [
+          { shopifyPaymentSyncStatus: 'pending' },
+          {
+            shopifyPaymentSyncStatus: 'retryable',
+            OR: [{ shopifyPaymentRetryAt: null }, { shopifyPaymentRetryAt: { lte: new Date() } }]
+          }
+        ]
+      }
+    }),
+
+  supersedeShopifyPaymentSync: async (recordId: number, reason: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        shopifyPaymentSyncStatus: { in: ['pending', 'retryable', 'processing', 'failed'] }
+      },
+      data: {
+        shopifyPaymentSyncStatus: 'superseded',
+        shopifyPaymentRetryAt: null,
+        shopifyPaymentClaimedAt: null,
+        shopifyPaymentLastError: reason.slice(0, 2_000)
+      }
+    });
+    return result.count === 1;
+  },
+
+  replaceClaimedShopifyPaymentSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: { id: recordId, shopifyPaymentSyncStatus: 'processing' },
+      data: {
+        shopifyPaymentSyncStatus: 'pending',
+        shopifyPaymentFingerprint: fingerprint,
+        shopifyPaymentAttemptCount: 0,
+        shopifyPaymentRetryAt: null,
+        shopifyPaymentLastError: 'Collected amount changed while the previous payment action was claimed',
+        shopifyPaymentClaimedAt: null
+      }
+    });
+    return result.count === 1;
+  },
+
+  getFinancialQueueHealth: async () => {
+    const staleBefore = new Date(Date.now() - 15 * 60_000);
+    const [
+      odooPending,
+      odooProcessing,
+      odooFailed,
+      returnPending,
+      returnProcessing,
+      returnFailed,
+      paymentPending,
+      paymentProcessing,
+      paymentFailed
+    ] = await Promise.all([
+      prisma.shipmentRecord.count({
+        where: {
+          odooSyncStatus: {
+            in: ['odoo-so-pending', 'odoo-stock-pending', 'odoo-delivery-pending', 'odoo-failed-retryable']
+          }
+        }
+      }),
+      prisma.shipmentRecord.count({
+        where: {
+          odooSyncStatus: { in: ['odoo-so-creating', 'odoo-stock-preparing', 'odoo-delivery-confirming'] },
+          odooSyncedAt: { lt: staleBefore }
+        }
+      }),
+      prisma.shipmentRecord.count({ where: { odooSyncStatus: 'failed' } }),
+      prisma.shipmentRecord.count({
+        where: {
+          collectionStatus: { in: ['returned', 'returned-settled'] },
+          returnSyncStatus: { in: ['pending', 'retryable'] }
+        }
+      }),
+      prisma.shipmentRecord.count({ where: { returnSyncStatus: 'processing', returnSyncClaimedAt: { lt: staleBefore } } }),
+      prisma.shipmentRecord.count({ where: { returnSyncStatus: 'failed' } }),
+      prisma.shipmentRecord.count({
+        where: {
+          collectionStatus: 'collected',
+          collectedAmount: { gt: 0 },
+          shopifyPaymentSyncStatus: { in: ['pending', 'retryable'] }
+        }
+      }),
+      prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'processing', shopifyPaymentClaimedAt: { lt: staleBefore } } }),
+      prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'failed' } })
+    ]);
+    return {
+      ok: odooProcessing === 0 && odooFailed === 0 && returnProcessing === 0 && returnFailed === 0 && paymentProcessing === 0 && paymentFailed === 0,
+      odoo: { pending: odooPending, stuck: odooProcessing, failed: odooFailed },
+      returns: { pending: returnPending, stuck: returnProcessing, failed: returnFailed },
+      shopifyPayments: { pending: paymentPending, stuck: paymentProcessing, failed: paymentFailed }
+    };
   }
 };

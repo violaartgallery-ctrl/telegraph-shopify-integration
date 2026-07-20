@@ -93,7 +93,18 @@ const ORDER_PAYMENT_STATE_QUERY = `
 const ORDER_EDIT_BEGIN_MUTATION = `
   mutation TelegraphOrderEditBegin($id: ID!) {
     orderEditBegin(id: $id) {
-      calculatedOrder { id lineItems(first: 50) { edges { node { id quantity } } } }
+      calculatedOrder {
+        id
+        lineItems(first: 50) {
+          edges {
+            node {
+              id
+              quantity
+              editableSubtotalSet { shopMoney { amount } }
+            }
+          }
+        }
+      }
       userErrors { field message }
     }
   }
@@ -374,6 +385,14 @@ export const shopifyStatusSyncClient = {
     if (!Number.isFinite(amount) || amount <= 0) {
       return { skipped: true, reason: 'invalid-amount' };
     }
+    // Never add another successful transaction on top of a real partial
+    // receipt. That state needs a deliberate reconciliation, not automation.
+    if (Math.abs(state.totalReceived) > 0.01) {
+      return { skipped: true, reason: 'existing-partial-payment-needs-review' };
+    }
+    if (amount > state.totalPrice + 0.01) {
+      return { skipped: true, reason: 'amount-exceeds-order-total' };
+    }
 
     const gap = Number((state.totalPrice - amount).toFixed(2));
     if (gap > 0.01) {
@@ -411,12 +430,10 @@ export const shopifyStatusSyncClient = {
 
   /**
    * Phase 1 (Case B): collected < shopifyTotal.
-   * Begin an order edit, add a line-item discount equal to the gap on the first
-   * product line, commit the edit, then create a SALE transaction for the
-   * (now-discounted) total.
-   *
-   * The discount is concentrated on the first line for simplicity; total still
-   * reduces by exactly `discountAmount`, which is what matters for reporting.
+   * Begin an order edit, distribute the gap across editable product lines,
+   * commit the edit, then create a SALE transaction for the discounted total.
+   * Distribution prevents Shopify rejecting a discount that is larger than the
+   * first line's subtotal.
    */
   applyOrderDiscountAndPay: async (params: {
     orderId: string | number;
@@ -432,7 +449,15 @@ export const shopifyStatusSyncClient = {
       orderEditBegin: {
         calculatedOrder: {
           id: string;
-          lineItems: { edges: Array<{ node: { id: string; quantity: number } }> };
+          lineItems: {
+            edges: Array<{
+              node: {
+                id: string;
+                quantity: number;
+                editableSubtotalSet: { shopMoney: { amount: string } };
+              };
+            }>;
+          };
         } | null;
         userErrors: Array<{ field?: string[] | null; message: string }>;
       };
@@ -442,25 +467,47 @@ export const shopifyStatusSyncClient = {
     }
     const calc = begin.orderEditBegin.calculatedOrder;
     if (!calc) throw new Error('orderEditBegin returned no calculatedOrder');
-    const firstLineId = calc.lineItems.edges?.[0]?.node?.id;
-    if (!firstLineId) throw new Error('orderEditBegin: order has no line items to discount');
+    const editableLines = calc.lineItems.edges.map((edge) => edge.node);
+    if (editableLines.length === 0) throw new Error('orderEditBegin: order has no line items to discount');
 
-    // 2. Add the discount as a fixed amount on the first line.
-    const add = await requestShopifyAdmin<{
-      orderEditAddLineItemDiscount: {
-        calculatedLineItem: { id: string } | null;
-        userErrors: Array<{ field?: string[] | null; message: string }>;
-      };
-    }>(ORDER_EDIT_ADD_LINE_DISCOUNT_MUTATION, {
-      id: calc.id,
-      lineItemId: firstLineId,
-      discount: {
-        fixedValue: { amount: Number(params.discountAmount).toFixed(2) },
-        description: params.discountDescription ?? 'Telegraph collection adjustment'
+    const totalEditableSubtotal = editableLines.reduce(
+      (total, line) => total + Number(line.editableSubtotalSet?.shopMoney?.amount ?? 0),
+      0
+    );
+    if (Number(params.discountAmount) > totalEditableSubtotal + 0.01) {
+      throw new Error(
+        `Shopify order edit has only ${totalEditableSubtotal.toFixed(2)} editable subtotal ` +
+        `for discount ${Number(params.discountAmount).toFixed(2)}`
+      );
+    }
+
+    // 2. Add fixed discounts without ever exceeding a line's editable subtotal.
+    let remainingDiscount = Number(params.discountAmount);
+    for (const line of editableLines) {
+      if (remainingDiscount <= 0.01) break;
+      const editableSubtotal = Number(line.editableSubtotalSet?.shopMoney?.amount ?? 0);
+      const lineDiscount = Math.min(remainingDiscount, editableSubtotal);
+      if (lineDiscount <= 0.01) continue;
+      const add = await requestShopifyAdmin<{
+        orderEditAddLineItemDiscount: {
+          calculatedLineItem: { id: string } | null;
+          userErrors: Array<{ field?: string[] | null; message: string }>;
+        };
+      }>(ORDER_EDIT_ADD_LINE_DISCOUNT_MUTATION, {
+        id: calc.id,
+        lineItemId: line.id,
+        discount: {
+          fixedValue: { amount: lineDiscount.toFixed(2) },
+          description: params.discountDescription ?? 'Telegraph collection adjustment'
+        }
+      });
+      if (add.orderEditAddLineItemDiscount.userErrors.length > 0) {
+        throw new Error('orderEditAddLineItemDiscount: ' + add.orderEditAddLineItemDiscount.userErrors.map((e) => e.message).join('; '));
       }
-    });
-    if (add.orderEditAddLineItemDiscount.userErrors.length > 0) {
-      throw new Error('orderEditAddLineItemDiscount: ' + add.orderEditAddLineItemDiscount.userErrors.map((e) => e.message).join('; '));
+      remainingDiscount = Number((remainingDiscount - lineDiscount).toFixed(2));
+    }
+    if (remainingDiscount > 0.01) {
+      throw new Error(`Shopify order edit cannot safely apply the remaining discount ${remainingDiscount.toFixed(2)}`);
     }
 
     // 3. Commit the edit so the order total drops by `discountAmount`.

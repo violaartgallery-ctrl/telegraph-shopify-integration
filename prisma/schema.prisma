@@ -52,10 +52,27 @@ model ShipmentRecord {
   odooSyncedAt               DateTime?
   odooAttemptCount           Int                  @default(0)
   odooRetryAt                DateTime?
+  returnSyncStatus           String?
+  returnSyncFingerprint      String?
+  returnSyncAttemptCount     Int                  @default(0)
+  returnSyncRetryAt          DateTime?
+  returnSyncLastError        String?
+  returnSyncClaimedAt        DateTime?
+  shopifyPaymentSyncStatus   String?
+  shopifyPaymentFingerprint  String?
+  shopifyPaymentAttemptCount Int                  @default(0)
+  shopifyPaymentRetryAt      DateTime?
+  shopifyPaymentLastError    String?
+  shopifyPaymentClaimedAt    DateTime?
+  shopifyPaymentSyncedAt     DateTime?
+  shopifyPaymentTransactionId String?
   rawOrderJson               String?
   createdAt                  DateTime             @default(now())
   updatedAt                  DateTime             @updatedAt
   metaDeliveryEvents         MetaDeliveryOutbox[]
+
+  @@index([returnSyncStatus, returnSyncRetryAt], map: "ShipmentRecord_return_sync_queue_idx")
+  @@index([shopifyPaymentSyncStatus, shopifyPaymentRetryAt], map: "ShipmentRecord_shopify_payment_queue_idx")
 }
 
 model MetaDeliveryOutbox {

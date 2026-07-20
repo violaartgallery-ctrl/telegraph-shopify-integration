@@ -43,7 +43,16 @@ export const projectAccurateStatusToShopify = (input: {
   let collectionStatus = 'pending';
   const tags = ['accurate'];
 
-  if (input.cancelled) {
+  // Explicit carrier return truth wins over both an older DTR status and a
+  // cancelled flag. Telegraph can legitimately report RTRN + cancelled after
+  // the parcel has travelled back; treating that as a plain cancellation would
+  // skip the return charge and Shopify return action.
+  if (returnedStatusCodes.has(statusCode) || returnedStatusCodes.has(returnStatusCode)) {
+    tags.push('accurate-returned');
+    if (input.cancelled) tags.push('accurate-cancelled');
+    collectionStatus = input.paidToCustomer ? 'returned-settled' : 'returned';
+    tags.push(input.paidToCustomer ? 'accurate-returned-settled' : 'accurate-returned-unsettled');
+  } else if (input.cancelled) {
     tags.push('accurate-cancelled');
     collectionStatus = 'cancelled';
   } else if (deliveredStatusCodes.has(statusCode) && customerDue < 0) {
@@ -53,10 +62,6 @@ export const projectAccurateStatusToShopify = (input: {
     tags.push('accurate-delivered');
     collectionStatus = input.collected ? 'collected' : 'delivered-not-collected';
     tags.push(input.collected ? 'accurate-collected' : 'accurate-delivered-not-collected');
-  } else if (returnedStatusCodes.has(statusCode) || returnedStatusCodes.has(returnStatusCode)) {
-    tags.push('accurate-returned');
-    collectionStatus = input.paidToCustomer ? 'returned-settled' : 'returned';
-    tags.push(input.paidToCustomer ? 'accurate-returned-settled' : 'accurate-returned-unsettled');
   } else if (statusCode === 'OTD') {
     tags.push('accurate-out-for-delivery');
   } else if (deliveryExceptionStatusCodes.has(statusCode)) {
