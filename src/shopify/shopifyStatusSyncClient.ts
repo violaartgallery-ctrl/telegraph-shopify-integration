@@ -384,7 +384,14 @@ export const shopifyStatusSyncClient = {
     orderId: string | number;
     amount: number;
     gateway?: string;
-  }): Promise<{ skipped: boolean; reason?: string; transactionId?: string; needsDiscountFor?: number; total?: number }> => {
+  }): Promise<{
+    skipped: boolean;
+    reason?: string;
+    transactionId?: string;
+    needsDiscountFor?: number;
+    total?: number;
+    currencyCode?: string;
+  }> => {
     const ownerId = toOrderGid(params.orderId);
     const state = await shopifyStatusSyncClient.fetchOrderPaymentState(params.orderId);
     if (!state) return { skipped: true, reason: 'order-not-found' };
@@ -409,7 +416,13 @@ export const shopifyStatusSyncClient = {
     const gap = Number((state.totalPrice - amount).toFixed(2));
     if (gap > 0.01) {
       // Caller must add a discount first, then call again with the new (post-discount) total.
-      return { skipped: true, reason: 'needs-discount', needsDiscountFor: gap, total: state.totalPrice };
+      return {
+        skipped: true,
+        reason: 'needs-discount',
+        needsDiscountFor: gap,
+        total: state.totalPrice,
+        currencyCode: state.currencyCode ?? undefined
+      };
     }
 
     const captureAmount = Math.min(amount, Math.max(state.totalOutstanding, state.totalPrice));
@@ -451,6 +464,7 @@ export const shopifyStatusSyncClient = {
     orderId: string | number;
     discountAmount: number;
     paymentAmount: number;
+    currencyCode: string;
     discountDescription?: string;
     gateway?: string;
   }): Promise<{ transactionId?: string; calculatedOrderId?: string }> => {
@@ -518,7 +532,10 @@ export const shopifyStatusSyncClient = {
         id: calc.id,
         lineItemId: line.id,
         discount: {
-          fixedValue: { amount: lineDiscount.toFixed(2) },
+          fixedValue: {
+            amount: lineDiscount.toFixed(2),
+            currencyCode: params.currencyCode
+          },
           description: params.discountDescription ?? 'Telegraph collection adjustment'
         }
       });
