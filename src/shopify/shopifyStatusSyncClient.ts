@@ -10,6 +10,13 @@ export const calculateOrderEditDiscountCapacity = (line: {
   Number(line.editableSubtotalSet?.shopMoney?.amount ?? 0) +
   Number(line.uneditableSubtotalSet?.shopMoney?.amount ?? 0);
 
+export const calculateOrderEditDiscountPercent = (netDiscount: number, currentSubtotal: number): number => {
+  if (!Number.isFinite(netDiscount) || !Number.isFinite(currentSubtotal) || netDiscount <= 0 || currentSubtotal <= 0) {
+    return 0;
+  }
+  return Math.min(100, Number(((netDiscount / currentSubtotal) * 100).toFixed(8)));
+};
+
 const METAFIELDS_SET_MUTATION = `
   mutation SetAccurateMetafields($metafields: [MetafieldsSetInput!]!) {
     metafieldsSet(metafields: $metafields) {
@@ -530,6 +537,14 @@ export const shopifyStatusSyncClient = {
       const discountCapacity = calculateOrderEditDiscountCapacity(line);
       const lineDiscount = Math.min(remainingDiscount, discountCapacity);
       if (lineDiscount <= 0.01) continue;
+      // A fixedValue is applied per unit and then combined with pre-existing
+      // discounts, so it can reduce a multi-quantity line by more than requested.
+      // A percentage of the current calculated subtotal produces the exact net
+      // reduction we want, independent of quantity and existing discounts.
+      const percentValue = calculateOrderEditDiscountPercent(lineDiscount, discountCapacity);
+      if (percentValue <= 0 || percentValue > 100) {
+        throw new Error(`Cannot calculate a safe Shopify line discount percentage for ${lineDiscount.toFixed(2)}`);
+      }
       const add = await requestShopifyAdmin<{
         orderEditAddLineItemDiscount: {
           calculatedLineItem: { id: string } | null;
@@ -543,10 +558,7 @@ export const shopifyStatusSyncClient = {
         id: calc.id,
         lineItemId: line.id,
         discount: {
-          fixedValue: {
-            amount: lineDiscount.toFixed(2),
-            currencyCode: params.currencyCode
-          },
+          percentValue,
           description: params.discountDescription ?? 'Telegraph collection adjustment'
         }
       });
