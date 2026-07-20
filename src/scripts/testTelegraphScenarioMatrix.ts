@@ -116,6 +116,16 @@ const scenarios: Scenario[] = [
     expectedTags: ['accurate-returned', 'accurate-returned-unsettled']
   },
   {
+    name: 'cancelled carrier flag still overridden by explicit returned status',
+    statusCode: 'RTRN',
+    cancelled: true,
+    paidToCustomer: true,
+    customerDue: -65,
+    expectedCollectionStatus: 'returned-settled',
+    expectedTerminal: true,
+    expectedTags: ['accurate-returned', 'accurate-cancelled', 'accurate-returned-settled']
+  },
+  {
     name: 'rejected',
     statusCode: 'RJCT',
     expectedCollectionStatus: 'returned',

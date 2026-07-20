@@ -43,16 +43,18 @@ export const projectAccurateStatusToShopify = (input: {
   let collectionStatus = 'pending';
   const tags = ['accurate'];
 
-  if (input.cancelled) {
-    tags.push('accurate-cancelled');
-    collectionStatus = 'cancelled';
-  // A shipment can keep its original DTR status while Telegraph later adds a
-  // returnStatus. The explicit return must win; otherwise a real return is
-  // incorrectly frozen as collected/delivered forever.
-  } else if (returnedStatusCodes.has(statusCode) || returnedStatusCodes.has(returnStatusCode)) {
+  // Explicit carrier return truth wins over both an older DTR status and a
+  // cancelled flag. Telegraph can legitimately report RTRN + cancelled after
+  // the parcel has travelled back; treating that as a plain cancellation would
+  // skip the return charge and Shopify return action.
+  if (returnedStatusCodes.has(statusCode) || returnedStatusCodes.has(returnStatusCode)) {
     tags.push('accurate-returned');
+    if (input.cancelled) tags.push('accurate-cancelled');
     collectionStatus = input.paidToCustomer ? 'returned-settled' : 'returned';
     tags.push(input.paidToCustomer ? 'accurate-returned-settled' : 'accurate-returned-unsettled');
+  } else if (input.cancelled) {
+    tags.push('accurate-cancelled');
+    collectionStatus = 'cancelled';
   } else if (deliveredStatusCodes.has(statusCode) && customerDue < 0) {
     tags.push('accurate-delivered', 'accurate-payment-review');
     collectionStatus = 'payment-review';
