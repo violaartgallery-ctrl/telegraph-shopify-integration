@@ -746,15 +746,25 @@ export const shipmentRepository = {
       where: {
         id: recordId,
         collectionStatus: { in: ['returned', 'returned-settled'] },
-        OR: [
-          { returnSyncStatus: null },
-          { returnSyncFingerprint: null },
-          { returnSyncFingerprint: { not: fingerprint } }
-        ],
-        NOT: {
-          returnSyncStatus: 'processing',
-          returnSyncClaimedAt: { gte: staleBefore }
-        }
+        AND: [
+          {
+            OR: [
+              { returnSyncStatus: null },
+              { returnSyncFingerprint: null },
+              { returnSyncFingerprint: { not: fingerprint } }
+            ]
+          },
+          {
+            // Keep a fresh claim locked, while allowing legacy NULL queue fields
+            // and interrupted/stale claims to enter the durable queue.
+            OR: [
+              { returnSyncStatus: null },
+              { returnSyncStatus: { not: 'processing' } },
+              { returnSyncClaimedAt: null },
+              { returnSyncClaimedAt: { lt: staleBefore } }
+            ]
+          }
+        ]
       },
       data: {
         returnSyncStatus: 'pending',
@@ -888,15 +898,25 @@ export const shipmentRepository = {
       where: {
         id: recordId,
         collectionStatus: 'collected',
-        OR: [
-          { shopifyPaymentSyncStatus: null },
-          { shopifyPaymentFingerprint: null },
-          { shopifyPaymentFingerprint: { not: fingerprint } }
-        ],
-        NOT: {
-          shopifyPaymentSyncStatus: 'processing',
-          shopifyPaymentClaimedAt: { gte: staleBefore }
-        }
+        AND: [
+          {
+            OR: [
+              { shopifyPaymentSyncStatus: null },
+              { shopifyPaymentFingerprint: null },
+              { shopifyPaymentFingerprint: { not: fingerprint } }
+            ]
+          },
+          {
+            // SQL three-valued logic makes NOT(A AND B) reject legacy NULLs.
+            // Spell out the safe-to-queue states so old rows are recoverable.
+            OR: [
+              { shopifyPaymentSyncStatus: null },
+              { shopifyPaymentSyncStatus: { not: 'processing' } },
+              { shopifyPaymentClaimedAt: null },
+              { shopifyPaymentClaimedAt: { lt: staleBefore } }
+            ]
+          }
+        ]
       },
       data: {
         shopifyPaymentSyncStatus: 'pending',
