@@ -134,6 +134,27 @@ const ORDER_EDIT_ADD_LINE_DISCOUNT_MUTATION = `
       calculatedOrder {
         id
         totalPriceSet { shopMoney { amount } }
+        addedDiscountApplications(first: 50) { nodes { id } }
+      }
+      userErrors { field message }
+    }
+  }
+`;
+
+const ORDER_EDIT_UPDATE_DISCOUNT_MUTATION = `
+  mutation TelegraphOrderEditUpdateDiscount(
+    $id: ID!
+    $discountApplicationId: ID!
+    $discount: OrderEditAppliedDiscountInput!
+  ) {
+    orderEditUpdateDiscount(
+      id: $id
+      discountApplicationId: $discountApplicationId
+      discount: $discount
+    ) {
+      calculatedOrder {
+        id
+        totalPriceSet { shopMoney { amount } }
       }
       userErrors { field message }
     }
@@ -529,19 +550,20 @@ export const shopifyStatusSyncClient = {
       );
     }
 
-    // 2. Add fixed discounts without ever exceeding a line's full subtotal.
+    // 2. Add and calibrate net discounts without exceeding a line's subtotal.
     let remainingDiscount = Number(params.discountAmount);
-    let stagedTotal: number | null = null;
+    let stagedTotal = initialCalculatedTotal;
+    let previousStagedTotal = initialCalculatedTotal;
+    const knownDiscountApplicationIds = new Set<string>();
     for (const line of discountableLines) {
       if (remainingDiscount <= 0.01) break;
       const discountCapacity = calculateOrderEditDiscountCapacity(line);
       const lineDiscount = Math.min(remainingDiscount, discountCapacity);
       if (lineDiscount <= 0.01) continue;
-      // A fixedValue is applied per unit and then combined with pre-existing
-      // discounts, so it can reduce a multi-quantity line by more than requested.
-      // A percentage of the current calculated subtotal produces the exact net
-      // reduction we want, independent of quantity and existing discounts.
-      const percentValue = calculateOrderEditDiscountPercent(lineDiscount, discountCapacity);
+      // Shopify combines a new line discount with existing automatic discounts.
+      // Start from the current subtotal ratio, then use the calculated order as
+      // feedback and update the same staged discount until the net reduction is exact.
+      let percentValue = calculateOrderEditDiscountPercent(lineDiscount, discountCapacity);
       if (percentValue <= 0 || percentValue > 100) {
         throw new Error(`Cannot calculate a safe Shopify line discount percentage for ${lineDiscount.toFixed(2)}`);
       }
@@ -551,6 +573,7 @@ export const shopifyStatusSyncClient = {
           calculatedOrder: {
             id: string;
             totalPriceSet: { shopMoney: { amount: string } };
+            addedDiscountApplications: { nodes: Array<{ id: string }> };
           } | null;
           userErrors: Array<{ field?: string[] | null; message: string }>;
         };
@@ -565,15 +588,66 @@ export const shopifyStatusSyncClient = {
       if (add.orderEditAddLineItemDiscount.userErrors.length > 0) {
         throw new Error('orderEditAddLineItemDiscount: ' + add.orderEditAddLineItemDiscount.userErrors.map((e) => e.message).join('; '));
       }
+      const addedApplicationIds =
+        add.orderEditAddLineItemDiscount.calculatedOrder?.addedDiscountApplications.nodes.map((node) => node.id) ?? [];
+      const newApplicationIds = addedApplicationIds.filter((id) => !knownDiscountApplicationIds.has(id));
+      if (newApplicationIds.length !== 1) {
+        throw new Error(`Expected one new Shopify discount application, found ${newApplicationIds.length}`);
+      }
+      addedApplicationIds.forEach((id) => knownDiscountApplicationIds.add(id));
+      const discountApplicationId = newApplicationIds[0]!;
       stagedTotal = Number(
         add.orderEditAddLineItemDiscount.calculatedOrder?.totalPriceSet?.shopMoney?.amount ?? NaN
       );
+      let actualLineReduction = previousStagedTotal - stagedTotal;
+
+      for (let calibrationAttempt = 0;
+        calibrationAttempt < 3 && Math.abs(actualLineReduction - lineDiscount) > 0.01;
+        calibrationAttempt++) {
+        if (!Number.isFinite(actualLineReduction) || actualLineReduction <= 0) {
+          throw new Error(`Shopify staged discount produced invalid reduction ${actualLineReduction}`);
+        }
+        percentValue = Math.min(
+          100,
+          Number((percentValue * (lineDiscount / actualLineReduction)).toFixed(8))
+        );
+        const update = await requestShopifyAdmin<{
+          orderEditUpdateDiscount: {
+            calculatedOrder: {
+              id: string;
+              totalPriceSet: { shopMoney: { amount: string } };
+            } | null;
+            userErrors: Array<{ field?: string[] | null; message: string }>;
+          };
+        }>(ORDER_EDIT_UPDATE_DISCOUNT_MUTATION, {
+          id: calc.id,
+          discountApplicationId,
+          discount: {
+            percentValue,
+            description: params.discountDescription ?? 'Telegraph collection adjustment'
+          }
+        });
+        if (update.orderEditUpdateDiscount.userErrors.length > 0) {
+          throw new Error('orderEditUpdateDiscount: ' + update.orderEditUpdateDiscount.userErrors.map((e) => e.message).join('; '));
+        }
+        stagedTotal = Number(
+          update.orderEditUpdateDiscount.calculatedOrder?.totalPriceSet?.shopMoney?.amount ?? NaN
+        );
+        actualLineReduction = previousStagedTotal - stagedTotal;
+      }
+      if (!Number.isFinite(actualLineReduction) || Math.abs(actualLineReduction - lineDiscount) > 0.01) {
+        throw new Error(
+          `Shopify calibrated line discount ${Number.isFinite(actualLineReduction) ? actualLineReduction.toFixed(2) : 'missing'} ` +
+          `does not match requested line discount ${lineDiscount.toFixed(2)}`
+        );
+      }
+      previousStagedTotal = stagedTotal;
       remainingDiscount = Number((remainingDiscount - lineDiscount).toFixed(2));
     }
     if (remainingDiscount > 0.01) {
       throw new Error(`Shopify order edit cannot safely apply the remaining discount ${remainingDiscount.toFixed(2)}`);
     }
-    const stagedDiscountDelta = stagedTotal === null ? NaN : initialCalculatedTotal - stagedTotal;
+    const stagedDiscountDelta = initialCalculatedTotal - stagedTotal;
     if (!Number.isFinite(stagedDiscountDelta) || Math.abs(stagedDiscountDelta - Number(params.discountAmount)) > 0.01) {
       throw new Error(
         `Shopify staged discount ${Number.isFinite(stagedDiscountDelta) ? stagedDiscountDelta.toFixed(2) : 'missing'} ` +
