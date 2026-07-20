@@ -124,7 +124,7 @@ const ORDER_EDIT_ADD_LINE_DISCOUNT_MUTATION = `
       calculatedLineItem { id }
       calculatedOrder {
         id
-        totalOutstandingSet { shopMoney { amount } }
+        totalPriceSet { shopMoney { amount } }
       }
       userErrors { field message }
     }
@@ -513,7 +513,7 @@ export const shopifyStatusSyncClient = {
 
     // 2. Add fixed discounts without ever exceeding a line's full subtotal.
     let remainingDiscount = Number(params.discountAmount);
-    let stagedOutstanding: number | null = null;
+    let stagedTotal: number | null = null;
     for (const line of discountableLines) {
       if (remainingDiscount <= 0.01) break;
       const discountCapacity = calculateOrderEditDiscountCapacity(line);
@@ -524,7 +524,7 @@ export const shopifyStatusSyncClient = {
           calculatedLineItem: { id: string } | null;
           calculatedOrder: {
             id: string;
-            totalOutstandingSet: { shopMoney: { amount: string } };
+            totalPriceSet: { shopMoney: { amount: string } };
           } | null;
           userErrors: Array<{ field?: string[] | null; message: string }>;
         };
@@ -542,8 +542,8 @@ export const shopifyStatusSyncClient = {
       if (add.orderEditAddLineItemDiscount.userErrors.length > 0) {
         throw new Error('orderEditAddLineItemDiscount: ' + add.orderEditAddLineItemDiscount.userErrors.map((e) => e.message).join('; '));
       }
-      stagedOutstanding = Number(
-        add.orderEditAddLineItemDiscount.calculatedOrder?.totalOutstandingSet?.shopMoney?.amount ?? NaN
+      stagedTotal = Number(
+        add.orderEditAddLineItemDiscount.calculatedOrder?.totalPriceSet?.shopMoney?.amount ?? NaN
       );
       remainingDiscount = Number((remainingDiscount - lineDiscount).toFixed(2));
     }
@@ -551,12 +551,12 @@ export const shopifyStatusSyncClient = {
       throw new Error(`Shopify order edit cannot safely apply the remaining discount ${remainingDiscount.toFixed(2)}`);
     }
     if (
-      stagedOutstanding === null ||
-      !Number.isFinite(stagedOutstanding) ||
-      Math.abs(stagedOutstanding - Number(params.paymentAmount)) > 0.01
+      stagedTotal === null ||
+      !Number.isFinite(stagedTotal) ||
+      Math.abs(stagedTotal - Number(params.paymentAmount)) > 0.01
     ) {
       throw new Error(
-        `Shopify staged total ${stagedOutstanding !== null && Number.isFinite(stagedOutstanding) ? stagedOutstanding.toFixed(2) : 'missing'} ` +
+        `Shopify staged total ${stagedTotal !== null && Number.isFinite(stagedTotal) ? stagedTotal.toFixed(2) : 'missing'} ` +
         `does not match collected amount ${Number(params.paymentAmount).toFixed(2)}`
       );
     }
