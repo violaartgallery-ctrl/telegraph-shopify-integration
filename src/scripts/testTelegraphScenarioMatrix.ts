@@ -1,7 +1,10 @@
 import { projectAccurateStatusToShopify } from '../services/accurateStatusMapper.js';
 import { calculateTelegraphMerchantPaymentAmount, calculateTelegraphReturnCharge } from '../odoo/odooSyncService.js';
 import { buildReturnSyncFingerprint, buildShopifyPaymentFingerprint } from '../services/shipmentStatusSyncService.js';
-import { calculateOrderEditDiscountCapacity } from '../shopify/shopifyStatusSyncClient.js';
+import {
+  calculateOrderEditDiscountCapacity,
+  calculateOrderEditDiscountPercent
+} from '../shopify/shopifyStatusSyncClient.js';
 
 interface Scenario {
   name: string;
@@ -233,6 +236,14 @@ assert(
   }) === 1000,
   'mixed fulfilled and unfulfilled subtotal must be combined'
 );
+assert(
+  Math.abs(calculateOrderEditDiscountPercent(100, 960) - 10.41666667) < 0.00000001,
+  'net discount percentage must use the already-discounted multi-quantity subtotal'
+);
+assert(
+  calculateOrderEditDiscountPercent(960, 960) === 100,
+  'full subtotal discount must cap at 100 percent'
+);
 
 console.log(JSON.stringify({
   ok: true,
@@ -240,5 +251,6 @@ console.log(JSON.stringify({
   returnChargeScenarios: returnChargeCases.length,
   paymentAmountScenarios: paymentAmountCases.length,
   fulfilledDiscountCapacity: true,
+  netDiscountPercentage: true,
   idempotencyFingerprints: true
 }, null, 2));
