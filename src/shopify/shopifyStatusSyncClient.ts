@@ -102,6 +102,8 @@ const ORDER_EDIT_BEGIN_MUTATION = `
     orderEditBegin(id: $id) {
       calculatedOrder {
         id
+        totalPriceSet { shopMoney { amount } }
+        stagedChanges(first: 1) { nodes { __typename } }
         lineItems(first: 50) {
           edges {
             node {
@@ -475,6 +477,8 @@ export const shopifyStatusSyncClient = {
       orderEditBegin: {
         calculatedOrder: {
           id: string;
+          totalPriceSet: { shopMoney: { amount: string } };
+          stagedChanges: { nodes: Array<{ __typename: string }> };
           lineItems: {
             edges: Array<{
               node: {
@@ -494,6 +498,13 @@ export const shopifyStatusSyncClient = {
     }
     const calc = begin.orderEditBegin.calculatedOrder;
     if (!calc) throw new Error('orderEditBegin returned no calculatedOrder');
+    if (calc.stagedChanges.nodes.length > 0) {
+      throw new Error('orderEditBegin returned a session with pre-existing staged changes');
+    }
+    const initialCalculatedTotal = Number(calc.totalPriceSet?.shopMoney?.amount ?? NaN);
+    if (!Number.isFinite(initialCalculatedTotal)) {
+      throw new Error('orderEditBegin returned no calculated total');
+    }
     const discountableLines = calc.lineItems.edges.map((edge) => edge.node);
     if (discountableLines.length === 0) throw new Error('orderEditBegin: order has no line items to discount');
 
@@ -550,14 +561,11 @@ export const shopifyStatusSyncClient = {
     if (remainingDiscount > 0.01) {
       throw new Error(`Shopify order edit cannot safely apply the remaining discount ${remainingDiscount.toFixed(2)}`);
     }
-    if (
-      stagedTotal === null ||
-      !Number.isFinite(stagedTotal) ||
-      Math.abs(stagedTotal - Number(params.paymentAmount)) > 0.01
-    ) {
+    const stagedDiscountDelta = stagedTotal === null ? NaN : initialCalculatedTotal - stagedTotal;
+    if (!Number.isFinite(stagedDiscountDelta) || Math.abs(stagedDiscountDelta - Number(params.discountAmount)) > 0.01) {
       throw new Error(
-        `Shopify staged total ${stagedTotal !== null && Number.isFinite(stagedTotal) ? stagedTotal.toFixed(2) : 'missing'} ` +
-        `does not match collected amount ${Number(params.paymentAmount).toFixed(2)}`
+        `Shopify staged discount ${Number.isFinite(stagedDiscountDelta) ? stagedDiscountDelta.toFixed(2) : 'missing'} ` +
+        `does not match requested discount ${Number(params.discountAmount).toFixed(2)}`
       );
     }
 
