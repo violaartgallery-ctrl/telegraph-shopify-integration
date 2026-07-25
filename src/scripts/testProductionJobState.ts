@@ -9,7 +9,9 @@ import {
   createPreviewJob,
   finishPreview,
   loadJob,
+  loadPreviewSourceSnapshot,
   queueRun,
+  savePreviewSourceSnapshot,
   type PreviewCursor,
   type RunCursor,
   yieldJob,
@@ -33,6 +35,24 @@ try {
 
   const claimed = await claimJob(chatId, batchId) as PreviewCursor | null;
   assert.ok(claimed?.executionToken, 'preview lease must be claimed');
+  await savePreviewSourceSnapshot(chatId, batchId, claimed.executionToken!, {
+    wordBase64: Buffer.from('snapshot').toString('base64'),
+    productionEntries: [],
+    ordersDetail: [
+      {
+        order_name: '#TEST-1',
+        customer: 'Test',
+        created_at: '2026-07-25T00:00:00Z',
+        items: [],
+      },
+    ],
+    warnings: [],
+  });
+  assert.equal(
+    (await loadPreviewSourceSnapshot(batchId))?.ordersDetail[0]?.order_name,
+    '#TEST-1',
+    'preview source snapshot must be durable'
+  );
 
   const queuedRun = await queueRun(chatId, { recipientChatIds: [chatId] });
   assert.equal(queuedRun.action, 'queued_after_preview');
@@ -51,6 +71,11 @@ try {
   );
   assert.equal(transitioned.kind, 'run');
   assert.deepEqual(transitioned.orderNumbers, ['#TEST-1', '#TEST-2']);
+  assert.equal(
+    await loadPreviewSourceSnapshot(batchId),
+    null,
+    'finished preview must remove its temporary source snapshot'
+  );
 
   const claims = await Promise.all(
     Array.from({ length: 8 }, () => claimJob(chatId, batchId))
@@ -77,7 +102,7 @@ try {
     where: { source: 'prod_job_history', reason: batchId, externalId: String(chatId) },
   });
   assert.equal(history.length, 1, 'completion history must be durable');
-  console.log(JSON.stringify({ ok: true, batchId, checks: 9 }));
+  console.log(JSON.stringify({ ok: true, batchId, checks: 11 }));
 } finally {
   await clearJob(chatId);
   if (batchId) {

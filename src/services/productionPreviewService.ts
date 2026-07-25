@@ -11,6 +11,11 @@ import { PermanentProductionError, SoftDeadlineError } from './productionPipelin
 
 type Checkpoint = () => Promise<void>;
 
+interface ProductionSourceSnapshotStore {
+  load: () => Promise<ProductionAgentResponse | null>;
+  save: (data: ProductionAgentResponse) => Promise<void>;
+}
+
 function assertTime(deadline: number, progress: string): void {
   if (Date.now() >= deadline) throw new SoftDeadlineError(progress);
 }
@@ -113,8 +118,9 @@ export async function sendCompleteProductionPreview(options: {
   cursor: PreviewCursor;
   deadline: number;
   checkpoint: Checkpoint;
+  sourceSnapshot?: ProductionSourceSnapshotStore;
 }): Promise<void> {
-  const { chatId, cursor, deadline, checkpoint } = options;
+  const { chatId, cursor, deadline, checkpoint, sourceSnapshot } = options;
   assertTime(deadline, 'لم يبدأ جلب التجميعة بعد');
 
   await sendMessage(
@@ -124,10 +130,14 @@ export async function sendCompleteProductionPreview(options: {
       : `📦 جاري تثبيت أوردرات التجميعة ${cursor.batchId}...`
   );
 
-  const data = await fetchProductionBatch({
-    orderId: cursor.orderId,
-    orderNumbers: cursor.orderNumbers.length ? cursor.orderNumbers : undefined,
-  });
+  const savedSnapshot = await sourceSnapshot?.load() ?? null;
+  let data = savedSnapshot;
+  if (!data) {
+    data = await fetchProductionBatch({
+      orderId: cursor.orderId,
+      orderNumbers: cursor.orderNumbers.length ? cursor.orderNumbers : undefined,
+    });
+  }
 
   if (!cursor.orderNumbers.length) {
     cursor.orderNumbers = extractOrderNumbers(data);
@@ -137,6 +147,11 @@ export async function sendCompleteProductionPreview(options: {
     }
   }
   validateSource(cursor, data);
+  if (sourceSnapshot && !savedSnapshot) {
+    // Capture the complete source before the first externally-visible send.
+    // Every continuation then regenerates artifacts from these exact bytes.
+    await sourceSnapshot.save(data);
+  }
   await checkpoint();
 
   const count = cursor.orderNumbers.length;
@@ -194,7 +209,7 @@ export async function sendCompleteProductionPreview(options: {
 
   // 3) Print-ready photo sheet. Any failed source image blocks completion.
   assertTime(deadline, 'باقي ورق طباعة الصور والصور المنفردة');
-  const { buildPrintSheetPdf, kindForProduct } = await import('./printSheet.js');
+  const { buildPrintSheetPdf, kindForProduct, printPhotoSourceUrl } = await import('./printSheet.js');
   const printSources: Array<{ url: string; kind: 'wallet' | 'keychain' }> = [];
   const seenPrint = new Set<string>();
   for (const entry of data.productionEntries) {
@@ -210,7 +225,7 @@ export async function sendCompleteProductionPreview(options: {
     const photos: Array<{ buffer: Buffer; kind: 'wallet' | 'keychain' }> = [];
     for (const source of printSources) {
       assertTime(deadline, 'باقي تحميل صور ورق الطباعة');
-      photos.push({ buffer: await fetchBinary(source.url), kind: source.kind });
+      photos.push({ buffer: await fetchBinary(printPhotoSourceUrl(source.url)), kind: source.kind });
     }
     const pdfBytes = await buildPrintSheetPdf(photos);
     if (!pdfBytes) throw new Error('Print-sheet builder returned no PDF');

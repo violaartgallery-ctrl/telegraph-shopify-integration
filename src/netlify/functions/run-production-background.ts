@@ -12,9 +12,11 @@ import {
   completeRun,
   createPreviewJob,
   finishPreview,
+  loadPreviewSourceSnapshot,
   markNeedsReview,
   ProductionJobLeaseLostError,
   retryJob,
+  savePreviewSourceSnapshot,
   type JobCursor,
   type PreviewCursor,
   type RunCursor,
@@ -103,6 +105,15 @@ export async function runPipeline(chatId: number, expectedBatchId?: string): Pro
         cursor,
         deadline,
         checkpoint,
+        sourceSnapshot: {
+          load: async () => await loadPreviewSourceSnapshot(cursor.batchId),
+          save: async (data) => await savePreviewSourceSnapshot(
+            chatId,
+            cursor.batchId,
+            executionToken,
+            data
+          ),
+        },
       });
 
       await sendMessage(
