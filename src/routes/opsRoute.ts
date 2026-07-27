@@ -72,7 +72,10 @@ export const createOpsRouter = (
   router.get('/ops/sync-collections', async (request, response) => {
     if (!strictGuard(request, response)) return;
     try {
-      const result = await shipmentStatusSyncService.syncCollectionsFromReports({ maxActions: 12, budgetMs: 70_000 });
+      const result = await shipmentStatusSyncService.syncCollectionsFromReports({
+        maxActions: Math.max(1, Math.min(queryInt(request, 'maxActions', 2), 4)),
+        budgetMs: 70_000
+      });
       response.json({ ok: true, ...result });
     } catch (error) {
       logger.error('ops/sync-collections failed', { reason: error instanceof Error ? error.message : String(error) });
@@ -102,7 +105,9 @@ export const createOpsRouter = (
       const result = await shipmentStatusSyncService.processReturnQueue({
         limit: queryInt(request, 'limit', 4),
         budgetMs: 70_000,
-        apply: queryApply(request)
+        apply: queryApply(request),
+        // Carrier status alone never changes sellable Shopify inventory.
+        restock: false
       });
       response.json({ ok: true, ...result });
     } catch (error) {
@@ -117,7 +122,9 @@ export const createOpsRouter = (
       const result = await shipmentStatusSyncService.processShopifyPaymentQueue({
         limit: queryInt(request, 'limit', 6),
         budgetMs: 70_000,
-        apply: queryApply(request)
+        apply: queryApply(request),
+        // Partial collections remain review-only in scheduled automation.
+        allowDiscounts: false
       });
       response.json({ ok: true, ...result });
     } catch (error) {
@@ -224,11 +231,11 @@ export const createOpsRouter = (
 
       if (!result.ok && previous?.payloadJson !== fingerprint) {
         const alert = [
-          '🚨 تنبيه أمان Viola Production',
-          `Theme: ${result.theme.ok ? 'OK' : result.theme.error ?? 'FAILED'}`,
-          `Shopify Validation: ${result.validation.ok ? 'OK' : result.validation.error ?? 'FAILED'}`,
-          `Vercel locations fallback: ${result.vercelFallback.ok ? 'OK' : result.vercelFallback.error ?? 'FAILED'}`,
-          'لن يتم تخمين مناطق؛ راجع النظام قبل أي Run جديد.',
+          '🚨 تنبيه أمان متجر VIOLA',
+          `صفحة السلة والشراء المفتوح: ${result.theme.ok ? 'سليمة' : result.theme.error ?? 'تحتاج مراجعة'}`,
+          `منع المحافظة والمنطقة: ${result.validation.ok ? 'متوقف كما هو مطلوب' : 'مفعّل وقد يمنع العملاء'}`,
+          `نسخة بيانات المناطق الاحتياطية (للتشخيص فقط): ${result.vercelFallback.ok ? 'سليمة' : result.vercelFallback.error ?? 'غير متاحة'}`,
+          'المزامنة المالية منفصلة عن الثيم، ولم يتم تعديل رحلة الشراء.',
         ].join('\n');
         await Promise.all(recipients.map((recipient) => sendMessage(recipient, alert)));
         await prisma.failedPayload.deleteMany({ where: stateWhere });
@@ -238,7 +245,7 @@ export const createOpsRouter = (
       } else if (result.ok && previous) {
         await Promise.all(recipients.map((recipient) => sendMessage(
           recipient,
-          '✅ Viola Production health رجع سليم: Theme + Shopify Validation + Vercel fallback.'
+          '✅ متجر VIOLA رجع سليم: السلة متاحة ومنع المحافظة والمنطقة غير مفعّل.'
         )));
         await prisma.failedPayload.deleteMany({ where: stateWhere });
       }

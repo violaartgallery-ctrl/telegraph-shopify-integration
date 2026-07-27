@@ -47,6 +47,31 @@ export function kindForProduct(product: string): PrintKind {
   return "keychain";
 }
 
+/**
+ * Shopify can resize the original image at the CDN edge. Keeping print sources
+ * at or below 2400px prevents huge uploads from exhausting the serverless image
+ * decoder while retaining well over the detail required by the print layout.
+ */
+export function printPhotoSourceUrl(sourceUrl: string): string {
+  try {
+    const url = new URL(sourceUrl);
+    const hostname = url.hostname.toLowerCase();
+    const isShopifyCdn =
+      hostname === "cdn.shopify.com" ||
+      hostname.endsWith(".shopifycdn.com") ||
+      hostname.endsWith(".shopifycdn.net");
+    if (!isShopifyCdn) return sourceUrl;
+
+    const currentWidth = Number(url.searchParams.get("width"));
+    if (!Number.isFinite(currentWidth) || currentWidth <= 0 || currentWidth > 2400) {
+      url.searchParams.set("width", "2400");
+    }
+    return url.toString();
+  } catch {
+    return sourceUrl;
+  }
+}
+
 // ── skyline bin-packing (bottom-left), mirrors print_layout._skyline_pack ─────
 type Seg = { x: number; w: number; y: number };
 interface Item { idx: number; iw: number; ih: number; cw: number; ch: number }

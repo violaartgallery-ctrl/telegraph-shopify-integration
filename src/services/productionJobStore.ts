@@ -12,6 +12,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
+import type { ProductionAgentResponse } from './productionAgentClient.js';
 import type { ShipResult } from './productionJobTypes.js';
 
 type JobTransaction = Pick<Prisma.TransactionClient, '$queryRawUnsafe' | 'failedPayload'>;
@@ -73,6 +74,7 @@ export type QueueRunAction =
 
 const SOURCE = 'prod_job';
 const HISTORY_SOURCE = 'prod_job_history';
+const PREVIEW_SNAPSHOT_SOURCE = 'prod_preview_snapshot';
 
 // A running lease older than this is recoverable after an invocation crash.
 export const JOB_STALE_MS = 330_000;
@@ -225,6 +227,79 @@ export async function loadJob(chatId: number): Promise<JobCursor | null> {
   return row ? parseCursor(row.payloadJson) : null;
 }
 
+function parsePreviewSnapshot(payloadJson: string): ProductionAgentResponse | null {
+  try {
+    const parsed = JSON.parse(payloadJson) as Partial<ProductionAgentResponse>;
+    if (
+      typeof parsed.wordBase64 !== 'string' ||
+      !Array.isArray(parsed.productionEntries) ||
+      !Array.isArray(parsed.ordersDetail) ||
+      !Array.isArray(parsed.warnings)
+    ) {
+      return null;
+    }
+    return parsed as ProductionAgentResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Return the immutable source captured before the first Telegram artifact was
+ * sent. Continuations must use this exact payload so file indexes cannot drift.
+ */
+export async function loadPreviewSourceSnapshot(
+  batchId: string
+): Promise<ProductionAgentResponse | null> {
+  const prisma = await db();
+  const row = await prisma.failedPayload.findFirst({
+    where: { source: PREVIEW_SNAPSHOT_SOURCE, reason: batchId },
+    orderBy: { id: 'desc' },
+  });
+  if (!row) return null;
+  const snapshot = parsePreviewSnapshot(row.payloadJson);
+  if (!snapshot) throw new Error(`Preview source snapshot ${batchId} is invalid`);
+  return snapshot;
+}
+
+/**
+ * Persist the source only while this invocation still owns the preview lease.
+ * The snapshot is written before any Telegram document is sent.
+ */
+export async function savePreviewSourceSnapshot(
+  chatId: number,
+  batchId: string,
+  executionToken: string,
+  data: ProductionAgentResponse
+): Promise<void> {
+  const prisma = await db();
+  await prisma.$transaction(async (transaction) => {
+    await lockChat(transaction, chatId);
+    const existing = await readLocked(transaction, chatId);
+    if (
+      !existing ||
+      existing.cursor.kind !== 'preview' ||
+      existing.cursor.batchId !== batchId ||
+      existing.cursor.executionToken !== executionToken ||
+      existing.cursor.status !== 'running'
+    ) {
+      throw new ProductionJobLeaseLostError();
+    }
+
+    await transaction.failedPayload.deleteMany({
+      where: { source: PREVIEW_SNAPSHOT_SOURCE, reason: batchId },
+    });
+    await transaction.failedPayload.create({
+      data: {
+        source: PREVIEW_SNAPSHOT_SOURCE,
+        reason: batchId,
+        externalId: chatKey(chatId),
+        payloadJson: JSON.stringify(data),
+      },
+    });
+  });
+}
+
 export async function listRecoverableJobs(): Promise<Array<{ chatId: number; job: JobCursor }>> {
   const prisma = await db();
   const rows = await prisma.failedPayload.findMany({
@@ -257,6 +332,9 @@ export async function createPreviewJob(
     const existing = await readLocked(transaction, chatId);
     if (existing) return { created: false, job: existing.cursor };
 
+    await transaction.failedPayload.deleteMany({
+      where: { source: PREVIEW_SNAPSHOT_SOURCE, externalId: chatKey(chatId) },
+    });
     const job = createPreviewCursor(options);
     await writeLocked(transaction, chatId, job);
     return { created: true, job };
@@ -441,6 +519,9 @@ export async function finishPreview(
     if (cursor.pendingRun) {
       const run = runCursorFromPreview(cursor);
       await writeLocked(transaction, chatId, run);
+      await transaction.failedPayload.deleteMany({
+        where: { source: PREVIEW_SNAPSHOT_SOURCE, reason: cursor.batchId },
+      });
       return run;
     }
 
@@ -449,6 +530,9 @@ export async function finishPreview(
     cursor.attemptCount = 0;
     cursor.lastError = undefined;
     await writeLocked(transaction, chatId, cursor);
+    await transaction.failedPayload.deleteMany({
+      where: { source: PREVIEW_SNAPSHOT_SOURCE, reason: cursor.batchId },
+    });
     return cursor;
   });
 }
@@ -506,6 +590,9 @@ export async function completeRun(
     await transaction.failedPayload.deleteMany({
       where: { source: SOURCE, reason: chatKey(chatId) },
     });
+    await transaction.failedPayload.deleteMany({
+      where: { source: PREVIEW_SNAPSHOT_SOURCE, externalId: chatKey(chatId) },
+    });
   });
 }
 
@@ -515,6 +602,9 @@ export async function clearJob(chatId: number): Promise<void> {
     await lockChat(transaction, chatId);
     await transaction.failedPayload.deleteMany({
       where: { source: SOURCE, reason: chatKey(chatId) },
+    });
+    await transaction.failedPayload.deleteMany({
+      where: { source: PREVIEW_SNAPSHOT_SOURCE, externalId: chatKey(chatId) },
     });
   });
 }

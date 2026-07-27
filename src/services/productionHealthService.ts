@@ -3,13 +3,12 @@ import { requestShopifyAdmin } from '../shopify/shopifyAdminGraphql.js';
 export interface ProductionHealthResult {
   ok: boolean;
   checkedAt: string;
+  policy: 'open-checkout';
   theme: {
     ok: boolean;
+    cartReachable: boolean;
     selectorPresent: boolean;
     usesNetlify: boolean;
-    assetUrl?: string;
-    governorates?: number;
-    areas?: number;
     error?: string;
   };
   validation: {
@@ -64,32 +63,20 @@ async function checkTheme(): Promise<ProductionHealthResult['theme']> {
     const html = await response.text();
     const rendered = html.replace(/\\\//g, '/');
     const selectorPresent =
-      rendered.includes('telegraph-location') &&
-      rendered.includes('Telegraph Governorate ID') &&
-      rendered.includes('Telegraph Area ID');
+      /name=["']attributes\[Telegraph (?:Governorate|Area) ID\]["']/i.test(rendered);
     const usesNetlify = /netlify/i.test(rendered);
-    const match = rendered.match(/(?:https?:)?\/\/[^"'\s]*telegraph-locations\.json[^"'\s<]*/i)
-      ?? rendered.match(/\/cdn\/shop\/[^"'\s]*telegraph-locations\.json[^"'\s<]*/i);
-    if (!match) throw new Error('rendered cart did not expose telegraph-locations.json');
-    const rawAssetUrl = match[0];
-    const assetUrl = rawAssetUrl.startsWith('//')
-      ? `https:${rawAssetUrl}`
-      : rawAssetUrl.startsWith('/')
-        ? `${storefrontUrl()}${rawAssetUrl}`
-        : rawAssetUrl;
-    const assetResponse = await fetch(assetUrl, { signal: AbortSignal.timeout(20_000) });
-    if (!assetResponse.ok) throw new Error(`locations asset HTTP ${assetResponse.status}`);
-    const counts = countLocations(await assetResponse.json());
     return {
-      ok: selectorPresent && !usesNetlify && healthyLocationCounts(counts),
+      // Current storefront policy intentionally keeps checkout open and does not
+      // render the retired Telegraph governorate/area gate.
+      ok: !selectorPresent && !usesNetlify,
+      cartReachable: true,
       selectorPresent,
       usesNetlify,
-      assetUrl,
-      ...counts,
     };
   } catch (error) {
     return {
       ok: false,
+      cartReachable: false,
       selectorPresent: false,
       usesNetlify: false,
       error: String(error).slice(0, 400),
@@ -123,18 +110,17 @@ async function checkValidation(): Promise<ProductionHealthResult['validation']> 
       }
     `);
     const rule = data.validations.nodes.find((node) => node.title === VALIDATION_TITLE);
-    const ok = Boolean(
-      rule?.enabled &&
-      rule.blockOnFailure &&
-      rule.shopifyFunction?.apiType === 'cart_checkout_validation'
-    );
+    // The location validation is deliberately disabled while checkout remains
+    // open. A missing or disabled rule is healthy; an enabled rule can block
+    // customers and must fail this monitor.
+    const ok = !rule?.enabled;
     return {
       ok,
       ...(rule ? {
         id: rule.id,
         enabled: rule.enabled,
         blockOnFailure: rule.blockOnFailure,
-      } : { error: 'validation rule is missing' }),
+      } : {}),
     };
   } catch (error) {
     return { ok: false, error: String(error).slice(0, 400) };
@@ -162,8 +148,11 @@ export async function checkProductionHealth(): Promise<ProductionHealthResult> {
     checkVercelFallback(),
   ]);
   return {
-    ok: theme.ok && validation.ok && vercelFallback.ok,
+    // The Vercel locations endpoint is kept as a diagnostic only. It is not in
+    // the customer journey and must never make the open checkout look unhealthy.
+    ok: theme.ok && validation.ok,
     checkedAt: new Date().toISOString(),
+    policy: 'open-checkout',
     theme,
     validation,
     vercelFallback,

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import type { ProductionAgentResponse } from '../services/productionAgentClient.js';
 import { createPreviewCursor } from '../services/productionJobStore.js';
 import { sendCompleteProductionPreview } from '../services/productionPreviewService.js';
 import { signedResumeHeaders, verifyResumeRequest } from '../services/productionContinuation.js';
+import { printPhotoSourceUrl } from '../services/printSheet.js';
 
 const originalFetch = globalThis.fetch;
 const originalToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -11,6 +13,7 @@ const originalResumeSecret = process.env.PRODUCTION_RESUME_SECRET;
 const telegramMessages: string[] = [];
 let telegramDocuments = 0;
 let agentCalls = 0;
+let savedSnapshot: ProductionAgentResponse | null = null;
 
 const agentPayload = {
   wordBase64: Buffer.from('test-word-document').toString('base64'),
@@ -58,6 +61,14 @@ try {
     cursor,
     deadline: Date.now() + 120_000,
     checkpoint: async () => { checkpoints += 1; },
+    sourceSnapshot: {
+      load: async () => savedSnapshot
+        ? JSON.parse(JSON.stringify(savedSnapshot)) as ProductionAgentResponse
+        : null,
+      save: async (data) => {
+        savedSnapshot = JSON.parse(JSON.stringify(data)) as ProductionAgentResponse;
+      },
+    },
   });
 
   await run();
@@ -70,7 +81,7 @@ try {
   assert.equal(telegramDocuments, 4, 'a resumed preview must not resend confirmed documents');
   assert.equal(cursor.sentArtifactKeys.length, 6, 'confirmed artifact keys must stay unique');
   assert.equal(checkpoints, firstCheckpointCount + 1, 'second run only checkpoints the verified source snapshot');
-  assert.equal(agentCalls, 2, 'each invocation revalidates the exact order snapshot');
+  assert.equal(agentCalls, 1, 'continuations must reuse the immutable source snapshot');
   assert.ok(telegramMessages.some((message) => /[\u0600-\u06ff]/.test(message)), 'Arabic Telegram text must remain UTF-8');
   assert.ok(telegramMessages.every((message) => !message.includes('???') && !message.includes('\uFFFD')));
 
@@ -79,6 +90,14 @@ try {
   assert.equal(verifyResumeRequest(headers, body, 1_000_100), true);
   assert.equal(verifyResumeRequest(headers, `${body} `, 1_000_100), false);
   assert.equal(verifyResumeRequest(headers, body, 1_000_000 + 6 * 60_000), false);
+
+  const resized = printPhotoSourceUrl('https://cdn.shopify.com/s/files/photo.jpg?v=1');
+  assert.equal(new URL(resized).searchParams.get('width'), '2400');
+  assert.equal(
+    printPhotoSourceUrl('https://example.com/photo.jpg'),
+    'https://example.com/photo.jpg',
+    'non-Shopify URLs must not be rewritten'
+  );
 
   console.log(JSON.stringify({
     ok: true,

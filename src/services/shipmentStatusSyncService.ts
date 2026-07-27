@@ -128,13 +128,23 @@ export class ShipmentStatusSyncService {
     shopifyQueued: number;
     skipped: number;
     notInDb: number;
+    ambiguous: number;
     failed: number;
   }> {
-    const maxActions = opts.maxActions ?? 6;
+    const maxActions = opts.maxActions ?? 2;
     const budgetMs = opts.budgetMs ?? 23_000;
     const start = Date.now();
     const DELIVERED = new Set(['DTR']);
-    const summary = { scanned: 0, recorded: 0, shopifyPaid: 0, shopifyQueued: 0, skipped: 0, notInDb: 0, failed: 0 };
+    const summary = {
+      scanned: 0,
+      recorded: 0,
+      shopifyPaid: 0,
+      shopifyQueued: 0,
+      skipped: 0,
+      notInDb: 0,
+      ambiguous: 0,
+      failed: 0
+    };
     let page = 1;
     let actions = 0;
     while (actions < maxActions && Date.now() - start < budgetMs) {
@@ -167,13 +177,12 @@ export class ShipmentStatusSyncService {
           Number(sh.collectedAmount ?? 0) <= 0
         ) continue;
 
-        // Find DB record by code, then by refNumber → order number.
-        let rec = await shipmentRepository.findByReference(code);
-        if (!rec && ref) {
-          const m = ref.match(/(\d{3,})\s*$/);
-          if (m) rec = await shipmentRepository.findByShopifyOrderName('#' + m[1]);
-        }
-        if (!rec) { summary.notInDb++; continue; }
+        // Financial writes require the exact Telegraph shipment code stored for
+        // the Shopify order. Never infer an order from a free-text reference.
+        const exactMatches = await shipmentRepository.findByShipmentCodes([code]);
+        if (exactMatches.length === 0) { summary.notInDb++; continue; }
+        if (exactMatches.length !== 1) { summary.ambiguous++; continue; }
+        const rec = exactMatches[0]!;
         if (actions >= maxActions || Date.now() - start >= budgetMs) break;
 
         try {
@@ -401,8 +410,9 @@ export class ShipmentStatusSyncService {
   /** Execute one idempotent Shopify payment action and let the durable queue own retries. */
   private async performShopifyPayment(
     record: { id: number; shopifyOrderId: string },
-    collectedAmount: number
-  ): Promise<{ transactionId?: string; reason?: string }> {
+    collectedAmount: number,
+    allowDiscounts: boolean
+  ): Promise<{ transactionId?: string; reason?: string; manualReview?: boolean }> {
     const first = await shopifyStatusSyncClient.recordCustomerPayment({
       orderId: record.shopifyOrderId,
       amount: collectedAmount
@@ -410,7 +420,13 @@ export class ShipmentStatusSyncService {
     if (!first.skipped) {
       return { transactionId: first.transactionId };
     }
-    if (first.reason === 'needs-discount' && first.needsDiscountFor && first.total && first.currencyCode) {
+    if (
+      first.reason === 'needs-discount' &&
+      first.needsDiscountFor &&
+      first.total &&
+      first.currencyCode &&
+      allowDiscounts
+    ) {
       const result = await shopifyStatusSyncClient.applyOrderDiscountAndPay({
         orderId: record.shopifyOrderId,
         discountAmount: first.needsDiscountFor,
@@ -429,7 +445,10 @@ export class ShipmentStatusSyncService {
     if (first.reason === 'already-paid' || first.reason === 'order-cancelled') {
       return { reason: first.reason };
     }
-    throw new Error(`Shopify payment was not recorded: ${first.reason ?? 'unknown reason'}`);
+    return {
+      reason: first.reason ?? 'unknown-payment-state',
+      manualReview: true
+    };
   }
 
   /** Phase 2: flag a delivered-but-not-collected order for human follow-up. */
@@ -656,7 +675,12 @@ export class ShipmentStatusSyncService {
   }
 
   /** Process claimed return actions. Odoo billing and Shopify cancellation are independently idempotent. */
-  async processReturnQueue(options: { limit?: number; budgetMs?: number; apply?: boolean } = {}): Promise<{
+  async processReturnQueue(options: {
+    limit?: number;
+    budgetMs?: number;
+    apply?: boolean;
+    restock?: boolean;
+  } = {}): Promise<{
     apply: boolean;
     found: number;
     processed: number;
@@ -665,10 +689,20 @@ export class ShipmentStatusSyncService {
     recovered: number;
     remaining: number;
     hasMore: boolean;
-    actions: Array<{ order: string; shipmentCode?: string | null; charge: number; status: string }>;
+    actions: Array<{
+      order: string;
+      shipmentCode?: string | null;
+      charge: number;
+      restock: boolean;
+      status: string;
+    }>;
     elapsedMs: number;
   }> {
     const apply = options.apply ?? false;
+    // A carrier return does not prove that the warehouse received and inspected
+    // the item. Automated financial recovery therefore leaves live inventory
+    // unchanged unless a deliberately controlled caller opts in.
+    const restock = options.restock ?? false;
     const limit = Math.max(1, Math.min(options.limit ?? 4, 10));
     const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? 70_000, 100_000));
     const startedAt = Date.now();
@@ -677,7 +711,13 @@ export class ShipmentStatusSyncService {
     let processed = 0;
     let skipped = 0;
     let failed = 0;
-    const actions: Array<{ order: string; shipmentCode?: string | null; charge: number; status: string }> = [];
+    const actions: Array<{
+      order: string;
+      shipmentCode?: string | null;
+      charge: number;
+      restock: boolean;
+      status: string;
+    }> = [];
 
     for (const candidate of records) {
       if (Date.now() - startedAt >= budgetMs) break;
@@ -686,6 +726,7 @@ export class ShipmentStatusSyncService {
         order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
         shipmentCode: candidate.accurateShipmentCode,
         charge,
+        restock,
         status: apply ? 'pending' : 'preview'
       };
       actions.push(action);
@@ -761,7 +802,7 @@ export class ShipmentStatusSyncService {
           orderId: record.shopifyOrderId,
           reason: 'OTHER',
           refund: false,
-          restock: true,
+          restock,
           notifyCustomer: false,
           staffNote: `Telegraph returned shipment (${record.collectionStatus})`
         });
@@ -814,7 +855,12 @@ export class ShipmentStatusSyncService {
     };
   }
 
-  async processShopifyPaymentQueue(options: { limit?: number; budgetMs?: number; apply?: boolean } = {}): Promise<{
+  async processShopifyPaymentQueue(options: {
+    limit?: number;
+    budgetMs?: number;
+    apply?: boolean;
+    allowDiscounts?: boolean;
+  } = {}): Promise<{
     apply: boolean;
     found: number;
     processed: number;
@@ -827,6 +873,10 @@ export class ShipmentStatusSyncService {
     elapsedMs: number;
   }> {
     const apply = options.apply ?? false;
+    // Exact-total COD payments are safe to automate. Partial collections can
+    // require editing a fulfilled Shopify order, so the scheduled worker leaves
+    // them for review unless a controlled caller explicitly opts in.
+    const allowDiscounts = options.allowDiscounts ?? false;
     const limit = Math.max(1, Math.min(options.limit ?? 6, 12));
     const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? 70_000, 100_000));
     const startedAt = Date.now();
@@ -877,7 +927,24 @@ export class ShipmentStatusSyncService {
       action.amount = currentAmount;
 
       try {
-        const result = await this.performShopifyPayment(current, currentAmount);
+        const result = await this.performShopifyPayment(current, currentAmount, allowDiscounts);
+        if (result.manualReview) {
+          const reason = `Shopify payment needs review: ${result.reason ?? 'unknown reason'}`;
+          await shipmentRepository.reviewShopifyPaymentSync(candidate.id, reason);
+          await failedPayloadService.save({
+            source: 'shopify-payment-review',
+            externalId: current.shopifyOrderId,
+            reason,
+            payload: {
+              recordId: current.id,
+              shopifyOrderName: current.shopifyOrderName,
+              amount: currentAmount
+            }
+          });
+          skipped++;
+          action.status = 'needs-review';
+          continue;
+        }
         const state = await shopifyStatusSyncClient.fetchOrderPaymentState(current.shopifyOrderId);
         const complete = Boolean(
           state?.cancelledAt ||

@@ -17,3 +17,4 @@ MANUAL_WORK_REQUIRED.*
 telegraph-locations.json
 .env
 .env.*
+.tmp*
