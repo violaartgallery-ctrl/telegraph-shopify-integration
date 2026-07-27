@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           curl --fail-with-body --silent --show-error --max-time 110 \
-            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-collections"
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-collections?maxActions=2"
 
       - name: Discover all returned shipments by exact code
         id: discover_returns
@@ -67,31 +67,19 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          drained=false
-          for _ in $(seq 1 65); do
-            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
-              -X POST -H "x-ops-secret: $OPS_SECRET" \
-              "$BASE/ops/process-return-queue?apply=1&limit=4")
-            echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,elapsedMs}'
-            if [ "$(echo "$response" | jq -r '.hasMore')" != "true" ]; then drained=true; break; fi
-            sleep 2
-          done
-          test "$drained" = "true"
+          response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+            -X POST -H "x-ops-secret: $OPS_SECRET" \
+            "$BASE/ops/process-return-queue?apply=1&limit=2")
+          echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
 
       - name: Process Shopify payment actions in resumable batches
         if: ${{ always() && steps.discover_returns.outcome == 'success' && steps.process_returns.outcome == 'success' }}
         run: |
           set -euo pipefail
-          drained=false
-          for _ in $(seq 1 30); do
-            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
-              -X POST -H "x-ops-secret: $OPS_SECRET" \
-              "$BASE/ops/process-shopify-payment-queue?apply=1&limit=6")
-            echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,elapsedMs}'
-            if [ "$(echo "$response" | jq -r '.hasMore')" != "true" ]; then drained=true; break; fi
-            sleep 2
-          done
-          test "$drained" = "true"
+          response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+            -X POST -H "x-ops-secret: $OPS_SECRET" \
+            "$BASE/ops/process-shopify-payment-queue?apply=1&limit=4")
+          echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
 
       - name: Resume interrupted production batches
         if: always()
@@ -111,16 +99,10 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$OPS_SECRET"
-          drained=false
-          for _ in $(seq 1 25); do
-            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
-              -X POST -H "x-ops-secret: $OPS_SECRET" \
-              "$BASE/ops/process-odoo-queue")
-            echo "$response" | jq -c '{processed,budgetHit,remaining,hasMore,elapsedMs}'
-            if [ "$(echo "$response" | jq -r '.hasMore')" != "true" ]; then drained=true; break; fi
-            sleep 2
-          done
-          test "$drained" = "true"
+          response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+            -X POST -H "x-ops-secret: $OPS_SECRET" \
+            "$BASE/ops/process-odoo-queue")
+          echo "$response" | jq -c '{processed,budgetHit,remaining,hasMore,elapsedMs}'
 
   health:
     if: always()

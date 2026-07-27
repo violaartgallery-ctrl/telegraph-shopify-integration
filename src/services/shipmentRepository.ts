@@ -806,7 +806,9 @@ export const shipmentRepository = {
           }
         ]
       },
-      orderBy: [{ returnSyncRetryAt: 'asc' }, { returnedAt: 'asc' }, { id: 'asc' }],
+      // Keep new customer-facing state current while the historical backlog is
+      // drained gradually by the same idempotent worker.
+      orderBy: [{ returnedAt: 'desc' }, { id: 'desc' }],
       take: limit
     }),
 
@@ -959,7 +961,9 @@ export const shipmentRepository = {
           }
         ]
       },
-      orderBy: [{ shopifyPaymentRetryAt: 'asc' }, { deliveredAt: 'asc' }, { id: 'asc' }],
+      // New collections take priority; older exact matches continue to drain in
+      // controlled batches whenever there is spare capacity.
+      orderBy: [{ deliveredAt: 'desc' }, { id: 'desc' }],
       take: limit
     }),
 
@@ -994,6 +998,17 @@ export const shipmentRepository = {
         shopifyPaymentClaimedAt: null,
         shopifyPaymentSyncedAt: new Date(),
         ...(transactionId ? { shopifyPaymentTransactionId: transactionId } : {})
+      }
+    }),
+
+  reviewShopifyPaymentSync: async (recordId: number, reason: string) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        shopifyPaymentSyncStatus: 'needs-review',
+        shopifyPaymentRetryAt: null,
+        shopifyPaymentLastError: reason.slice(0, 2_000),
+        shopifyPaymentClaimedAt: null
       }
     }),
 
@@ -1075,7 +1090,8 @@ export const shipmentRepository = {
       returnFailed,
       paymentPending,
       paymentProcessing,
-      paymentFailed
+      paymentFailed,
+      paymentNeedsReview
     ] = await Promise.all([
       prisma.shipmentRecord.count({
         where: {
@@ -1107,13 +1123,19 @@ export const shipmentRepository = {
         }
       }),
       prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'processing', shopifyPaymentClaimedAt: { lt: staleBefore } } }),
-      prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'failed' } })
+      prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'failed' } }),
+      prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'needs-review' } })
     ]);
     return {
       ok: odooProcessing === 0 && odooFailed === 0 && returnProcessing === 0 && returnFailed === 0 && paymentProcessing === 0 && paymentFailed === 0,
       odoo: { pending: odooPending, stuck: odooProcessing, failed: odooFailed },
       returns: { pending: returnPending, stuck: returnProcessing, failed: returnFailed },
-      shopifyPayments: { pending: paymentPending, stuck: paymentProcessing, failed: paymentFailed }
+      shopifyPayments: {
+        pending: paymentPending,
+        stuck: paymentProcessing,
+        failed: paymentFailed,
+        needsReview: paymentNeedsReview
+      }
     };
   }
 };
