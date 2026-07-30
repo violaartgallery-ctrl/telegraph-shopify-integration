@@ -7,6 +7,7 @@ import {
   planHistoricalDiscoveryPages
 } from '../services/shipmentStatusSyncService.js';
 import { classifyFinancialHealth } from '../services/shipmentRepository.js';
+import { classifyCollectedInvoiceVerification } from '../odoo/odooSyncService.js';
 
 assert.equal(isLegacyNonShopifyShipmentCode('VI00000169'), true);
 assert.equal(isLegacyNonShopifyShipmentCode('vi00000999'), true);
@@ -135,5 +136,24 @@ assert.equal(classifyFinancialHealth({ backlog: 0, manualReview: 0, stuck: 0, fa
 assert.equal(classifyFinancialHealth({ backlog: 12, manualReview: 0, stuck: 0, failed: 0 }), 'backlog-warning');
 assert.equal(classifyFinancialHealth({ backlog: 12, manualReview: 2, stuck: 0, failed: 0 }), 'manual-review');
 assert.equal(classifyFinancialHealth({ backlog: 0, manualReview: 2, stuck: 1, failed: 0 }), 'hard-failure');
+
+assert.deepEqual(classifyCollectedInvoiceVerification({
+  targetAmount: 1_114,
+  actualAmount: 1_114,
+  residual: 0,
+  paymentState: 'paid'
+}), { complete: true });
+assert.deepEqual(classifyCollectedInvoiceVerification({
+  targetAmount: 1_114,
+  actualAmount: 1_114,
+  residual: 0,
+  paymentState: 'reversed'
+}), { complete: false, reason: 'odoo-invoice-payment-reversed' });
+assert.deepEqual(classifyCollectedInvoiceVerification({
+  targetAmount: 343,
+  actualAmount: 343.02,
+  residual: 0.02,
+  paymentState: 'partial'
+}), { complete: false, reason: 'odoo-invoice-total-mismatch' });
 
 console.log('Financial queue automation self-test passed.');

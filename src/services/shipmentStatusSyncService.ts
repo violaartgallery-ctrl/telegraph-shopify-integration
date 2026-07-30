@@ -1464,7 +1464,10 @@ export class ShipmentStatusSyncService {
               `Odoo collection verification failed: ${verification.reason ?? 'not complete'} ` +
               `(expected=${verification.targetAmount ?? 'missing'}, actual=${verification.actualAmount ?? 'missing'}, ` +
               `residual=${verification.residual ?? 'missing'})`;
-            if (verification.reason === 'odoo-invoice-total-mismatch') {
+            if (
+              verification.reason === 'odoo-invoice-total-mismatch' ||
+              verification.reason === 'odoo-invoice-payment-reversed'
+            ) {
               await shipmentRepository.reviewOdooCollectionSync(current.id, reason);
               await failedPayloadService.save({
                 source: 'odoo-collection-review',
