@@ -99,6 +99,24 @@ export const calculateTelegraphReturnCharge = (shipment: {
 export const isTransientNetworkError = (message: string): boolean =>
   /fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|ECONNRESET|socket hang up|ESOCKETTIMEDOUT|timeout|503|504|Gateway/i.test(message);
 
+export const classifyCollectedInvoiceVerification = (input: {
+  targetAmount: number;
+  actualAmount: number;
+  residual: number;
+  paymentState?: string | null;
+}): { complete: boolean; reason?: string } => {
+  if (Math.abs(input.actualAmount - input.targetAmount) > 0.01) {
+    return { complete: false, reason: 'odoo-invoice-total-mismatch' };
+  }
+  if (input.paymentState === 'reversed') {
+    return { complete: false, reason: 'odoo-invoice-payment-reversed' };
+  }
+  if (input.paymentState === 'paid' && input.residual <= 0.01) {
+    return { complete: true };
+  }
+  return { complete: false, reason: 'odoo-invoice-not-paid' };
+};
+
 /**
  * Authoritative invoice-target calculator for collected Telegraph shipments.
  *
@@ -610,21 +628,21 @@ export class OdooSyncService {
     const invoice = await this.getInvoice(record.odooInvoiceId);
     const actualAmount = Number(invoice.amount_total ?? 0);
     const residual = Number(invoice.amount_residual ?? 0);
-    const amountMatches = Math.abs(actualAmount - targetAmount) <= 0.01;
-    const paid = invoice.payment_state === 'paid' && residual <= 0.01;
+    const classification = classifyCollectedInvoiceVerification({
+      targetAmount,
+      actualAmount,
+      residual,
+      paymentState: invoice.payment_state
+    });
     return {
-      complete: amountMatches && paid,
+      complete: classification.complete,
       invoiceId: invoice.id,
       invoiceName: invoice.name ?? String(invoice.id),
       targetAmount,
       actualAmount,
       residual,
       paymentState: invoice.payment_state,
-      ...(!amountMatches
-        ? { reason: 'odoo-invoice-total-mismatch' }
-        : !paid
-          ? { reason: 'odoo-invoice-not-paid' }
-          : {})
+      ...(classification.reason ? { reason: classification.reason } : {})
     };
   }
 
