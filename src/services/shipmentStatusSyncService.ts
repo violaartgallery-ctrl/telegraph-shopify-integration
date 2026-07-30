@@ -1359,11 +1359,29 @@ export class ShipmentStatusSyncService {
         await this.odooSyncService.syncCollectedShipment(current.id);
         const verification = await this.odooSyncService.verifyCollectedShipmentAccounting(current.id);
         if (!verification.complete) {
-          throw new Error(
+          const reason =
             `Odoo collection verification failed: ${verification.reason ?? 'not complete'} ` +
             `(expected=${verification.targetAmount ?? 'missing'}, actual=${verification.actualAmount ?? 'missing'}, ` +
-            `residual=${verification.residual ?? 'missing'})`
-          );
+            `residual=${verification.residual ?? 'missing'})`;
+          if (verification.reason === 'odoo-invoice-total-mismatch') {
+            await shipmentRepository.reviewOdooCollectionSync(current.id, reason);
+            await failedPayloadService.save({
+              source: 'odoo-collection-review',
+              externalId: current.accurateShipmentCode,
+              reason,
+              payload: {
+                recordId: current.id,
+                shopifyOrderName: current.shopifyOrderName,
+                expected: verification.targetAmount,
+                actual: verification.actualAmount,
+                residual: verification.residual
+              }
+            });
+            skipped++;
+            action.status = 'needs-review';
+            continue;
+          }
+          throw new Error(reason);
         }
         await shipmentRepository.completeOdooCollectionSync(current.id);
         processed++;
