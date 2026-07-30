@@ -181,6 +181,22 @@ const ORDER_CANCEL_MUTATION = `
   }
 `;
 
+const RETURN_FULFILLMENT_STATE_QUERY = `
+  query TelegraphReturnFulfillments($id: ID!) {
+    order(id: $id) {
+      id
+      cancelledAt
+      fulfillments(first: 20) {
+        id
+        status
+        trackingInfo {
+          number
+        }
+      }
+    }
+  }
+`;
+
 const FULFILLMENT_CANCEL_MUTATION = `
   mutation TelegraphFulfillmentCancel($id: ID!) {
     fulfillmentCancel(id: $id) {
@@ -710,6 +726,100 @@ export const shopifyStatusSyncClient = {
     if (resp.tagsAdd.userErrors.length > 0) {
       throw new Error('addOrderTags: ' + resp.tagsAdd.userErrors.map((e) => e.message).join('; '));
     }
+  },
+
+  /**
+   * A fulfilled return occasionally cannot be cancelled until its Shopify
+   * Fulfillment is cancelled first. This guard only touches active fulfillments
+   * whose tracking number exactly equals the Telegraph code already linked to
+   * the order. It never guesses from the order name and it does not restock.
+   */
+  cancelExactReturnedShipmentFulfillments: async (params: {
+    orderId: string | number;
+    shipmentCode: string;
+  }): Promise<{
+    skipped: boolean;
+    safe: boolean;
+    reason?: string;
+    cancelledFulfillmentIds: string[];
+  }> => {
+    const ownerId = toOrderGid(params.orderId);
+    const expectedCode = params.shipmentCode.trim().toUpperCase();
+    const readState = async () => await requestShopifyAdmin<{
+      order: {
+        id: string;
+        cancelledAt: string | null;
+        fulfillments: Array<{
+          id: string;
+          status: string | null;
+          trackingInfo: Array<{ number?: string | null }>;
+        }>;
+      } | null;
+    }>(RETURN_FULFILLMENT_STATE_QUERY, { id: ownerId });
+
+    const before = await readState();
+    if (!before.order) {
+      return { skipped: true, safe: false, reason: 'order-not-found', cancelledFulfillmentIds: [] };
+    }
+    if (before.order.cancelledAt) {
+      return { skipped: true, safe: true, reason: 'already-cancelled', cancelledFulfillmentIds: [] };
+    }
+
+    const active = (before.order.fulfillments ?? []).filter(
+      (fulfillment) => fulfillment.status?.toUpperCase() !== 'CANCELLED'
+    );
+    if (active.length === 0) {
+      return { skipped: true, safe: true, reason: 'no-active-fulfillments', cancelledFulfillmentIds: [] };
+    }
+
+    const exact = active.filter((fulfillment) =>
+      (fulfillment.trackingInfo ?? []).some(
+        (tracking) => tracking.number?.trim().toUpperCase() === expectedCode
+      )
+    );
+    if (exact.length !== active.length) {
+      return {
+        skipped: true,
+        safe: false,
+        reason: `active-fulfillment-tracking-mismatch:${exact.length}/${active.length}`,
+        cancelledFulfillmentIds: []
+      };
+    }
+
+    const cancelledFulfillmentIds: string[] = [];
+    for (const fulfillment of exact) {
+      const result = await requestShopifyAdmin<{
+        fulfillmentCancel: {
+          fulfillment: { id: string; status: string } | null;
+          userErrors: Array<{ field?: string[] | null; message: string }>;
+        };
+      }>(FULFILLMENT_CANCEL_MUTATION, { id: fulfillment.id });
+      if (result.fulfillmentCancel.userErrors.length > 0) {
+        throw new Error(
+          `fulfillmentCancel failed: ${result.fulfillmentCancel.userErrors.map((error) => error.message).join('; ')}`
+        );
+      }
+      if (result.fulfillmentCancel.fulfillment?.status?.toUpperCase() !== 'CANCELLED') {
+        throw new Error(`fulfillmentCancel was not confirmed for ${fulfillment.id}`);
+      }
+      cancelledFulfillmentIds.push(fulfillment.id);
+    }
+
+    const after = await readState();
+    const stillActiveExact = (after.order?.fulfillments ?? []).filter((fulfillment) =>
+      fulfillment.status?.toUpperCase() !== 'CANCELLED' &&
+      (fulfillment.trackingInfo ?? []).some(
+        (tracking) => tracking.number?.trim().toUpperCase() === expectedCode
+      )
+    );
+    if (stillActiveExact.length > 0) {
+      throw new Error(`Shopify still reports ${stillActiveExact.length} active exact fulfillment(s)`);
+    }
+    return {
+      skipped: false,
+      safe: true,
+      cancelledFulfillmentIds
+    };
   },
 
   /**

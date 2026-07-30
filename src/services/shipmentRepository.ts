@@ -31,6 +31,31 @@ export interface AccurateSnapshotCurrentState {
 }
 
 const RETURN_CODES = new Set(['RTRN', 'RTS', 'RJCT']);
+const ODOO_COLLECTION_READY_STATUSES = [
+  'delivery-confirmed',
+  'invoice-posted',
+  'invoice-posted-awaiting-payment',
+  'paid',
+  'paid-existing'
+];
+
+export type FinancialHealthStatus =
+  | 'healthy'
+  | 'backlog-warning'
+  | 'manual-review'
+  | 'hard-failure';
+
+export const classifyFinancialHealth = (input: {
+  backlog: number;
+  manualReview: number;
+  stuck: number;
+  failed: number;
+}): FinancialHealthStatus => {
+  if (input.stuck > 0 || input.failed > 0) return 'hard-failure';
+  if (input.manualReview > 0) return 'manual-review';
+  if (input.backlog > 0) return 'backlog-warning';
+  return 'healthy';
+};
 
 /**
  * Accurate's ordinary lookup can lag behind the collection report. Preserve a
@@ -139,6 +164,40 @@ export const shipmentRepository = {
         accurateShipmentCode: { in: codes }
       }
     }),
+
+  findFinancialMatchesByShipmentCodes: async (codes: string[]) =>
+    await prisma.shipmentRecord.findMany({
+      where: {
+        accurateShipmentCode: { in: codes }
+      },
+      select: {
+        id: true,
+        shopifyOrderId: true,
+        shopifyOrderName: true,
+        accurateShipmentCode: true,
+        collectionStatus: true,
+        returnSyncStatus: true,
+        returnSyncFingerprint: true,
+        shopifyPaymentSyncStatus: true,
+        shopifyPaymentFingerprint: true,
+        odooSyncStatus: true,
+        odooCollectionSyncStatus: true,
+        odooCollectionFingerprint: true
+      }
+    }),
+
+  getOperationalCursor: async (name: string, fallback: number): Promise<number> => {
+    const cursor = await prisma.shipmentSequence.findUnique({ where: { name } });
+    return Math.max(fallback, cursor?.nextValue ?? fallback);
+  },
+
+  setOperationalCursor: async (name: string, nextValue: number): Promise<void> => {
+    await prisma.shipmentSequence.upsert({
+      where: { name },
+      create: { name, nextValue },
+      update: { nextValue }
+    });
+  },
 
   findOpenShipments: async (limit?: number) => {
     // The status-sync path (syncRecord) never reads rawOrderJson — only the Odoo
@@ -740,6 +799,242 @@ export const shipmentRepository = {
     return r1.count + r2.count + r3.count + legacyWithoutSo.count + legacyWithSo.count;
   },
 
+  /**
+   * A collection can be discovered before the ordinary Odoo production queue
+   * has created/validated the Sales Order and pickings. Queue that prerequisite
+   * without guessing any product data; the existing raw Shopify order remains
+   * the only source of SKU and quantity truth.
+   */
+  ensureCollectedProductionQueued: async (recordId: number): Promise<boolean> => {
+    const queuedSalesOrder = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: 'collected',
+        rawOrderJson: { not: null },
+        accurateShipmentCode: { not: null },
+        odooSyncStatus: null
+      },
+      data: {
+        odooSyncStatus: 'odoo-so-pending',
+        odooLastError: null,
+        odooRetryAt: null,
+        odooSyncedAt: new Date()
+      }
+    });
+    if (queuedSalesOrder.count === 1) return true;
+
+    const queuedStock = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: 'collected',
+        rawOrderJson: { not: null },
+        accurateShipmentCode: { not: null },
+        odooSaleOrderId: { not: null },
+        odooSyncStatus: { in: ['sales-order-created', 'sales-order-existing'] }
+      },
+      data: {
+        odooSyncStatus: 'odoo-stock-pending',
+        odooLastError: null,
+        odooRetryAt: null,
+        odooSyncedAt: new Date()
+      }
+    });
+    return queuedStock.count === 1;
+  },
+
+  queueOdooCollectionSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    const staleBefore = new Date(Date.now() - 10 * 60_000);
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: 'collected',
+        collectedAmount: { gt: 0 },
+        AND: [
+          {
+            OR: [
+              { odooCollectionSyncStatus: null },
+              { odooCollectionFingerprint: null },
+              { odooCollectionFingerprint: { not: fingerprint } }
+            ]
+          },
+          {
+            OR: [
+              { odooCollectionSyncStatus: null },
+              { odooCollectionSyncStatus: { not: 'processing' } },
+              { odooCollectionClaimedAt: null },
+              { odooCollectionClaimedAt: { lt: staleBefore } }
+            ]
+          }
+        ]
+      },
+      data: {
+        odooCollectionSyncStatus: 'pending',
+        odooCollectionFingerprint: fingerprint,
+        odooCollectionAttemptCount: 0,
+        odooCollectionRetryAt: null,
+        odooCollectionLastError: null,
+        odooCollectionClaimedAt: null
+      }
+    });
+    return result.count === 1;
+  },
+
+  recoverStuckOdooCollectionSync: async (stuckThresholdMinutes = 10): Promise<number> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        odooCollectionSyncStatus: 'processing',
+        odooCollectionClaimedAt: { lt: new Date(Date.now() - stuckThresholdMinutes * 60_000) }
+      },
+      data: {
+        odooCollectionSyncStatus: 'retryable',
+        odooCollectionRetryAt: new Date(),
+        odooCollectionClaimedAt: null,
+        odooCollectionLastError: 'Recovered after an interrupted Odoo collection worker'
+      }
+    });
+    return result.count;
+  },
+
+  findPendingOdooCollectionSync: async (limit: number) =>
+    await prisma.shipmentRecord.findMany({
+      where: {
+        collectionStatus: 'collected',
+        collectedAmount: { gt: 0 },
+        rawOrderJson: { not: null },
+        accurateShipmentCode: { not: null },
+        odooSyncStatus: { in: ODOO_COLLECTION_READY_STATUSES },
+        OR: [
+          { odooCollectionSyncStatus: 'pending' },
+          {
+            odooCollectionSyncStatus: 'retryable',
+            OR: [{ odooCollectionRetryAt: null }, { odooCollectionRetryAt: { lte: new Date() } }]
+          }
+        ]
+      },
+      orderBy: [{ deliveredAt: 'desc' }, { id: 'desc' }],
+      take: limit
+    }),
+
+  claimOdooCollectionSync: async (recordId: number): Promise<boolean> => {
+    const now = new Date();
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        collectionStatus: 'collected',
+        collectedAmount: { gt: 0 },
+        odooSyncStatus: { in: ODOO_COLLECTION_READY_STATUSES },
+        OR: [
+          { odooCollectionSyncStatus: 'pending' },
+          {
+            odooCollectionSyncStatus: 'retryable',
+            OR: [{ odooCollectionRetryAt: null }, { odooCollectionRetryAt: { lte: now } }]
+          }
+        ]
+      },
+      data: {
+        odooCollectionSyncStatus: 'processing',
+        odooCollectionClaimedAt: now
+      }
+    });
+    return result.count === 1;
+  },
+
+  deferOdooCollectionSync: async (recordId: number, reason: string): Promise<void> => {
+    await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        odooCollectionSyncStatus: { in: ['pending', 'retryable', 'processing'] }
+      },
+      data: {
+        odooCollectionSyncStatus: 'retryable',
+        odooCollectionRetryAt: new Date(Date.now() + 2 * 60_000),
+        odooCollectionLastError: reason.slice(0, 2_000),
+        odooCollectionClaimedAt: null
+      }
+    });
+  },
+
+  replaceClaimedOdooCollectionSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: { id: recordId, odooCollectionSyncStatus: 'processing' },
+      data: {
+        odooCollectionSyncStatus: 'pending',
+        odooCollectionFingerprint: fingerprint,
+        odooCollectionAttemptCount: 0,
+        odooCollectionRetryAt: null,
+        odooCollectionLastError: 'Carrier financial amounts changed while the previous action was claimed',
+        odooCollectionClaimedAt: null
+      }
+    });
+    return result.count === 1;
+  },
+
+  completeOdooCollectionSync: async (recordId: number): Promise<void> => {
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        odooCollectionSyncStatus: 'completed',
+        odooCollectionAttemptCount: 0,
+        odooCollectionRetryAt: null,
+        odooCollectionLastError: null,
+        odooCollectionClaimedAt: null,
+        odooCollectionSyncedAt: new Date()
+      }
+    });
+  },
+
+  failOdooCollectionSync: async (recordId: number, error: string) => {
+    const current = await prisma.shipmentRecord.findUnique({
+      where: { id: recordId },
+      select: { odooCollectionAttemptCount: true }
+    });
+    const attempt = (current?.odooCollectionAttemptCount ?? 0) + 1;
+    const needsReview = attempt >= 7;
+    return await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        odooCollectionSyncStatus: needsReview ? 'needs-review' : 'retryable',
+        odooCollectionAttemptCount: attempt,
+        odooCollectionRetryAt: needsReview
+          ? null
+          : new Date(Date.now() + retryDelayMinutes(attempt) * 60_000),
+        odooCollectionLastError: error.slice(0, 2_000),
+        odooCollectionClaimedAt: null
+      }
+    });
+  },
+
+  countDueOdooCollectionSync: async (): Promise<number> =>
+    await prisma.shipmentRecord.count({
+      where: {
+        collectionStatus: 'collected',
+        collectedAmount: { gt: 0 },
+        OR: [
+          { odooCollectionSyncStatus: 'pending' },
+          {
+            odooCollectionSyncStatus: 'retryable',
+            OR: [{ odooCollectionRetryAt: null }, { odooCollectionRetryAt: { lte: new Date() } }]
+          }
+        ]
+      }
+    }),
+
+  supersedeOdooCollectionSync: async (recordId: number, reason: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        odooCollectionSyncStatus: { in: ['pending', 'retryable', 'processing', 'needs-review'] }
+      },
+      data: {
+        odooCollectionSyncStatus: 'superseded',
+        odooCollectionRetryAt: null,
+        odooCollectionClaimedAt: null,
+        odooCollectionLastError: reason.slice(0, 2_000)
+      }
+    });
+    return result.count === 1;
+  },
+
   queueReturnSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
     const staleBefore = new Date(Date.now() - 10 * 60_000);
     const result = await prisma.shipmentRecord.updateMany({
@@ -863,6 +1158,17 @@ export const shipmentRepository = {
       }
     });
   },
+
+  reviewReturnSync: async (recordId: number, reason: string) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        returnSyncStatus: 'needs-review',
+        returnSyncRetryAt: null,
+        returnSyncLastError: reason.slice(0, 2_000),
+        returnSyncClaimedAt: null
+      }
+    }),
 
   countDueReturnSync: async (): Promise<number> =>
     await prisma.shipmentRecord.count({
@@ -1085,9 +1391,14 @@ export const shipmentRepository = {
       odooPending,
       odooProcessing,
       odooFailed,
+      odooCollectionPending,
+      odooCollectionProcessing,
+      odooCollectionFailed,
+      odooCollectionNeedsReview,
       returnPending,
       returnProcessing,
       returnFailed,
+      returnNeedsReview,
       paymentPending,
       paymentProcessing,
       paymentFailed,
@@ -1109,12 +1420,28 @@ export const shipmentRepository = {
       prisma.shipmentRecord.count({ where: { odooSyncStatus: 'failed' } }),
       prisma.shipmentRecord.count({
         where: {
+          collectionStatus: 'collected',
+          collectedAmount: { gt: 0 },
+          odooCollectionSyncStatus: { in: ['pending', 'retryable'] }
+        }
+      }),
+      prisma.shipmentRecord.count({
+        where: {
+          odooCollectionSyncStatus: 'processing',
+          odooCollectionClaimedAt: { lt: staleBefore }
+        }
+      }),
+      prisma.shipmentRecord.count({ where: { odooCollectionSyncStatus: 'failed' } }),
+      prisma.shipmentRecord.count({ where: { odooCollectionSyncStatus: 'needs-review' } }),
+      prisma.shipmentRecord.count({
+        where: {
           collectionStatus: { in: ['returned', 'returned-settled'] },
           returnSyncStatus: { in: ['pending', 'retryable'] }
         }
       }),
       prisma.shipmentRecord.count({ where: { returnSyncStatus: 'processing', returnSyncClaimedAt: { lt: staleBefore } } }),
       prisma.shipmentRecord.count({ where: { returnSyncStatus: 'failed' } }),
+      prisma.shipmentRecord.count({ where: { returnSyncStatus: 'needs-review' } }),
       prisma.shipmentRecord.count({
         where: {
           collectionStatus: 'collected',
@@ -1126,10 +1453,28 @@ export const shipmentRepository = {
       prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'failed' } }),
       prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'needs-review' } })
     ]);
+    const backlog = odooPending + odooCollectionPending + returnPending + paymentPending;
+    const manualReview = odooCollectionNeedsReview + returnNeedsReview + paymentNeedsReview;
+    const stuck = odooProcessing + odooCollectionProcessing + returnProcessing + paymentProcessing;
+    const failed = odooFailed + odooCollectionFailed + returnFailed + paymentFailed;
+    const status = classifyFinancialHealth({ backlog, manualReview, stuck, failed });
     return {
-      ok: odooProcessing === 0 && odooFailed === 0 && returnProcessing === 0 && returnFailed === 0 && paymentProcessing === 0 && paymentFailed === 0,
+      ok: status !== 'hard-failure',
+      status,
+      totals: { backlog, manualReview, stuck, failed },
       odoo: { pending: odooPending, stuck: odooProcessing, failed: odooFailed },
-      returns: { pending: returnPending, stuck: returnProcessing, failed: returnFailed },
+      odooCollections: {
+        pending: odooCollectionPending,
+        stuck: odooCollectionProcessing,
+        failed: odooCollectionFailed,
+        needsReview: odooCollectionNeedsReview
+      },
+      returns: {
+        pending: returnPending,
+        stuck: returnProcessing,
+        failed: returnFailed,
+        needsReview: returnNeedsReview
+      },
       shopifyPayments: {
         pending: paymentPending,
         stuck: paymentProcessing,

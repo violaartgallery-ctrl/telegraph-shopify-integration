@@ -25,70 +25,72 @@ jobs:
       - name: Drain Meta Delivered outbox
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error --max-time 110 \
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -X POST -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/meta-delivered/drain"
 
       - name: Sync open shipments
         if: always()
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error --max-time 110 \
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-open-shipments"
 
-      - name: Sync collection reports
+      - name: Discover collections from hot page and durable cursor
+        id: discover_collections
         if: always()
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error --max-time 110 \
-            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-collections?maxActions=2"
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-collections?apply=1&pages=2")
+          echo "$response" | jq -c '{scanned,carrierCollections,exactMatches,shopifyQueued,odooQueued,alreadyQueued,legacySkipped,failed,historicalPages,nextPage,scanComplete,elapsedMs}'
 
-      - name: Discover all returned shipments by exact code
+      - name: Discover returns from hot page and durable cursor
         id: discover_returns
         if: always()
         run: |
           set -euo pipefail
-          page=1
-          complete=false
-          for _ in $(seq 1 50); do
-            response=$(curl --fail-with-body --silent --show-error --max-time 110 \
-              -X POST -H "x-ops-secret: $OPS_SECRET" \
-              "$BASE/ops/sync-returns?apply=1&page=$page&pages=1")
-            echo "$response" | jq -c '{scanned,carrierReturns,exactMatches,queued,alreadyComplete,notInDb,ambiguous,failed,nextPage,scanComplete}'
-            if [ "$(echo "$response" | jq -r '.scanComplete')" = "true" ]; then
-              complete=true
-              break
-            fi
-            page=$(echo "$response" | jq -er '.nextPage')
-          done
-          test "$complete" = "true"
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
+            -X POST -H "x-ops-secret: $OPS_SECRET" \
+            "$BASE/ops/sync-returns?apply=1&pages=2")
+          echo "$response" | jq -c '{scanned,carrierReturns,exactMatches,queued,alreadyComplete,legacySkipped,failed,historicalPages,nextPage,scanComplete,elapsedMs}'
 
       - name: Process return actions in resumable batches
         id: process_returns
         if: always()
         run: |
           set -euo pipefail
-          response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -X POST -H "x-ops-secret: $OPS_SECRET" \
-            "$BASE/ops/process-return-queue?apply=1&limit=2")
+            "$BASE/ops/process-return-queue?apply=1&limit=4")
           echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
 
       - name: Process Shopify payment actions in resumable batches
-        if: ${{ always() && steps.discover_returns.outcome == 'success' && steps.process_returns.outcome == 'success' }}
+        id: process_shopify_payments
+        if: always()
         run: |
           set -euo pipefail
-          response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -X POST -H "x-ops-secret: $OPS_SECRET" \
-            "$BASE/ops/process-shopify-payment-queue?apply=1&limit=4")
+            "$BASE/ops/process-shopify-payment-queue?apply=1&limit=8")
           echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
 
       - name: Resume interrupted production batches
         if: always()
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error --max-time 60 \
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 60 \
             -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/resume-production-jobs"
 
   odoo-queue:
+    if: always()
+    needs: [status-sync]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -99,10 +101,21 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$OPS_SECRET"
-          response=$(curl --fail-with-body --silent --show-error --max-time 110 \
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -X POST -H "x-ops-secret: $OPS_SECRET" \
             "$BASE/ops/process-odoo-queue")
           echo "$response" | jq -c '{processed,budgetHit,remaining,hasMore,elapsedMs}'
+
+      - name: Process Odoo collection accounting independently
+        if: always()
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
+            -X POST -H "x-ops-secret: $OPS_SECRET" \
+            "$BASE/ops/process-odoo-collection-queue?apply=1&limit=4")
+          echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
 
   health:
     if: always()
@@ -116,12 +129,24 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$OPS_SECRET"
-          curl --fail-with-body --silent --show-error --max-time 120 \
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/production-health"
 
       - name: Check financial queue safety
         if: always()
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error --max-time 60 \
-            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/financial-health"
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 60 \
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/financial-health")
+          echo "$response" | jq -c .
+          {
+            echo "## Financial queue summary"
+            echo
+            echo "- Status: $(echo "$response" | jq -r '.status')"
+            echo "- Backlog: $(echo "$response" | jq -r '.totals.backlog')"
+            echo "- Manual review: $(echo "$response" | jq -r '.totals.manualReview')"
+            echo "- Stuck: $(echo "$response" | jq -r '.totals.stuck')"
+            echo "- Failed: $(echo "$response" | jq -r '.totals.failed')"
+          } >> "$GITHUB_STEP_SUMMARY"

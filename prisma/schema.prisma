@@ -52,6 +52,13 @@ model ShipmentRecord {
   odooSyncedAt               DateTime?
   odooAttemptCount           Int                  @default(0)
   odooRetryAt                DateTime?
+  odooCollectionSyncStatus   String?
+  odooCollectionFingerprint  String?
+  odooCollectionAttemptCount Int                  @default(0)
+  odooCollectionRetryAt      DateTime?
+  odooCollectionLastError    String?
+  odooCollectionClaimedAt    DateTime?
+  odooCollectionSyncedAt     DateTime?
   returnSyncStatus           String?
   returnSyncFingerprint      String?
   returnSyncAttemptCount     Int                  @default(0)
@@ -73,6 +80,7 @@ model ShipmentRecord {
 
   @@index([returnSyncStatus, returnSyncRetryAt], map: "ShipmentRecord_return_sync_queue_idx")
   @@index([shopifyPaymentSyncStatus, shopifyPaymentRetryAt], map: "ShipmentRecord_shopify_payment_queue_idx")
+  @@index([odooCollectionSyncStatus, odooCollectionRetryAt], map: "ShipmentRecord_odoo_collection_queue_idx")
 }
 
 model MetaDeliveryOutbox {

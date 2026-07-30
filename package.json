@@ -16,6 +16,7 @@
     "test:meta-delivered-db": "tsx src/scripts/testMetaDeliveredDatabase.ts",
     "test:production-job-state": "tsx src/scripts/testProductionJobState.ts",
     "test:production-automation": "tsx src/scripts/testProductionAutomation.ts",
+    "test:financial-queues": "tsx src/scripts/testFinancialQueueAutomation.ts",
     "test:admin-auth": "tsx src/scripts/testAdminAuth.ts",
     "shopify:ensure-validation": "tsx src/scripts/ensureShopifyValidation.ts",
     "health:production": "tsx src/scripts/checkProductionHealth.ts",
