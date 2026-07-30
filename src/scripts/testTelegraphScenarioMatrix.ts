@@ -85,6 +85,15 @@ const scenarios: Scenario[] = [
     expectedTags: ['accurate-delivered', 'accurate-collected']
   },
   {
+    name: 'delivered and already settled to merchant',
+    statusCode: 'DTR',
+    collected: false,
+    paidToCustomer: true,
+    expectedCollectionStatus: 'collected',
+    expectedTerminal: true,
+    expectedTags: ['accurate-delivered', 'accurate-collected']
+  },
+  {
     name: 'delivered but needs payment review',
     statusCode: 'DTR',
     collected: true,

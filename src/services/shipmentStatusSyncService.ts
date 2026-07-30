@@ -420,23 +420,41 @@ export class ShipmentStatusSyncService {
     const lastPage = hotPage.paginatorInfo.lastPage;
 
     // Shipment pages are ordered by creation, so an older shipment that is
-    // delivered today can sit far from page 1. Sweep recent carrier activity
-    // explicitly to keep status changes within the 30-minute schedule.
+    // collected or settled today can sit far from page 1. Telegraph can clear
+    // `collected` after paying the merchant, therefore sweep both carrier flags
+    // independently. The write path is idempotent when a row appears in both.
     try {
-      const recentInput = {
-        statusCode: ['DTR'],
-        collected: true,
-        lastTransactionDate: { fromDays: 2 }
-      };
-      const recentFirst = await processPage(1, recentInput, false);
-      summary.recentPages.push(1);
-      const recentLastPage = recentFirst.paginatorInfo.lastPage;
-      for (let page = 2; page <= recentLastPage; page += 1) {
-        if (Date.now() - startedAt >= budgetMs - 20_000) break;
-        await processPage(page, recentInput, false);
-        summary.recentPages.push(page);
+      const recentInputs = [
+        {
+          statusCode: ['DTR'],
+          collected: true,
+          lastTransactionDate: { fromDays: 2 }
+        },
+        {
+          statusCode: ['DTR'],
+          paid: true,
+          lastTransactionDate: { fromDays: 2 }
+        }
+      ];
+      let allRecentSweepsComplete = true;
+      for (const recentInput of recentInputs) {
+        if (Date.now() - startedAt >= budgetMs - 20_000) {
+          allRecentSweepsComplete = false;
+          break;
+        }
+        const recentFirst = await processPage(1, recentInput, false);
+        if (!summary.recentPages.includes(1)) summary.recentPages.push(1);
+        const recentLastPage = recentFirst.paginatorInfo.lastPage;
+        let pagesCompleted = 1;
+        for (let page = 2; page <= recentLastPage; page += 1) {
+          if (Date.now() - startedAt >= budgetMs - 20_000) break;
+          await processPage(page, recentInput, false);
+          if (!summary.recentPages.includes(page)) summary.recentPages.push(page);
+          pagesCompleted++;
+        }
+        if (pagesCompleted !== recentLastPage) allRecentSweepsComplete = false;
       }
-      summary.recentSweepComplete = summary.recentPages.length === recentLastPage;
+      summary.recentSweepComplete = allRecentSweepsComplete;
     } catch (error) {
       summary.failed++;
       await failedPayloadService.save({
