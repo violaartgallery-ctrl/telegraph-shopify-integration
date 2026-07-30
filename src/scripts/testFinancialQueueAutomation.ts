@@ -150,6 +150,12 @@ assert.deepEqual(classifyCollectedInvoiceVerification({
   paymentState: 'reversed'
 }), { complete: false, reason: 'odoo-invoice-payment-reversed' });
 assert.deepEqual(classifyCollectedInvoiceVerification({
+  targetAmount: 3_419,
+  actualAmount: 3_418.99,
+  residual: 0,
+  paymentState: 'paid'
+}), { complete: true });
+assert.deepEqual(classifyCollectedInvoiceVerification({
   targetAmount: 343,
   actualAmount: 343.02,
   residual: 0.02,
