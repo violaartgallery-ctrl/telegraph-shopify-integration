@@ -45,7 +45,7 @@ jobs:
           response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
             --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/sync-collections?apply=1&pages=2")
-          echo "$response" | jq -c '{scanned,carrierCollections,exactMatches,shopifyQueued,odooQueued,alreadyQueued,legacySkipped,failed,historicalPages,nextPage,scanComplete,elapsedMs}'
+          echo "$response" | jq -c '{scanned,carrierCollections,exactMatches,shopifyQueued,odooQueued,alreadyQueued,legacySkipped,failed,recentPages,recentSweepComplete,historicalPages,nextPage,scanComplete,elapsedMs}'
 
       - name: Discover returns from hot page and durable cursor
         id: discover_returns
@@ -56,7 +56,7 @@ jobs:
             --retry-delay 2 --connect-timeout 15 --max-time 95 \
             -X POST -H "x-ops-secret: $OPS_SECRET" \
             "$BASE/ops/sync-returns?apply=1&pages=2")
-          echo "$response" | jq -c '{scanned,carrierReturns,exactMatches,queued,alreadyComplete,legacySkipped,failed,historicalPages,nextPage,scanComplete,elapsedMs}'
+          echo "$response" | jq -c '{scanned,carrierReturns,exactMatches,queued,alreadyComplete,legacySkipped,failed,recentPages,recentSweepComplete,historicalPages,nextPage,scanComplete,elapsedMs}'
 
       - name: Process return actions in resumable batches
         id: process_returns
