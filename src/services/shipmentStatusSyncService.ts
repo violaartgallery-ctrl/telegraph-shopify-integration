@@ -97,6 +97,70 @@ export const buildOdooCollectionFingerprint = (input: {
   normalizedNumber(input.customerDue)
 ]);
 
+export const isCompletedCollectedDiscoveryReplay = (input: {
+  record: {
+    accurateStatus?: string | null;
+    accurateStatusCode?: string | null;
+    accurateReturnStatus?: string | null;
+    accurateReturnStatusCode?: string | null;
+    accurateIsTerminal?: boolean | null;
+    collectionStatus?: string | null;
+    trackingUrl?: string | null;
+    collectedAmount?: number | null;
+    pendingCollectionAmount?: number | null;
+    returnedValue?: number | null;
+    deliveryFees?: number | null;
+    returnFees?: number | null;
+    returningDueFees?: number | null;
+    customerDue?: number | null;
+    deliveredAt?: Date | null;
+    returnSyncStatus?: string | null;
+    shopifyPaymentSyncStatus?: string | null;
+    shopifyPaymentFingerprint?: string | null;
+    odooSyncStatus?: string | null;
+    odooCollectionSyncStatus?: string | null;
+    odooCollectionFingerprint?: string | null;
+  };
+  snapshot: AccurateSnapshotData;
+  shopifyFingerprint: string;
+  odooFingerprint: string;
+}): boolean => {
+  const { record, snapshot } = input;
+  const sameNumber = (left?: number | null, right?: number | null) =>
+    normalizedNumber(left) === normalizedNumber(right);
+  const sameDate = (left?: Date | null, right?: Date | null) =>
+    !right || Boolean(left && left.getTime() === right.getTime());
+  const returnQueueIsInactive = !['pending', 'retryable', 'processing', 'failed']
+    .includes(record.returnSyncStatus ?? '');
+  const productionQueueIsReady =
+    Boolean(record.odooSyncStatus) &&
+    !['sales-order-created', 'sales-order-existing'].includes(record.odooSyncStatus ?? '');
+
+  return (
+    record.accurateStatus === snapshot.accurateStatus &&
+    record.accurateStatusCode === snapshot.accurateStatusCode &&
+    record.accurateReturnStatus === snapshot.accurateReturnStatus &&
+    record.accurateReturnStatusCode === snapshot.accurateReturnStatusCode &&
+    record.accurateIsTerminal === snapshot.accurateIsTerminal &&
+    record.collectionStatus === snapshot.collectionStatus &&
+    record.trackingUrl === snapshot.trackingUrl &&
+    sameNumber(record.collectedAmount, snapshot.collectedAmount) &&
+    sameNumber(record.pendingCollectionAmount, snapshot.pendingCollectionAmount) &&
+    sameNumber(record.returnedValue, snapshot.returnedValue) &&
+    sameNumber(record.deliveryFees, snapshot.deliveryFees) &&
+    sameNumber(record.returnFees, snapshot.returnFees) &&
+    sameNumber(record.returningDueFees, snapshot.returningDueFees) &&
+    sameNumber(record.customerDue, snapshot.customerDue) &&
+    sameDate(record.deliveredAt, snapshot.deliveredAt) &&
+    returnQueueIsInactive &&
+    record.shopifyPaymentSyncStatus !== null &&
+    record.shopifyPaymentFingerprint === input.shopifyFingerprint &&
+    productionQueueIsReady &&
+    record.odooCollectionSyncStatus !== null &&
+    record.odooCollectionFingerprint === input.odooFingerprint
+  );
+};
+
 const sleep = async (ms: number): Promise<void> =>
   await new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -246,77 +310,100 @@ export class ShipmentStatusSyncService {
         byCode.set(record.accurateShipmentCode, matches);
       }
 
-      for (const shipment of eligible) {
-        const matches = byCode.get(shipment.code) ?? [];
-        if (matches.length === 0) {
-          summary.notInDb++;
-          continue;
-        }
-        if (matches.length !== 1) {
-          summary.ambiguous++;
-          continue;
-        }
-        summary.exactMatches++;
-        if (!apply) continue;
-        const record = matches[0]!;
-        try {
-          const projection = projectAccurateStatusToShopify({
-            statusCode: shipment.status?.code,
-            statusName: shipment.status?.name,
-            returnStatusCode: shipment.returnStatus?.code,
-            returnStatusName: shipment.returnStatus?.name,
-            collected: shipment.collected,
-            paidToCustomer: shipment.paidToCustomer,
-            cancelled: shipment.cancelled,
-            customerDue: shipment.customerDue
-          });
-          await this.persistAccurateSnapshot(record.id, {
-            accurateStatus: projection.shipmentStatus,
-            accurateStatusCode: shipment.status?.code ?? 'DTR',
-            accurateReturnStatus: shipment.returnStatus?.name ?? shipment.returnStatus?.code ?? null,
-            accurateReturnStatusCode: shipment.returnStatus?.code ?? null,
-            accurateIsTerminal: projection.isTerminal,
-            collectionStatus: 'collected',
-            trackingUrl: shipment.trackingUrl,
-            collectedAmount: Number(shipment.collectedAmount ?? 0),
-            pendingCollectionAmount: Number(shipment.pendingCollectionAmount ?? 0),
-            returnedValue: Number(shipment.returnedValue ?? 0),
-            deliveryFees: Number(shipment.deliveryFees ?? 0),
-            returnFees: Number(shipment.returnFees ?? 0),
-            returningDueFees: Number(shipment.returningDueFees ?? 0),
-            customerDue: Number(shipment.customerDue ?? 0),
-            ...actualShipmentDates(shipment)
-          }, 'accurate-report');
-          await shipmentRepository.supersedeReturnSync(
-            record.id,
-            'Superseded because Telegraph currently reports a collected delivery'
-          );
-          const shopifyQueued = await shipmentRepository.queueShopifyPaymentSync(
-            record.id,
-            buildShopifyPaymentFingerprint(Number(shipment.collectedAmount ?? 0))
-          );
-          const odooQueued = await shipmentRepository.queueOdooCollectionSync(
-            record.id,
-            buildOdooCollectionFingerprint({
+      // A page can contain many collected shipments. Process a small bounded
+      // group in parallel so one historical page remains comfortably inside
+      // the serverless request budget. Every record write and queue claim is
+      // still independently idempotent.
+      const collectionDiscoveryConcurrency = 10;
+      for (let index = 0; index < eligible.length; index += collectionDiscoveryConcurrency) {
+        const chunk = eligible.slice(index, index + collectionDiscoveryConcurrency);
+        await Promise.all(chunk.map(async (shipment) => {
+          const matches = byCode.get(shipment.code) ?? [];
+          if (matches.length === 0) {
+            summary.notInDb++;
+            return;
+          }
+          if (matches.length !== 1) {
+            summary.ambiguous++;
+            return;
+          }
+          summary.exactMatches++;
+          if (!apply) return;
+          const record = matches[0]!;
+          try {
+            const projection = projectAccurateStatusToShopify({
+              statusCode: shipment.status?.code,
+              statusName: shipment.status?.name,
+              returnStatusCode: shipment.returnStatus?.code,
+              returnStatusName: shipment.returnStatus?.name,
+              collected: shipment.collected,
+              paidToCustomer: shipment.paidToCustomer,
+              cancelled: shipment.cancelled,
+              customerDue: shipment.customerDue
+            });
+            const snapshot: AccurateSnapshotData = {
+              accurateStatus: projection.shipmentStatus,
+              accurateStatusCode: shipment.status?.code ?? 'DTR',
+              accurateReturnStatus: shipment.returnStatus?.name ?? shipment.returnStatus?.code ?? null,
+              accurateReturnStatusCode: shipment.returnStatus?.code ?? null,
+              accurateIsTerminal: projection.isTerminal,
+              collectionStatus: 'collected',
+              trackingUrl: shipment.trackingUrl,
+              collectedAmount: Number(shipment.collectedAmount ?? 0),
+              pendingCollectionAmount: Number(shipment.pendingCollectionAmount ?? 0),
+              returnedValue: Number(shipment.returnedValue ?? 0),
+              deliveryFees: Number(shipment.deliveryFees ?? 0),
+              returnFees: Number(shipment.returnFees ?? 0),
+              returningDueFees: Number(shipment.returningDueFees ?? 0),
+              customerDue: Number(shipment.customerDue ?? 0),
+              ...actualShipmentDates(shipment)
+            };
+            const shopifyFingerprint = buildShopifyPaymentFingerprint(
+              Number(shipment.collectedAmount ?? 0)
+            );
+            const odooFingerprint = buildOdooCollectionFingerprint({
               code: shipment.code,
               collectedAmount: shipment.collectedAmount,
               deliveryFees: shipment.deliveryFees,
               customerDue: shipment.customerDue
-            })
-          );
-          await shipmentRepository.ensureCollectedProductionQueued(record.id);
-          if (shopifyQueued) summary.shopifyQueued++;
-          if (odooQueued) summary.odooQueued++;
-          if (!shopifyQueued && !odooQueued) summary.alreadyQueued++;
-        } catch (error) {
-          summary.failed++;
-          await failedPayloadService.save({
-            source: 'accurate-collection-discovery',
-            externalId: shipment.code,
-            reason: error instanceof Error ? error.message : String(error),
-            payload: { shipmentCode: shipment.code, recordId: record.id }
-          });
-        }
+            });
+            if (isCompletedCollectedDiscoveryReplay({
+              record,
+              snapshot,
+              shopifyFingerprint,
+              odooFingerprint
+            })) {
+              summary.alreadyQueued++;
+              return;
+            }
+
+            await this.persistAccurateSnapshot(record.id, snapshot, 'accurate-report');
+            await shipmentRepository.supersedeReturnSync(
+              record.id,
+              'Superseded because Telegraph currently reports a collected delivery'
+            );
+            const shopifyQueued = await shipmentRepository.queueShopifyPaymentSync(
+              record.id,
+              shopifyFingerprint
+            );
+            const odooQueued = await shipmentRepository.queueOdooCollectionSync(
+              record.id,
+              odooFingerprint
+            );
+            await shipmentRepository.ensureCollectedProductionQueued(record.id);
+            if (shopifyQueued) summary.shopifyQueued++;
+            if (odooQueued) summary.odooQueued++;
+            if (!shopifyQueued && !odooQueued) summary.alreadyQueued++;
+          } catch (error) {
+            summary.failed++;
+            await failedPayloadService.save({
+              source: 'accurate-collection-discovery',
+              externalId: shipment.code,
+              reason: error instanceof Error ? error.message : String(error),
+              payload: { shipmentCode: shipment.code, recordId: record.id }
+            });
+          }
+        }));
       }
       return result;
     };
@@ -327,13 +414,21 @@ export class ShipmentStatusSyncService {
       ? await shipmentRepository.getOperationalCursor(COLLECTION_DISCOVERY_CURSOR, FIRST_HISTORICAL_PAGE)
       : FIRST_HISTORICAL_PAGE;
     const plan = planHistoricalDiscoveryPages(cursor, lastPage, historyPages);
-    for (const page of plan.pages) {
+    const historicalPageConcurrency = 2;
+    for (let index = 0; index < plan.pages.length; index += historicalPageConcurrency) {
       if (Date.now() - startedAt >= budgetMs) break;
-      await processPage(page);
-      summary.historicalPages.push(page);
-      summary.nextPage = page >= lastPage ? FIRST_HISTORICAL_PAGE : page + 1;
-      if (apply && durableCursor) {
-        await shipmentRepository.setOperationalCursor(COLLECTION_DISCOVERY_CURSOR, summary.nextPage);
+      const pageChunk = plan.pages.slice(index, index + historicalPageConcurrency);
+      await Promise.all(pageChunk.map(async (page) => {
+        await processPage(page);
+      }));
+      // Persist only completed contiguous pages. If a request is interrupted,
+      // the unfinished chunk replays safely while earlier chunks stay saved.
+      for (const page of pageChunk) {
+        summary.historicalPages.push(page);
+        summary.nextPage = page >= lastPage ? FIRST_HISTORICAL_PAGE : page + 1;
+        if (apply && durableCursor) {
+          await shipmentRepository.setOperationalCursor(COLLECTION_DISCOVERY_CURSOR, summary.nextPage);
+        }
       }
     }
     summary.scanComplete =
