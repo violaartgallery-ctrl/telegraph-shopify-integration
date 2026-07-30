@@ -63,22 +63,38 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
-            --retry-delay 2 --connect-timeout 15 --max-time 95 \
-            -X POST -H "x-ops-secret: $OPS_SECRET" \
-            "$BASE/ops/process-return-queue?apply=1&limit=4")
-          echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
+          for round in $(seq 1 25); do
+            response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+              --retry-delay 2 --connect-timeout 15 --max-time 95 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/process-return-queue?apply=1&limit=10")
+            echo "$response" | jq -c --arg round "$round" \
+              '{round:($round|tonumber),found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
+            found=$(echo "$response" | jq -r '.found // 0')
+            has_more=$(echo "$response" | jq -r '.hasMore // false')
+            if [ "$has_more" != "true" ] || [ "$found" -eq 0 ]; then
+              break
+            fi
+          done
 
       - name: Process Shopify payment actions in resumable batches
         id: process_shopify_payments
         if: always()
         run: |
           set -euo pipefail
-          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
-            --retry-delay 2 --connect-timeout 15 --max-time 95 \
-            -X POST -H "x-ops-secret: $OPS_SECRET" \
-            "$BASE/ops/process-shopify-payment-queue?apply=1&limit=8")
-          echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
+          for round in $(seq 1 100); do
+            response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+              --retry-delay 2 --connect-timeout 15 --max-time 95 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/process-shopify-payment-queue?apply=1&limit=12")
+            echo "$response" | jq -c --arg round "$round" \
+              '{round:($round|tonumber),found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
+            found=$(echo "$response" | jq -r '.found // 0')
+            has_more=$(echo "$response" | jq -r '.hasMore // false')
+            if [ "$has_more" != "true" ] || [ "$found" -eq 0 ]; then
+              break
+            fi
+          done
 
       - name: Resume interrupted production batches
         if: always()
@@ -92,7 +108,7 @@ jobs:
     if: always()
     needs: [status-sync]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       BASE: https://viola-telegraph-integration.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
@@ -101,21 +117,37 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$OPS_SECRET"
-          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
-            --retry-delay 2 --connect-timeout 15 --max-time 95 \
-            -X POST -H "x-ops-secret: $OPS_SECRET" \
-            "$BASE/ops/process-odoo-queue")
-          echo "$response" | jq -c '{processed,budgetHit,remaining,hasMore,elapsedMs}'
+          for round in $(seq 1 25); do
+            response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+              --retry-delay 2 --connect-timeout 15 --max-time 95 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/process-odoo-queue")
+            echo "$response" | jq -c --arg round "$round" \
+              '{round:($round|tonumber),processed,budgetHit,remaining,hasMore,elapsedMs}'
+            processed=$(echo "$response" | jq -r '.processed // 0')
+            has_more=$(echo "$response" | jq -r '.hasMore // false')
+            if [ "$has_more" != "true" ] || [ "$processed" -eq 0 ]; then
+              break
+            fi
+          done
 
       - name: Process Odoo collection accounting independently
         if: always()
         run: |
           set -euo pipefail
-          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
-            --retry-delay 2 --connect-timeout 15 --max-time 95 \
-            -X POST -H "x-ops-secret: $OPS_SECRET" \
-            "$BASE/ops/process-odoo-collection-queue?apply=1&limit=4")
-          echo "$response" | jq -c '{found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
+          for round in $(seq 1 100); do
+            response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+              --retry-delay 2 --connect-timeout 15 --max-time 95 \
+              -X POST -H "x-ops-secret: $OPS_SECRET" \
+              "$BASE/ops/process-odoo-collection-queue?apply=1&limit=20")
+            echo "$response" | jq -c --arg round "$round" \
+              '{round:($round|tonumber),found,processed,skipped,failed,recovered,remaining,hasMore,actions,elapsedMs}'
+            found=$(echo "$response" | jq -r '.found // 0')
+            has_more=$(echo "$response" | jq -r '.hasMore // false')
+            if [ "$has_more" != "true" ] || [ "$found" -eq 0 ]; then
+              break
+            fi
+          done
 
   health:
     if: always()
