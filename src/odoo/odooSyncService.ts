@@ -583,6 +583,51 @@ export class OdooSyncService {
     });
   }
 
+  async verifyCollectedShipmentAccounting(recordId: number): Promise<{
+    complete: boolean;
+    invoiceId?: number;
+    invoiceName?: string;
+    targetAmount?: number;
+    actualAmount?: number;
+    residual?: number;
+    paymentState?: string;
+    reason?: string;
+  }> {
+    this.assertEnabled();
+    const record = await shipmentRepository.findById(recordId);
+    if (!record) return { complete: false, reason: 'shipment-record-not-found' };
+    const targetAmount = calculateMerchantInvoiceTarget({
+      collectedAmount: record.collectedAmount,
+      deliveryFees: record.deliveryFees,
+      customerDue: record.customerDue
+    });
+    if (targetAmount === null) {
+      return { complete: false, reason: 'merchant-invoice-target-not-computable' };
+    }
+    if (!record.odooInvoiceId) {
+      return { complete: false, targetAmount, reason: 'odoo-invoice-link-missing' };
+    }
+    const invoice = await this.getInvoice(record.odooInvoiceId);
+    const actualAmount = Number(invoice.amount_total ?? 0);
+    const residual = Number(invoice.amount_residual ?? 0);
+    const amountMatches = Math.abs(actualAmount - targetAmount) <= 0.01;
+    const paid = invoice.payment_state === 'paid' && residual <= 0.01;
+    return {
+      complete: amountMatches && paid,
+      invoiceId: invoice.id,
+      invoiceName: invoice.name ?? String(invoice.id),
+      targetAmount,
+      actualAmount,
+      residual,
+      paymentState: invoice.payment_state,
+      ...(!amountMatches
+        ? { reason: 'odoo-invoice-total-mismatch' }
+        : !paid
+          ? { reason: 'odoo-invoice-not-paid' }
+          : {})
+    };
+  }
+
   async syncReturnedShipmentCharge(recordId: number): Promise<void> {
     this.assertEnabled();
     const record = await shipmentRepository.findById(recordId);
@@ -641,6 +686,43 @@ export class OdooSyncService {
       paymentId: payment.id,
       amount: returnCharge
     });
+  }
+
+  async verifyReturnedShipmentCharge(recordId: number): Promise<{
+    complete: boolean;
+    charge: number;
+    billId?: number;
+    actualAmount?: number;
+    residual?: number;
+    paymentState?: string;
+    reason?: string;
+  }> {
+    this.assertEnabled();
+    const record = await shipmentRepository.findById(recordId);
+    if (!record) return { complete: false, charge: 0, reason: 'shipment-record-not-found' };
+    const charge = calculateTelegraphReturnCharge(record);
+    if (charge <= 0) return { complete: true, charge };
+    if (!record.odooReturnBillId) {
+      return { complete: false, charge, reason: 'odoo-return-bill-link-missing' };
+    }
+    const bill = await this.getInvoice(record.odooReturnBillId);
+    const actualAmount = Number(bill.amount_total ?? 0);
+    const residual = Number(bill.amount_residual ?? 0);
+    const amountMatches = Math.abs(actualAmount - charge) <= 0.01;
+    const paid = bill.payment_state === 'paid' && residual <= 0.01;
+    return {
+      complete: amountMatches && paid,
+      charge,
+      billId: bill.id,
+      actualAmount,
+      residual,
+      paymentState: bill.payment_state,
+      ...(!amountMatches
+        ? { reason: 'odoo-return-bill-total-mismatch' }
+        : !paid
+          ? { reason: 'odoo-return-bill-not-paid' }
+          : {})
+    };
   }
 
   private async findOrCreatePartner(order: ShopifyOrder): Promise<number> {

@@ -72,9 +72,11 @@ export const createOpsRouter = (
   router.get('/ops/sync-collections', async (request, response) => {
     if (!strictGuard(request, response)) return;
     try {
-      const result = await shipmentStatusSyncService.syncCollectionsFromReports({
-        maxActions: Math.max(1, Math.min(queryInt(request, 'maxActions', 2), 4)),
-        budgetMs: 70_000
+      const result = await shipmentStatusSyncService.discoverCollectedShipmentsFromReports({
+        historyPages: Math.max(0, Math.min(queryInt(request, 'pages', 2), 5)),
+        budgetMs: 70_000,
+        apply: queryApply(request),
+        durableCursor: true
       });
       response.json({ ok: true, ...result });
     } catch (error) {
@@ -86,9 +88,8 @@ export const createOpsRouter = (
   router.post('/ops/sync-returns', async (request, response) => {
     if (!strictGuard(request, response)) return;
     try {
-      const result = await shipmentStatusSyncService.discoverReturnedShipmentsFromReports({
-        startPage: queryInt(request, 'page', 1),
-        pages: queryInt(request, 'pages', 1),
+      const result = await shipmentStatusSyncService.discoverReturnedShipmentsResumable({
+        historyPages: Math.max(0, Math.min(queryInt(request, 'pages', 2), 5)),
         budgetMs: 70_000,
         apply: queryApply(request)
       });
@@ -129,6 +130,23 @@ export const createOpsRouter = (
       response.json({ ok: true, ...result });
     } catch (error) {
       logger.error('ops/process-shopify-payment-queue failed', { reason: error instanceof Error ? error.message : String(error) });
+      response.status(500).json({ ok: false });
+    }
+  });
+
+  router.post('/ops/process-odoo-collection-queue', async (request, response) => {
+    if (!strictGuard(request, response)) return;
+    try {
+      const result = await shipmentStatusSyncService.processOdooCollectionQueue({
+        limit: queryInt(request, 'limit', 4),
+        budgetMs: 70_000,
+        apply: queryApply(request)
+      });
+      response.json({ ok: true, ...result });
+    } catch (error) {
+      logger.error('ops/process-odoo-collection-queue failed', {
+        reason: error instanceof Error ? error.message : String(error)
+      });
       response.status(500).json({ ok: false });
     }
   });
