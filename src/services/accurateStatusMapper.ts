@@ -59,9 +59,13 @@ export const projectAccurateStatusToShopify = (input: {
     tags.push('accurate-delivered', 'accurate-payment-review');
     collectionStatus = 'payment-review';
   } else if (deliveredStatusCodes.has(statusCode)) {
+    // Telegraph clears `collected` after some shipments are settled to the
+    // merchant, while `paidToCustomer` remains true. Either flag is conclusive
+    // carrier evidence that the COD collection happened.
+    const collectionConfirmed = Boolean(input.collected || input.paidToCustomer);
     tags.push('accurate-delivered');
-    collectionStatus = input.collected ? 'collected' : 'delivered-not-collected';
-    tags.push(input.collected ? 'accurate-collected' : 'accurate-delivered-not-collected');
+    collectionStatus = collectionConfirmed ? 'collected' : 'delivered-not-collected';
+    tags.push(collectionConfirmed ? 'accurate-collected' : 'accurate-delivered-not-collected');
   } else if (statusCode === 'OTD') {
     tags.push('accurate-out-for-delivery');
   } else if (deliveryExceptionStatusCodes.has(statusCode)) {
