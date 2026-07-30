@@ -105,7 +105,12 @@ export const classifyCollectedInvoiceVerification = (input: {
   residual: number;
   paymentState?: string | null;
 }): { complete: boolean; reason?: string } => {
-  if (Math.abs(input.actualAmount - input.targetAmount) > 0.01) {
+  // Compare integer piastres so binary floating-point noise cannot turn an
+  // intended one-piastre tolerance into 0.0100000000002 and a false review.
+  const differenceInPiastres = Math.abs(
+    Math.round(input.actualAmount * 100) - Math.round(input.targetAmount * 100)
+  );
+  if (differenceInPiastres > 1) {
     return { complete: false, reason: 'odoo-invoice-total-mismatch' };
   }
   if (input.paymentState === 'reversed') {
