@@ -1004,6 +1004,17 @@ export const shipmentRepository = {
     });
   },
 
+  reviewOdooCollectionSync: async (recordId: number, reason: string) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        odooCollectionSyncStatus: 'needs-review',
+        odooCollectionRetryAt: null,
+        odooCollectionLastError: reason.slice(0, 2_000),
+        odooCollectionClaimedAt: null
+      }
+    }),
+
   countDueOdooCollectionSync: async (): Promise<number> =>
     await prisma.shipmentRecord.count({
       where: {
