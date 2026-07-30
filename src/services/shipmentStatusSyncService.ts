@@ -314,7 +314,7 @@ export class ShipmentStatusSyncService {
       // group in parallel so one historical page remains comfortably inside
       // the serverless request budget. Every record write and queue claim is
       // still independently idempotent.
-      const collectionDiscoveryConcurrency = 10;
+      const collectionDiscoveryConcurrency = 20;
       for (let index = 0; index < eligible.length; index += collectionDiscoveryConcurrency) {
         const chunk = eligible.slice(index, index + collectionDiscoveryConcurrency);
         await Promise.all(chunk.map(async (shipment) => {
@@ -1379,7 +1379,7 @@ export class ShipmentStatusSyncService {
     elapsedMs: number;
   }> {
     const apply = options.apply ?? false;
-    const limit = Math.max(1, Math.min(options.limit ?? 4, 8));
+    const limit = Math.max(1, Math.min(options.limit ?? 4, 20));
     const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? 70_000, 100_000));
     const startedAt = Date.now();
     const recovered = apply ? await shipmentRepository.recoverStuckOdooCollectionSync(10) : 0;
@@ -1394,113 +1394,117 @@ export class ShipmentStatusSyncService {
       status: string;
     }> = [];
 
-    for (const candidate of records) {
+    const odooCollectionConcurrency = 5;
+    for (let index = 0; index < records.length; index += odooCollectionConcurrency) {
       if (Date.now() - startedAt >= budgetMs) break;
-      const action = {
-        order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
-        shipmentCode: candidate.accurateShipmentCode,
-        amount: Number(candidate.collectedAmount ?? 0),
-        status: apply ? 'pending' : 'preview'
-      };
-      actions.push(action);
-      if (!apply) continue;
-      if (isLegacyNonShopifyShipmentCode(candidate.accurateShipmentCode)) {
-        await shipmentRepository.supersedeOdooCollectionSync(
-          candidate.id,
-          'Legacy Telegraph shipment excluded from Shopify and Odoo automation'
-        );
-        skipped++;
-        action.status = 'legacy-excluded';
-        continue;
-      }
-      if (!this.odooSyncService) {
-        throw new Error('Odoo collection service is unavailable');
-      }
-      if (!await shipmentRepository.claimOdooCollectionSync(candidate.id)) {
-        skipped++;
-        action.status = 'claimed-by-other-or-prerequisite-pending';
-        continue;
-      }
-
-      const current = await shipmentRepository.findById(candidate.id);
-      const currentAmount = Number(current?.collectedAmount ?? 0);
-      if (
-        !current ||
-        current.collectionStatus !== 'collected' ||
-        currentAmount <= 0 ||
-        !current.accurateShipmentCode ||
-        isLegacyNonShopifyShipmentCode(current.accurateShipmentCode)
-      ) {
-        await shipmentRepository.supersedeOdooCollectionSync(
-          candidate.id,
-          'Superseded because the latest exact carrier state is not an actionable Shopify collection'
-        );
-        skipped++;
-        action.status = 'superseded';
-        continue;
-      }
-      const currentFingerprint = buildOdooCollectionFingerprint({
-        code: current.accurateShipmentCode,
-        collectedAmount: current.collectedAmount,
-        deliveryFees: current.deliveryFees,
-        customerDue: current.customerDue
-      });
-      if (current.odooCollectionFingerprint !== currentFingerprint) {
-        await shipmentRepository.replaceClaimedOdooCollectionSync(candidate.id, currentFingerprint);
-        skipped++;
-        action.amount = currentAmount;
-        action.status = 'requeued-new-amount';
-        continue;
-      }
-
-      try {
-        await this.odooSyncService.syncCollectedShipment(current.id);
-        const verification = await this.odooSyncService.verifyCollectedShipmentAccounting(current.id);
-        if (!verification.complete) {
-          const reason =
-            `Odoo collection verification failed: ${verification.reason ?? 'not complete'} ` +
-            `(expected=${verification.targetAmount ?? 'missing'}, actual=${verification.actualAmount ?? 'missing'}, ` +
-            `residual=${verification.residual ?? 'missing'})`;
-          if (verification.reason === 'odoo-invoice-total-mismatch') {
-            await shipmentRepository.reviewOdooCollectionSync(current.id, reason);
-            await failedPayloadService.save({
-              source: 'odoo-collection-review',
-              externalId: current.accurateShipmentCode,
-              reason,
-              payload: {
-                recordId: current.id,
-                shopifyOrderName: current.shopifyOrderName,
-                expected: verification.targetAmount,
-                actual: verification.actualAmount,
-                residual: verification.residual
-              }
-            });
-            skipped++;
-            action.status = 'needs-review';
-            continue;
-          }
-          throw new Error(reason);
+      const chunk = records.slice(index, index + odooCollectionConcurrency);
+      await Promise.all(chunk.map(async (candidate) => {
+        const action = {
+          order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
+          shipmentCode: candidate.accurateShipmentCode,
+          amount: Number(candidate.collectedAmount ?? 0),
+          status: apply ? 'pending' : 'preview'
+        };
+        actions.push(action);
+        if (!apply) return;
+        if (isLegacyNonShopifyShipmentCode(candidate.accurateShipmentCode)) {
+          await shipmentRepository.supersedeOdooCollectionSync(
+            candidate.id,
+            'Legacy Telegraph shipment excluded from Shopify and Odoo automation'
+          );
+          skipped++;
+          action.status = 'legacy-excluded';
+          return;
         }
-        await shipmentRepository.completeOdooCollectionSync(current.id);
-        processed++;
-        action.amount = currentAmount;
-        action.status = 'completed';
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        await shipmentRepository.failOdooCollectionSync(current.id, reason);
-        await failedPayloadService.save({
-          source: 'odoo-collection-worker',
-          externalId: current.accurateShipmentCode,
-          reason,
-          payload: {
-            recordId: current.id,
-            shopifyOrderName: current.shopifyOrderName,
-            amount: currentAmount
-          }
+        if (!this.odooSyncService) {
+          throw new Error('Odoo collection service is unavailable');
+        }
+        if (!await shipmentRepository.claimOdooCollectionSync(candidate.id)) {
+          skipped++;
+          action.status = 'claimed-by-other-or-prerequisite-pending';
+          return;
+        }
+
+        const current = await shipmentRepository.findById(candidate.id);
+        const currentAmount = Number(current?.collectedAmount ?? 0);
+        if (
+          !current ||
+          current.collectionStatus !== 'collected' ||
+          currentAmount <= 0 ||
+          !current.accurateShipmentCode ||
+          isLegacyNonShopifyShipmentCode(current.accurateShipmentCode)
+        ) {
+          await shipmentRepository.supersedeOdooCollectionSync(
+            candidate.id,
+            'Superseded because the latest exact carrier state is not an actionable Shopify collection'
+          );
+          skipped++;
+          action.status = 'superseded';
+          return;
+        }
+        const currentFingerprint = buildOdooCollectionFingerprint({
+          code: current.accurateShipmentCode,
+          collectedAmount: current.collectedAmount,
+          deliveryFees: current.deliveryFees,
+          customerDue: current.customerDue
         });
-        failed++;
-        action.status = 'retry-scheduled';
-      }
+        if (current.odooCollectionFingerprint !== currentFingerprint) {
+          await shipmentRepository.replaceClaimedOdooCollectionSync(candidate.id, currentFingerprint);
+          skipped++;
+          action.amount = currentAmount;
+          action.status = 'requeued-new-amount';
+          return;
+        }
+
+        try {
+          await this.odooSyncService.syncCollectedShipment(current.id);
+          const verification = await this.odooSyncService.verifyCollectedShipmentAccounting(current.id);
+          if (!verification.complete) {
+            const reason =
+              `Odoo collection verification failed: ${verification.reason ?? 'not complete'} ` +
+              `(expected=${verification.targetAmount ?? 'missing'}, actual=${verification.actualAmount ?? 'missing'}, ` +
+              `residual=${verification.residual ?? 'missing'})`;
+            if (verification.reason === 'odoo-invoice-total-mismatch') {
+              await shipmentRepository.reviewOdooCollectionSync(current.id, reason);
+              await failedPayloadService.save({
+                source: 'odoo-collection-review',
+                externalId: current.accurateShipmentCode,
+                reason,
+                payload: {
+                  recordId: current.id,
+                  shopifyOrderName: current.shopifyOrderName,
+                  expected: verification.targetAmount,
+                  actual: verification.actualAmount,
+                  residual: verification.residual
+                }
+              });
+              skipped++;
+              action.status = 'needs-review';
+              return;
+            }
+            throw new Error(reason);
+          }
+          await shipmentRepository.completeOdooCollectionSync(current.id);
+          processed++;
+          action.amount = currentAmount;
+          action.status = 'completed';
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await shipmentRepository.failOdooCollectionSync(current.id, reason);
+          await failedPayloadService.save({
+            source: 'odoo-collection-worker',
+            externalId: current.accurateShipmentCode,
+            reason,
+            payload: {
+              recordId: current.id,
+              shopifyOrderName: current.shopifyOrderName,
+              amount: currentAmount
+            }
+          });
+          failed++;
+          action.status = 'retry-scheduled';
+        }
+      }));
     }
 
     const remaining = await shipmentRepository.countDueOdooCollectionSync();
