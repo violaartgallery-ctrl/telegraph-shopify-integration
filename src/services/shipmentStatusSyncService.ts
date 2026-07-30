@@ -414,9 +414,12 @@ export class ShipmentStatusSyncService {
       ? await shipmentRepository.getOperationalCursor(COLLECTION_DISCOVERY_CURSOR, FIRST_HISTORICAL_PAGE)
       : FIRST_HISTORICAL_PAGE;
     const plan = planHistoricalDiscoveryPages(cursor, lastPage, historyPages);
-    const historicalPageConcurrency = 2;
+    const historicalPageConcurrency = 1;
     for (let index = 0; index < plan.pages.length; index += historicalPageConcurrency) {
-      if (Date.now() - startedAt >= budgetMs) break;
+      // Keep a 20-second response/cleanup margin. A slow historical page must
+      // never be started near the request deadline merely because a replayed
+      // page happened to finish quickly.
+      if (Date.now() - startedAt >= budgetMs - 20_000) break;
       const pageChunk = plan.pages.slice(index, index + historicalPageConcurrency);
       await Promise.all(pageChunk.map(async (page) => {
         await processPage(page);
@@ -1547,102 +1550,106 @@ export class ShipmentStatusSyncService {
     let failed = 0;
     const actions: Array<{ order: string; amount: number; status: string }> = [];
 
-    for (const candidate of records) {
+    const shopifyPaymentConcurrency = 3;
+    for (let index = 0; index < records.length; index += shopifyPaymentConcurrency) {
       if (Date.now() - startedAt >= budgetMs) break;
-      const amount = Number(candidate.collectedAmount ?? 0);
-      const action = {
-        order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
-        amount,
-        status: apply ? 'pending' : 'preview'
-      };
-      actions.push(action);
-      if (!apply) continue;
-      if (isLegacyNonShopifyShipmentCode(candidate.accurateShipmentCode)) {
-        await shipmentRepository.supersedeShopifyPaymentSync(
-          candidate.id,
-          'Legacy Telegraph shipment excluded from Shopify and Odoo automation'
-        );
-        skipped++;
-        action.status = 'legacy-excluded';
-        continue;
-      }
-      if (!await shipmentRepository.claimShopifyPaymentSync(candidate.id)) {
-        skipped++;
-        action.status = 'claimed-by-other';
-        continue;
-      }
+      const chunk = records.slice(index, index + shopifyPaymentConcurrency);
+      await Promise.all(chunk.map(async (candidate) => {
+        const amount = Number(candidate.collectedAmount ?? 0);
+        const action = {
+          order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
+          amount,
+          status: apply ? 'pending' : 'preview'
+        };
+        actions.push(action);
+        if (!apply) return;
+        if (isLegacyNonShopifyShipmentCode(candidate.accurateShipmentCode)) {
+          await shipmentRepository.supersedeShopifyPaymentSync(
+            candidate.id,
+            'Legacy Telegraph shipment excluded from Shopify and Odoo automation'
+          );
+          skipped++;
+          action.status = 'legacy-excluded';
+          return;
+        }
+        if (!await shipmentRepository.claimShopifyPaymentSync(candidate.id)) {
+          skipped++;
+          action.status = 'claimed-by-other';
+          return;
+        }
 
-      const current = await shipmentRepository.findById(candidate.id);
-      const currentAmount = Number(current?.collectedAmount ?? 0);
-      const currentFingerprint = buildShopifyPaymentFingerprint(currentAmount);
-      const explicitReturn = RETURNED_STATUS_CODES.has(current?.accurateStatusCode?.trim().toUpperCase() ?? '') ||
-        RETURNED_STATUS_CODES.has(current?.accurateReturnStatusCode?.trim().toUpperCase() ?? '');
-      if (
-        !current ||
-        current.collectionStatus !== 'collected' ||
-        currentAmount <= 0 ||
-        explicitReturn ||
-        isLegacyNonShopifyShipmentCode(current.accurateShipmentCode)
-      ) {
-        await shipmentRepository.supersedeShopifyPaymentSync(
-          candidate.id,
-          'Superseded because the latest carrier snapshot is not a payable collection'
-        );
-        skipped++;
-        action.status = 'superseded';
-        continue;
-      }
-      if (current.shopifyPaymentFingerprint !== currentFingerprint) {
-        await shipmentRepository.replaceClaimedShopifyPaymentSync(candidate.id, currentFingerprint);
-        skipped++;
+        const current = await shipmentRepository.findById(candidate.id);
+        const currentAmount = Number(current?.collectedAmount ?? 0);
+        const currentFingerprint = buildShopifyPaymentFingerprint(currentAmount);
+        const explicitReturn = RETURNED_STATUS_CODES.has(current?.accurateStatusCode?.trim().toUpperCase() ?? '') ||
+          RETURNED_STATUS_CODES.has(current?.accurateReturnStatusCode?.trim().toUpperCase() ?? '');
+        if (
+          !current ||
+          current.collectionStatus !== 'collected' ||
+          currentAmount <= 0 ||
+          explicitReturn ||
+          isLegacyNonShopifyShipmentCode(current.accurateShipmentCode)
+        ) {
+          await shipmentRepository.supersedeShopifyPaymentSync(
+            candidate.id,
+            'Superseded because the latest carrier snapshot is not a payable collection'
+          );
+          skipped++;
+          action.status = 'superseded';
+          return;
+        }
+        if (current.shopifyPaymentFingerprint !== currentFingerprint) {
+          await shipmentRepository.replaceClaimedShopifyPaymentSync(candidate.id, currentFingerprint);
+          skipped++;
+          action.amount = currentAmount;
+          action.status = 'requeued-new-amount';
+          return;
+        }
         action.amount = currentAmount;
-        action.status = 'requeued-new-amount';
-        continue;
-      }
-      action.amount = currentAmount;
 
-      try {
-        const result = await this.performShopifyPayment(current, currentAmount, allowDiscounts);
-        if (result.manualReview) {
-          const reason = `Shopify payment needs review: ${result.reason ?? 'unknown reason'}`;
-          await shipmentRepository.reviewShopifyPaymentSync(candidate.id, reason);
+        try {
+          const result = await this.performShopifyPayment(current, currentAmount, allowDiscounts);
+          if (result.manualReview) {
+            const reason = `Shopify payment needs review: ${result.reason ?? 'unknown reason'}`;
+            await shipmentRepository.reviewShopifyPaymentSync(candidate.id, reason);
+            await failedPayloadService.save({
+              source: 'shopify-payment-review',
+              externalId: current.shopifyOrderId,
+              reason,
+              payload: {
+                recordId: current.id,
+                shopifyOrderName: current.shopifyOrderName,
+                amount: currentAmount
+              }
+            });
+            skipped++;
+            action.status = 'needs-review';
+            return;
+          }
+          const state = await shopifyStatusSyncClient.fetchOrderPaymentState(current.shopifyOrderId);
+          const complete = Boolean(
+            state?.cancelledAt ||
+            (state?.displayFinancialStatus && /paid/i.test(state.displayFinancialStatus) && state.totalOutstanding <= 0.01)
+          );
+          if (!complete) {
+            throw new Error(`Shopify payment not confirmed (status=${state?.displayFinancialStatus ?? 'missing'}, outstanding=${state?.totalOutstanding ?? 'n/a'})`);
+          }
+          await shipmentRepository.completeShopifyPaymentSync(candidate.id, result.transactionId);
+          processed++;
+          action.status = result.reason ?? 'completed';
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await shipmentRepository.failShopifyPaymentSync(candidate.id, reason);
           await failedPayloadService.save({
-            source: 'shopify-payment-review',
+            source: 'shopify-payment-worker',
             externalId: current.shopifyOrderId,
             reason,
-            payload: {
-              recordId: current.id,
-              shopifyOrderName: current.shopifyOrderName,
-              amount: currentAmount
-            }
+            payload: { recordId: current.id, shopifyOrderName: current.shopifyOrderName, amount: currentAmount }
           });
-          skipped++;
-          action.status = 'needs-review';
-          continue;
+          failed++;
+          action.status = 'retry-scheduled';
         }
-        const state = await shopifyStatusSyncClient.fetchOrderPaymentState(current.shopifyOrderId);
-        const complete = Boolean(
-          state?.cancelledAt ||
-          (state?.displayFinancialStatus && /paid/i.test(state.displayFinancialStatus) && state.totalOutstanding <= 0.01)
-        );
-        if (!complete) {
-          throw new Error(`Shopify payment not confirmed (status=${state?.displayFinancialStatus ?? 'missing'}, outstanding=${state?.totalOutstanding ?? 'n/a'})`);
-        }
-        await shipmentRepository.completeShopifyPaymentSync(candidate.id, result.transactionId);
-        processed++;
-        action.status = result.reason ?? 'completed';
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        await shipmentRepository.failShopifyPaymentSync(candidate.id, reason);
-        await failedPayloadService.save({
-          source: 'shopify-payment-worker',
-          externalId: current.shopifyOrderId,
-          reason,
-          payload: { recordId: current.id, shopifyOrderName: current.shopifyOrderName, amount: currentAmount }
-        });
-        failed++;
-        action.status = 'retry-scheduled';
-      }
+      }));
     }
 
     const remaining = await shipmentRepository.countDueShopifyPaymentSync();
