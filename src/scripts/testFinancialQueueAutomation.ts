@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   buildOdooCollectionFingerprint,
   buildShopifyPaymentFingerprint,
+  isCompletedCollectedDiscoveryReplay,
   isLegacyNonShopifyShipmentCode,
   planHistoricalDiscoveryPages
 } from '../services/shipmentStatusSyncService.js';
@@ -70,6 +71,65 @@ const odooChanged = buildOdooCollectionFingerprint({
 });
 assert.equal(odooA, odooReplay);
 assert.notEqual(odooA, odooChanged);
+
+const completedReplayRecord = {
+  accurateStatus: 'delivered',
+  accurateStatusCode: 'DTR',
+  accurateReturnStatus: null,
+  accurateReturnStatusCode: null,
+  accurateIsTerminal: true,
+  collectionStatus: 'collected',
+  trackingUrl: 'https://example.test/VI0002725',
+  collectedAmount: 1_318,
+  pendingCollectionAmount: 0,
+  returnedValue: 0,
+  deliveryFees: 76,
+  returnFees: 0,
+  returningDueFees: 0,
+  customerDue: 1_242,
+  deliveredAt: new Date('2026-07-20T12:00:00.000Z'),
+  returnSyncStatus: 'superseded',
+  shopifyPaymentSyncStatus: 'completed',
+  shopifyPaymentFingerprint: paymentA,
+  odooSyncStatus: 'paid',
+  odooCollectionSyncStatus: 'completed',
+  odooCollectionFingerprint: odooA
+};
+const completedReplaySnapshot = {
+  accurateStatus: 'delivered',
+  accurateStatusCode: 'DTR',
+  accurateReturnStatus: null,
+  accurateReturnStatusCode: null,
+  accurateIsTerminal: true,
+  collectionStatus: 'collected',
+  trackingUrl: 'https://example.test/VI0002725',
+  collectedAmount: 1_318,
+  pendingCollectionAmount: 0,
+  returnedValue: 0,
+  deliveryFees: 76,
+  returnFees: 0,
+  returningDueFees: 0,
+  customerDue: 1_242,
+  deliveredAt: new Date('2026-07-20T12:00:00.000Z')
+};
+assert.equal(isCompletedCollectedDiscoveryReplay({
+  record: completedReplayRecord,
+  snapshot: completedReplaySnapshot,
+  shopifyFingerprint: paymentA,
+  odooFingerprint: odooA
+}), true);
+assert.equal(isCompletedCollectedDiscoveryReplay({
+  record: completedReplayRecord,
+  snapshot: { ...completedReplaySnapshot, collectedAmount: 1_300 },
+  shopifyFingerprint: buildShopifyPaymentFingerprint(1_300),
+  odooFingerprint: odooA
+}), false);
+assert.equal(isCompletedCollectedDiscoveryReplay({
+  record: { ...completedReplayRecord, returnSyncStatus: 'pending' },
+  snapshot: completedReplaySnapshot,
+  shopifyFingerprint: paymentA,
+  odooFingerprint: odooA
+}), false);
 
 assert.equal(classifyFinancialHealth({ backlog: 0, manualReview: 0, stuck: 0, failed: 0 }), 'healthy');
 assert.equal(classifyFinancialHealth({ backlog: 12, manualReview: 0, stuck: 0, failed: 0 }), 'backlog-warning');
