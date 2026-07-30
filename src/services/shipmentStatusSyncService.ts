@@ -262,6 +262,8 @@ export class ShipmentStatusSyncService {
       ambiguous: 0,
       legacySkipped: 0,
       failed: 0,
+      recentPages: [] as number[],
+      recentSweepComplete: false,
       historicalPages: [] as number[],
       nextPage: FIRST_HISTORICAL_PAGE,
       lastPage: 1,
@@ -269,9 +271,15 @@ export class ShipmentStatusSyncService {
       elapsedMs: 0
     };
 
-    const processPage = async (page: number) => {
-      const result = await this.accurateClient.listShipments({}, first, page);
-      summary.lastPage = result.paginatorInfo.lastPage;
+    const processPage = async (
+      page: number,
+      input: Record<string, unknown> = {},
+      trackHistoricalPaginator = true
+    ) => {
+      const result = await this.accurateClient.listShipments(input, first, page);
+      if (trackHistoricalPaginator) {
+        summary.lastPage = result.paginatorInfo.lastPage;
+      }
       summary.scanned += result.data.length;
       const collected = result.data.filter((shipment) => {
         const statusCode = shipment.status?.code?.trim().toUpperCase() ?? '';
@@ -410,6 +418,35 @@ export class ShipmentStatusSyncService {
 
     const hotPage = await processPage(1);
     const lastPage = hotPage.paginatorInfo.lastPage;
+
+    // Shipment pages are ordered by creation, so an older shipment that is
+    // delivered today can sit far from page 1. Sweep recent carrier activity
+    // explicitly to keep status changes within the 30-minute schedule.
+    try {
+      const recentInput = {
+        statusCode: ['DTR'],
+        collected: true,
+        lastTransactionDate: { fromDays: 2 }
+      };
+      const recentFirst = await processPage(1, recentInput, false);
+      summary.recentPages.push(1);
+      const recentLastPage = recentFirst.paginatorInfo.lastPage;
+      for (let page = 2; page <= recentLastPage; page += 1) {
+        if (Date.now() - startedAt >= budgetMs - 20_000) break;
+        await processPage(page, recentInput, false);
+        summary.recentPages.push(page);
+      }
+      summary.recentSweepComplete = summary.recentPages.length === recentLastPage;
+    } catch (error) {
+      summary.failed++;
+      await failedPayloadService.save({
+        source: 'accurate-recent-collection-discovery',
+        reason: error instanceof Error ? error.message : String(error),
+        payload: { fromDays: 2 }
+      });
+    }
+    summary.lastPage = lastPage;
+
     const cursor = durableCursor
       ? await shipmentRepository.getOperationalCursor(COLLECTION_DISCOVERY_CURSOR, FIRST_HISTORICAL_PAGE)
       : FIRST_HISTORICAL_PAGE;
@@ -871,6 +908,7 @@ export class ShipmentStatusSyncService {
     first?: number;
     budgetMs?: number;
     apply?: boolean;
+    input?: Record<string, unknown>;
   } = {}): Promise<{
     apply: boolean;
     scanned: number;
@@ -915,7 +953,7 @@ export class ShipmentStatusSyncService {
     for (let offset = 0; offset < pages; offset += 1) {
       if (offset > 0 && Date.now() - startedAt >= budgetMs) break;
       const page = startPage + offset;
-      const result = await this.accurateClient.listShipments({}, first, page);
+      const result = await this.accurateClient.listShipments(options.input ?? {}, first, page);
       summary.lastPage = result.paginatorInfo.lastPage;
       summary.scanned += result.data.length;
       const returned = result.data.filter((shipment) => {
@@ -1059,6 +1097,8 @@ export class ShipmentStatusSyncService {
       ambiguous: 0,
       legacySkipped: 0,
       failed: 0,
+      recentPages: [] as number[],
+      recentSweepComplete: false,
       historicalPages: [] as number[],
       nextPage: FIRST_HISTORICAL_PAGE,
       lastPage: 1,
@@ -1087,12 +1127,52 @@ export class ShipmentStatusSyncService {
       apply
     });
     merge(hot);
+    const historicalLastPage = hot.lastPage;
+
+    try {
+      const recentInput = {
+        deliveredOrReturnedDate: { fromDays: 2 }
+      };
+      const recentFirst = await this.discoverReturnedShipmentsFromReports({
+        startPage: 1,
+        pages: 1,
+        first,
+        budgetMs: Math.max(10_000, budgetMs - (Date.now() - startedAt)),
+        apply,
+        input: recentInput
+      });
+      merge(recentFirst);
+      summary.recentPages.push(1);
+      const recentLastPage = recentFirst.lastPage;
+      for (let page = 2; page <= recentLastPage; page += 1) {
+        if (Date.now() - startedAt >= budgetMs - 20_000) break;
+        const recentPart = await this.discoverReturnedShipmentsFromReports({
+          startPage: page,
+          pages: 1,
+          first,
+          budgetMs: Math.max(10_000, budgetMs - (Date.now() - startedAt)),
+          apply,
+          input: recentInput
+        });
+        merge(recentPart);
+        summary.recentPages.push(page);
+      }
+      summary.recentSweepComplete = summary.recentPages.length === recentLastPage;
+    } catch (error) {
+      summary.failed++;
+      await failedPayloadService.save({
+        source: 'accurate-recent-return-discovery',
+        reason: error instanceof Error ? error.message : String(error),
+        payload: { fromDays: 2 }
+      });
+    }
+    summary.lastPage = historicalLastPage;
 
     const cursor = await shipmentRepository.getOperationalCursor(
       RETURN_DISCOVERY_CURSOR,
       FIRST_HISTORICAL_PAGE
     );
-    const plan = planHistoricalDiscoveryPages(cursor, hot.lastPage, historyPages);
+    const plan = planHistoricalDiscoveryPages(cursor, historicalLastPage, historyPages);
     for (const page of plan.pages) {
       if (Date.now() - startedAt >= budgetMs) break;
       const part = await this.discoverReturnedShipmentsFromReports({
@@ -1104,7 +1184,7 @@ export class ShipmentStatusSyncService {
       });
       merge(part);
       summary.historicalPages.push(page);
-      summary.nextPage = page >= hot.lastPage ? FIRST_HISTORICAL_PAGE : page + 1;
+      summary.nextPage = page >= historicalLastPage ? FIRST_HISTORICAL_PAGE : page + 1;
       if (apply) {
         await shipmentRepository.setOperationalCursor(RETURN_DISCOVERY_CURSOR, summary.nextPage);
       }
