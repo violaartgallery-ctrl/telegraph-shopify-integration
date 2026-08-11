@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { sendDocument, sendMessage } from '../telegram/telegramApi.js';
 import type { PreviewCursor } from './productionJobStore.js';
 import {
@@ -12,6 +13,16 @@ import { PermanentProductionError, SoftDeadlineError } from './productionPipelin
 type Checkpoint = (progressMade?: boolean) => Promise<void>;
 
 const DEFAULT_MAX_PHOTOS_PER_INVOCATION = 6;
+
+class PermanentPhotoUnavailableError extends Error {
+  constructor(
+    readonly url: string,
+    readonly status: number
+  ) {
+    super(`Photo HTTP ${status}: ${url.slice(0, 160)}`);
+    this.name = 'PermanentPhotoUnavailableError';
+  }
+}
 
 interface ProductionSourceSnapshotStore {
   load: () => Promise<ProductionAgentResponse | null>;
@@ -134,10 +145,14 @@ async function fetchBinary(url: string, deadline: number): Promise<Buffer> {
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
       if (response.ok) return Buffer.from(await response.arrayBuffer());
+      if (response.status === 404 || response.status === 410) {
+        throw new PermanentPhotoUnavailableError(url, response.status);
+      }
       const error = new Error(`Photo HTTP ${response.status}: ${url.slice(0, 160)}`);
       if (response.status !== 429 && response.status < 500) throw error;
       lastError = error;
     } catch (error) {
+      if (error instanceof PermanentPhotoUnavailableError) throw error;
       lastError = error;
       if (attempt === 2) throw error;
     }
@@ -341,16 +356,29 @@ export async function sendCompleteProductionPreview(options: {
 
   // 4) Every source photo, with progress keyed by recipient + URL.
   const sentPhotoKeys = new Set(cursor.sentPhotoKeys);
+  const unavailablePhotoUrls = new Set(cursor.unavailablePhotoUrls ?? []);
+  cursor.unavailablePhotoUrls = [...unavailablePhotoUrls];
   const maxPhotos = photoLimit(options.maxPhotosPerInvocation);
   let photosCompletedThisInvocation = 0;
   for (let index = 0; index < photos.length; index += 1) {
     const photo = photos[index]!;
+    if (unavailablePhotoUrls.has(photo.url)) continue;
     const pendingRecipients = cursor.recipientChatIds.filter(
       (recipient) => !sentPhotoKeys.has(artifactStateKey(recipient, photo.url))
     );
     if (!pendingRecipients.length) continue;
     assertTime(deadline, `اتبعت ${index} صورة — باقي ${photos.length - index}`);
-    const buffer = await fetchBinary(photo.url, deadline);
+    let buffer: Buffer;
+    try {
+      buffer = await fetchBinary(photo.url, deadline);
+    } catch (error) {
+      if (!(error instanceof PermanentPhotoUnavailableError)) throw error;
+      unavailablePhotoUrls.add(photo.url);
+      cursor.unavailablePhotoUrls = [...unavailablePhotoUrls];
+      // This is a durable review marker, not a confirmed external send.
+      await checkpoint(false);
+      continue;
+    }
     let extension = 'jpg';
     try {
       const raw = new URL(photo.url).pathname.split('.').pop() ?? 'jpg';
@@ -411,17 +439,37 @@ export async function sendCompleteProductionPreview(options: {
     `منتجات الإنتاج: ${data.productionEntries.length}`,
     `ملفات الليزر: ${laserFileCount}`,
     `شبكات البوكسات: ${boxFileCount}`,
-    `الصور: ${photos.length}`,
+    `الصور المطلوبة: ${photos.length}`,
+    `الصور غير المتاحة: ${unavailablePhotoUrls.size}`,
     `التحذيرات: ${data.warnings.length}`,
   ];
   for (const warning of data.warnings.slice(0, 5)) {
     summaryLines.push(`⚠️ ${String(warning).slice(0, 180)}`);
   }
+  const unavailablePhotos = photos.filter((photo) => unavailablePhotoUrls.has(photo.url));
+  for (const photo of unavailablePhotos.slice(0, 10)) {
+    summaryLines.push(`⛔ صورة غير متاحة: ${photo.orderName} — ${photo.product}`);
+  }
+  const reviewDigest = createHash('sha256')
+    .update([...unavailablePhotoUrls].sort().join('\n'))
+    .digest('hex')
+    .slice(0, 12);
   await sendTextToAll({
     cursor,
-    artifactKey: `summary:${productionSourceFingerprint(data)}`,
+    artifactKey: `summary:${productionSourceFingerprint(data)}:${reviewDigest}`,
     text: summaryLines.join('\n'),
     deadline,
     checkpoint,
   });
+
+  if (unavailablePhotos.length) {
+    const affected = unavailablePhotos
+      .slice(0, 5)
+      .map((photo) => `${photo.orderName} (${photo.product})`)
+      .join(', ');
+    throw new PermanentProductionError(
+      `${unavailablePhotos.length} صورة مصدرها غير متاح نهائيًا (404/410): ${affected}. ` +
+      'تم إرسال كل الملفات والصور الأخرى، لكن الـBatch لن يتحول إلى Run قبل المراجعة.'
+    );
+  }
 }

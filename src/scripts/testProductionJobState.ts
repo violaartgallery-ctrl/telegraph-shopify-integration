@@ -10,7 +10,9 @@ import {
   finishPreview,
   loadJob,
   loadPreviewSourceSnapshot,
+  markNeedsReview,
   queueRun,
+  requeueNeedsReviewJob,
   retryJob,
   savePreviewSourceSnapshot,
   type PreviewCursor,
@@ -126,7 +128,19 @@ try {
   const progressed = await checkpointJob(retryChatId, retryClaim3, retryClaim3.executionToken!);
   assert.equal(progressed.attemptCount, 0, 'confirmed external progress resets consecutive failures');
 
-  console.log(JSON.stringify({ ok: true, batchId, checks: 14, retryCounterPersists: true }));
+  await markNeedsReview(
+    retryChatId,
+    progressed,
+    retryClaim3.executionToken!,
+    'permanent missing photo'
+  );
+  assert.equal((await loadJob(retryChatId))?.status, 'needs_review');
+  const requeued = await requeueNeedsReviewJob(retryChatId, retryPreview.batchId);
+  assert.equal(requeued.status, 'retrying');
+  assert.equal(requeued.attemptCount, 0);
+  assert.equal(requeued.executionToken, undefined);
+
+  console.log(JSON.stringify({ ok: true, batchId, checks: 18, retryCounterPersists: true }));
 } finally {
   await clearJob(chatId);
   await clearJob(retryChatId);

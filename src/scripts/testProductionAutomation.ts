@@ -6,7 +6,7 @@ import {
 import { createPreviewCursor } from '../services/productionJobStore.js';
 import { sendCompleteProductionPreview } from '../services/productionPreviewService.js';
 import { signedResumeHeaders, verifyResumeRequest } from '../services/productionContinuation.js';
-import { SoftDeadlineError } from '../services/productionPipelineErrors.js';
+import { PermanentProductionError, SoftDeadlineError } from '../services/productionPipelineErrors.js';
 import { printPhotoSourceUrl } from '../services/printSheet.js';
 
 const originalFetch = globalThis.fetch;
@@ -53,6 +53,10 @@ try {
     if (url.includes('/sendDocument')) {
       telegramDocuments += 1;
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+    if (url === 'https://photos.test/permanent-missing.jpg') {
+      photoFetchCounts.set(url, (photoFetchCounts.get(url) ?? 0) + 1);
+      return new Response('missing', { status: 404 });
     }
     if (url.startsWith('https://photos.test/')) {
       photoFetchCounts.set(url, (photoFetchCounts.get(url) ?? 0) + 1);
@@ -170,6 +174,69 @@ try {
   );
   assert.equal(largeCursor.sentArtifactKeys.length, 8, 'pre-sent Word/PDF plus final summary artifacts remain idempotent');
 
+  // A permanently deleted customer upload must not trap every later photo
+  // behind retries. Send every reachable photo, report the exact review item,
+  // then stop before the preview can become runnable.
+  const missingPhotoPayload: ProductionAgentResponse = {
+    wordBase64: Buffer.from('missing-photo-word').toString('base64'),
+    summary: { totalOrders: 4, productionEntries: 4, skippedItems: 0, warnings: 0 },
+    warnings: [],
+    ordersDetail: Array.from({ length: 4 }, (_, index) => ({
+      order_name: `#MISSING-${index + 1}`,
+      customer: `Customer ${index + 1}`,
+      created_at: '2026-08-11T00:00:00Z',
+      items: [],
+    })),
+    productionEntries: Array.from({ length: 4 }, (_, index) => ({
+      display_product: index === 0 ? 'Gift box' : 'Photo keychain',
+      total_quantity: 1,
+      customization_cleaned: [],
+      photo_attachments: [{
+        attachment_name: `missing-test-${index + 1}.jpg`,
+        attachment_url: index === 0
+          ? 'https://photos.test/permanent-missing.jpg'
+          : `https://photos.test/reachable-${index + 1}.jpg`,
+        order_name: `#MISSING-${index + 1}`,
+        comment_id: `missing-comment-${index + 1}`,
+      }],
+    })),
+  };
+  const missingCursor = createPreviewCursor({ recipientChatIds: ['100'] });
+  missingCursor.orderNumbers = missingPhotoPayload.ordersDetail.map((order) => order.order_name);
+  missingCursor.sourceFingerprint = productionSourceFingerprint(missingPhotoPayload);
+  missingCursor.artifactManifest = { laserFileCount: 0, boxFileCount: 0, uniquePhotoCount: 4 };
+  missingCursor.sentArtifactKeys.push(`100|word:${missingCursor.sourceFingerprint}`);
+  missingCursor.sentArtifactKeys.push(`100|print-sheet:${missingCursor.sourceFingerprint}`);
+  let missingReviewError: PermanentProductionError | null = null;
+  for (let invocation = 0; invocation < 5 && !missingReviewError; invocation += 1) {
+    try {
+      await sendCompleteProductionPreview({
+        chatId: 100,
+        cursor: missingCursor,
+        deadline: Date.now() + 120_000,
+        maxPhotosPerInvocation: 2,
+        checkpoint: async () => undefined,
+        sourceSnapshot: {
+          load: async () => JSON.parse(JSON.stringify(missingPhotoPayload)) as ProductionAgentResponse,
+          save: async () => { throw new Error('existing missing-photo snapshot must not be replaced'); },
+        },
+      });
+    } catch (error) {
+      if (error instanceof SoftDeadlineError) continue;
+      if (error instanceof PermanentProductionError) {
+        missingReviewError = error;
+        break;
+      }
+      throw error;
+    }
+  }
+  assert.ok(missingReviewError, 'a missing source photo must end in explicit manual review');
+  assert.match(missingReviewError.message, /#MISSING-1/);
+  assert.deepEqual(missingCursor.unavailablePhotoUrls, ['https://photos.test/permanent-missing.jpg']);
+  assert.equal(missingCursor.sentPhotoKeys.length, 3, 'all three reachable photos must still be sent');
+  assert.equal(photoFetchCounts.get('https://photos.test/permanent-missing.jpg'), 1);
+  assert.ok(telegramMessages.some((message) => message.includes('الصور غير المتاحة: 1')));
+
   const body = JSON.stringify({ chatId: 100, batchId: cursor.batchId, delayMs: 0 });
   const headers = signedResumeHeaders(body, 1_000_000);
   assert.equal(verifyResumeRequest(headers, body, 1_000_100), true);
@@ -195,6 +262,7 @@ try {
     largeBatchPhotos: photoFetchCounts.size,
     largeBatchInvocations: largeInvocations,
     largeBatchCheckpoints: largeCheckpoints,
+    permanentMissingPhotoReviewedAfterOtherPhotos: true,
   }));
 } finally {
   globalThis.fetch = originalFetch;

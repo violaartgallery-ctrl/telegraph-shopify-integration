@@ -58,6 +58,8 @@ export interface PreviewCursor extends JobCommon {
   sentArtifactKeys: string[];
   /** `${recipientChatId}|${photoUrl}` entries confirmed by Telegram. */
   sentPhotoKeys: string[];
+  /** Source photo URLs that returned a permanent 404/410 and require review. */
+  unavailablePhotoUrls?: string[];
   /** Detects edits between continuation segments so a batch cannot mix versions. */
   sourceFingerprint?: string;
   /** Counts captured after expensive artifact generation so completed stages can be skipped. */
@@ -141,6 +143,7 @@ export function createPreviewCursor(options: {
     attemptCount: 0,
     sentArtifactKeys: [],
     sentPhotoKeys: [],
+    unavailablePhotoUrls: [],
     updatedAt: Date.now(),
   };
 }
@@ -471,6 +474,37 @@ export async function retryJob(
     cursor.executionToken = undefined;
     cursor.attemptCount = Math.max(cursor.attemptCount, existing.cursor.attemptCount) + 1;
     cursor.lastError = String(error).slice(0, 500);
+    await writeLocked(transaction, chatId, cursor);
+    return cursor;
+  });
+}
+
+/**
+ * Support-only recovery after the cause of a needs-review stop is understood.
+ * Preserves every confirmed artifact/photo and only makes the same batch
+ * claimable again; it never creates a new batch or marks work as successful.
+ */
+export async function requeueNeedsReviewJob(
+  chatId: number,
+  batchId: string
+): Promise<JobCursor> {
+  const prisma = await db();
+  return await prisma.$transaction(async (transaction) => {
+    await lockChat(transaction, chatId);
+    const existing = await readLocked(transaction, chatId);
+    if (
+      !existing ||
+      existing.cursor.batchId !== batchId ||
+      existing.cursor.status !== 'needs_review'
+    ) {
+      throw new Error(`Production batch ${batchId} is not waiting for review`);
+    }
+
+    const cursor = existing.cursor;
+    cursor.status = 'retrying';
+    cursor.executionToken = undefined;
+    cursor.attemptCount = 0;
+    cursor.lastError = undefined;
     await writeLocked(transaction, chatId, cursor);
     return cursor;
   });
