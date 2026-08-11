@@ -131,17 +131,20 @@ export const createApp = () => {
   // OPS_SECRET.
   app.use(createOpsRouter(services.shipmentStatusSyncService, services.metaDeliveryService));
 
-  // Public, read-only fallback for the Shopify theme. The local theme JSON is
-  // primary; this endpoint must remain reachable without the admin secret when
-  // Shopify's CDN asset is temporarily unavailable.
-  app.get('/api/accurate/locations', async (_request, response, next) => {
+  const sendLocationCatalog = async (_request: Request, response: Response, next: NextFunction) => {
     try {
       response.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800');
       response.json({ locations: await getLocations(services.accurateClient) });
     } catch (error) {
       next(error);
     }
-  });
+  };
+
+  // Public, read-only location catalog. Shopify App Proxy maps
+  // /apps/viola-delivery/* on the storefront to /storefront/* here.
+  // Keep the legacy API path for existing checks and admin tooling.
+  app.get('/storefront/locations', sendLocationCatalog);
+  app.get('/api/accurate/locations', sendLocationCatalog);
 
   // BUG-SEC-4 FIX: Protect all admin routes under /orders/* and /api/* with adminAuth.
   // Shopify webhook routes (/webhooks/*) are intentionally NOT protected here —
