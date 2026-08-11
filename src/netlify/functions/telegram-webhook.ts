@@ -1,6 +1,7 @@
 import { waitUntil } from '@vercel/functions';
 import { answerCallbackQuery, sendMessage } from '../../telegram/telegramApi.js';
-import { productionRecipientChatIds, runPipeline } from './run-production-background.js';
+import { productionRecipientChatIds } from './run-production-background.js';
+import { scheduleProductionContinuation } from '../../services/productionContinuation.js';
 import {
   clearJob,
   createPreviewJob,
@@ -74,13 +75,24 @@ function isTelegraphEnabled(): boolean {
 }
 
 function triggerBackground(chatId: number, job: JobCursor): void {
+  const dispatch = scheduleProductionContinuation({
+    chatId,
+    batchId: job.batchId,
+    dispatchKey: String(job.updatedAt),
+  }).catch(async (error) => {
+    console.error('[webhook] Failed to enqueue production pipeline:', error);
+    await sendMessage(
+      chatId,
+      `🚨 تعذر وضع Batch ${job.batchId} في طابور التشغيل. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
+    );
+  });
   try {
-    waitUntil(runPipeline(chatId, job.batchId));
+    waitUntil(dispatch);
   } catch (error) {
-    console.error('[webhook] Failed to schedule production pipeline:', error);
+    console.error('[webhook] Failed to retain production queue publish:', error);
     void sendMessage(
       chatId,
-      `🚨 تعذر تشغيل Batch ${job.batchId} في الـrequest الحالي. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
+      `🚨 تعذر وضع Batch ${job.batchId} في طابور التشغيل. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
     );
   }
 }

@@ -9,7 +9,9 @@ import {
 } from './productionAgentClient.js';
 import { PermanentProductionError, SoftDeadlineError } from './productionPipelineErrors.js';
 
-type Checkpoint = () => Promise<void>;
+type Checkpoint = (progressMade?: boolean) => Promise<void>;
+
+const DEFAULT_MAX_PHOTOS_PER_INVOCATION = 6;
 
 interface ProductionSourceSnapshotStore {
   load: () => Promise<ProductionAgentResponse | null>;
@@ -26,6 +28,28 @@ function safeBatchName(batchId: string): string {
 
 function artifactStateKey(recipient: string, artifact: string): string {
   return `${recipient}|${artifact}`;
+}
+
+function artifactConfirmedForAll(cursor: PreviewCursor, artifactKey: string): boolean {
+  const sent = new Set(cursor.sentArtifactKeys);
+  return cursor.recipientChatIds.every((recipient) => sent.has(artifactStateKey(recipient, artifactKey)));
+}
+
+function indexedArtifactsConfirmedForAll(
+  cursor: PreviewCursor,
+  prefix: string,
+  count: number
+): boolean {
+  for (let index = 1; index <= count; index += 1) {
+    if (!artifactConfirmedForAll(cursor, `${prefix}:${index}:${cursor.sourceFingerprint}`)) return false;
+  }
+  return true;
+}
+
+function photoLimit(explicit?: number): number {
+  const parsed = Number(explicit ?? process.env.PRODUCTION_PHOTOS_PER_INVOCATION);
+  if (!Number.isFinite(parsed)) return DEFAULT_MAX_PHOTOS_PER_INVOCATION;
+  return Math.min(50, Math.max(1, Math.floor(parsed)));
 }
 
 async function sendArtifactToAll(options: {
@@ -97,10 +121,32 @@ function uniquePhotos(data: ProductionAgentResponse): Array<{
   return result;
 }
 
-async function fetchBinary(url: string): Promise<Buffer> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(90_000) });
-  if (!response.ok) throw new Error(`Photo HTTP ${response.status}: ${url.slice(0, 160)}`);
-  return Buffer.from(await response.arrayBuffer());
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchBinary(url: string, deadline: number): Promise<Buffer> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assertTime(deadline, 'باقي تحميل صورة');
+    const remaining = deadline - Date.now();
+    const timeoutMs = Math.min(45_000, Math.max(1_000, remaining - 2_000));
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      if (response.ok) return Buffer.from(await response.arrayBuffer());
+      const error = new Error(`Photo HTTP ${response.status}: ${url.slice(0, 160)}`);
+      if (response.status !== 429 && response.status < 500) throw error;
+      lastError = error;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2) throw error;
+    }
+    if (attempt < 2) {
+      assertTime(deadline, 'إعادة محاولة تحميل صورة');
+      await sleep(500 * (2 ** attempt));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function validateSource(cursor: PreviewCursor, data: ProductionAgentResponse): void {
@@ -119,16 +165,16 @@ export async function sendCompleteProductionPreview(options: {
   deadline: number;
   checkpoint: Checkpoint;
   sourceSnapshot?: ProductionSourceSnapshotStore;
+  maxPhotosPerInvocation?: number;
 }): Promise<void> {
   const { chatId, cursor, deadline, checkpoint, sourceSnapshot } = options;
   assertTime(deadline, 'لم يبدأ جلب التجميعة بعد');
 
-  await sendMessage(
-    chatId,
-    cursor.orderNumbers.length
-      ? `📦 بكمل التجميعة ${cursor.batchId} تلقائيًا من مكان الوقوف...`
-      : `📦 جاري تثبيت أوردرات التجميعة ${cursor.batchId}...`
-  );
+  const hadOrderNumbers = cursor.orderNumbers.length > 0;
+  const hadFingerprint = Boolean(cursor.sourceFingerprint);
+  if (!hadOrderNumbers) {
+    await sendMessage(chatId, `📦 جاري تثبيت أوردرات التجميعة ${cursor.batchId}...`);
+  }
 
   const savedSnapshot = await sourceSnapshot?.load() ?? null;
   let data = savedSnapshot;
@@ -152,98 +198,151 @@ export async function sendCompleteProductionPreview(options: {
     // Every continuation then regenerates artifacts from these exact bytes.
     await sourceSnapshot.save(data);
   }
-  await checkpoint();
+  // Loading a previously-saved snapshot is not forward progress and must not
+  // erase a consecutive retry count. Capturing the source for the first time is.
+  await checkpoint(!hadOrderNumbers || !hadFingerprint);
 
   const count = cursor.orderNumbers.length;
+  const photos = uniquePhotos(data);
   const batchName = safeBatchName(cursor.batchId);
   const date = new Date().toISOString().slice(0, 10);
-  await sendMessage(chatId, `✅ تم تثبيت ${count} أوردر في Batch واحد. جاري إرسال كل الملفات والصور...`);
+  if (!hadOrderNumbers) {
+    await sendMessage(chatId, `✅ تم تثبيت ${count} أوردر في Batch واحد. جاري إرسال كل الملفات والصور...`);
+  }
 
   // 1) Main production Word document.
-  const word = Buffer.from(data.wordBase64, 'base64');
-  if (!word.length) throw new PermanentProductionError('ملف Word من Ayman Agent فارغ');
-  await sendArtifactToAll({
-    cursor,
-    artifactKey: `word:${cursor.sourceFingerprint}`,
-    buffer: word,
-    filename: `production_${date}_${batchName}_${count}_orders.docx`,
-    caption: `قائمة الإنتاج الكاملة — ${count} أوردر ✅`,
-    deadline,
-    checkpoint,
-  });
-
-  // 2) Laser and box-grid files. Every file is checkpointed independently.
-  assertTime(deadline, 'باقي ملفات الليزر والبوكسات والصور');
-  const { buildAiBuffers, buildBoxGridBuffers } = await import('./aiWriter.js');
-  const linearEntries = data.productionEntries.filter((entry) => !isBoxEntry(entry));
-  const boxEntries = data.productionEntries.filter(isBoxEntry);
-  const laserFiles = linearEntries.length
-    ? await buildAiBuffers(linearEntries as never, { maxBytes: 1_500_000 })
-    : [];
-  const boxFiles = boxEntries.length ? await buildBoxGridBuffers(boxEntries as never) : [];
-
-  for (let index = 0; index < laserFiles.length; index += 1) {
-    const buffer = laserFiles[index]!;
+  const wordArtifactKey = `word:${cursor.sourceFingerprint}`;
+  if (!artifactConfirmedForAll(cursor, wordArtifactKey)) {
+    const word = Buffer.from(data.wordBase64, 'base64');
+    if (!word.length) throw new PermanentProductionError('ملف Word من Ayman Agent فارغ');
     await sendArtifactToAll({
       cursor,
-      artifactKey: `laser:${index + 1}:${cursor.sourceFingerprint}`,
-      buffer,
-      filename: `laser_${date}_${batchName}_${index + 1}.ai`,
-      caption: `ملف الليزر ${index + 1}/${laserFiles.length} 🔪`,
+      artifactKey: wordArtifactKey,
+      buffer: word,
+      filename: `production_${date}_${batchName}_${count}_orders.docx`,
+      caption: `قائمة الإنتاج الكاملة — ${count} أوردر ✅`,
       deadline,
       checkpoint,
     });
   }
-  for (let index = 0; index < boxFiles.length; index += 1) {
-    const buffer = boxFiles[index]!;
-    await sendArtifactToAll({
-      cursor,
-      artifactKey: `box:${index + 1}:${cursor.sourceFingerprint}`,
-      buffer,
-      filename: `box_grid_${date}_${batchName}_${index + 1}.ai`,
-      caption: `شبكة البوكسات ${index + 1}/${boxFiles.length} 📦`,
-      deadline,
-      checkpoint,
-    });
+
+  // 2) Laser and box-grid files. Every file is checkpointed independently.
+  assertTime(deadline, 'باقي ملفات الليزر والبوكسات والصور');
+  const savedManifest = cursor.artifactManifest;
+  const laserAlreadyComplete = Boolean(
+    savedManifest && indexedArtifactsConfirmedForAll(cursor, 'laser', savedManifest.laserFileCount)
+  );
+  const boxAlreadyComplete = Boolean(
+    savedManifest && indexedArtifactsConfirmedForAll(cursor, 'box', savedManifest.boxFileCount)
+  );
+  let laserFiles: Buffer[] | null = null;
+  let boxFiles: Buffer[] | null = null;
+
+  if (!laserAlreadyComplete || !boxAlreadyComplete) {
+    const { buildAiBuffers, buildBoxGridBuffers } = await import('./aiWriter.js');
+    if (!laserAlreadyComplete) {
+      const linearEntries = data.productionEntries.filter((entry) => !isBoxEntry(entry));
+      laserFiles = linearEntries.length
+        ? await buildAiBuffers(linearEntries as never, { maxBytes: 1_500_000 })
+        : [];
+    }
+    if (!boxAlreadyComplete) {
+      const boxEntries = data.productionEntries.filter(isBoxEntry);
+      boxFiles = boxEntries.length ? await buildBoxGridBuffers(boxEntries as never) : [];
+    }
+  }
+
+  const laserFileCount = laserFiles?.length ?? savedManifest?.laserFileCount ?? 0;
+  const boxFileCount = boxFiles?.length ?? savedManifest?.boxFileCount ?? 0;
+  if (
+    !savedManifest ||
+    savedManifest.laserFileCount !== laserFileCount ||
+    savedManifest.boxFileCount !== boxFileCount ||
+    savedManifest.uniquePhotoCount !== photos.length
+  ) {
+    cursor.artifactManifest = {
+      laserFileCount,
+      boxFileCount,
+      uniquePhotoCount: photos.length,
+    };
+    // This metadata avoids future regeneration, but it is not an externally
+    // visible success and therefore must not reset consecutive failures.
+    await checkpoint(false);
+  }
+
+  if (laserFiles) {
+    for (let index = 0; index < laserFiles.length; index += 1) {
+      const buffer = laserFiles[index]!;
+      await sendArtifactToAll({
+        cursor,
+        artifactKey: `laser:${index + 1}:${cursor.sourceFingerprint}`,
+        buffer,
+        filename: `laser_${date}_${batchName}_${index + 1}.ai`,
+        caption: `ملف الليزر ${index + 1}/${laserFiles.length} 🔪`,
+        deadline,
+        checkpoint,
+      });
+    }
+  }
+  if (boxFiles) {
+    for (let index = 0; index < boxFiles.length; index += 1) {
+      const buffer = boxFiles[index]!;
+      await sendArtifactToAll({
+        cursor,
+        artifactKey: `box:${index + 1}:${cursor.sourceFingerprint}`,
+        buffer,
+        filename: `box_grid_${date}_${batchName}_${index + 1}.ai`,
+        caption: `شبكة البوكسات ${index + 1}/${boxFiles.length} 📦`,
+        deadline,
+        checkpoint,
+      });
+    }
   }
 
   // 3) Print-ready photo sheet. Any failed source image blocks completion.
   assertTime(deadline, 'باقي ورق طباعة الصور والصور المنفردة');
-  const { buildPrintSheetPdf, kindForProduct, printPhotoSourceUrl } = await import('./printSheet.js');
-  const printSources: Array<{ url: string; kind: 'wallet' | 'keychain' }> = [];
-  const seenPrint = new Set<string>();
-  for (const entry of data.productionEntries) {
-    const kind = kindForProduct(entry.display_product);
-    for (const photo of entry.photo_attachments ?? []) {
-      if ((photo.position_label ?? '').trim()) continue;
-      if (!photo.attachment_url || seenPrint.has(photo.attachment_url)) continue;
-      seenPrint.add(photo.attachment_url);
-      printSources.push({ url: photo.attachment_url, kind });
+  const printSheetArtifactKey = `print-sheet:${cursor.sourceFingerprint}`;
+  if (!artifactConfirmedForAll(cursor, printSheetArtifactKey)) {
+    const { buildPrintSheetPdf, kindForProduct, printPhotoSourceUrl } = await import('./printSheet.js');
+    const printSources: Array<{ url: string; kind: 'wallet' | 'keychain' }> = [];
+    const seenPrint = new Set<string>();
+    for (const entry of data.productionEntries) {
+      const kind = kindForProduct(entry.display_product);
+      for (const photo of entry.photo_attachments ?? []) {
+        if ((photo.position_label ?? '').trim()) continue;
+        if (!photo.attachment_url || seenPrint.has(photo.attachment_url)) continue;
+        seenPrint.add(photo.attachment_url);
+        printSources.push({ url: photo.attachment_url, kind });
+      }
     }
-  }
-  if (printSources.length) {
-    const photos: Array<{ buffer: Buffer; kind: 'wallet' | 'keychain' }> = [];
-    for (const source of printSources) {
-      assertTime(deadline, 'باقي تحميل صور ورق الطباعة');
-      photos.push({ buffer: await fetchBinary(printPhotoSourceUrl(source.url)), kind: source.kind });
+    if (printSources.length) {
+      const printPhotos: Array<{ buffer: Buffer; kind: 'wallet' | 'keychain' }> = [];
+      for (const source of printSources) {
+        assertTime(deadline, 'باقي تحميل صور ورق الطباعة');
+        printPhotos.push({
+          buffer: await fetchBinary(printPhotoSourceUrl(source.url), deadline),
+          kind: source.kind,
+        });
+      }
+      const pdfBytes = await buildPrintSheetPdf(printPhotos);
+      if (!pdfBytes) throw new Error('Print-sheet builder returned no PDF');
+      const pdf = Buffer.from(pdfBytes);
+      await sendArtifactToAll({
+        cursor,
+        artifactKey: printSheetArtifactKey,
+        buffer: pdf,
+        filename: `print_sheets_${date}_${batchName}.pdf`,
+        caption: 'ورق طباعة الصور 🖨️',
+        deadline,
+        checkpoint,
+      });
     }
-    const pdfBytes = await buildPrintSheetPdf(photos);
-    if (!pdfBytes) throw new Error('Print-sheet builder returned no PDF');
-    const pdf = Buffer.from(pdfBytes);
-    await sendArtifactToAll({
-      cursor,
-      artifactKey: `print-sheet:${cursor.sourceFingerprint}`,
-      buffer: pdf,
-      filename: `print_sheets_${date}_${batchName}.pdf`,
-      caption: 'ورق طباعة الصور 🖨️',
-      deadline,
-      checkpoint,
-    });
   }
 
   // 4) Every source photo, with progress keyed by recipient + URL.
-  const photos = uniquePhotos(data);
   const sentPhotoKeys = new Set(cursor.sentPhotoKeys);
+  const maxPhotos = photoLimit(options.maxPhotosPerInvocation);
+  let photosCompletedThisInvocation = 0;
   for (let index = 0; index < photos.length; index += 1) {
     const photo = photos[index]!;
     const pendingRecipients = cursor.recipientChatIds.filter(
@@ -251,7 +350,7 @@ export async function sendCompleteProductionPreview(options: {
     );
     if (!pendingRecipients.length) continue;
     assertTime(deadline, `اتبعت ${index} صورة — باقي ${photos.length - index}`);
-    const buffer = await fetchBinary(photo.url);
+    const buffer = await fetchBinary(photo.url, deadline);
     let extension = 'jpg';
     try {
       const raw = new URL(photo.url).pathname.split('.').pop() ?? 'jpg';
@@ -273,6 +372,12 @@ export async function sendCompleteProductionPreview(options: {
       sentPhotoKeys.add(stateKey);
       await checkpoint();
     }
+    photosCompletedThisInvocation += 1;
+    if (photosCompletedThisInvocation >= maxPhotos && index < photos.length - 1) {
+      throw new SoftDeadlineError(
+        `تم إرسال ${photosCompletedThisInvocation} صور في الجزء الحالي — باقي صور التجميعة`
+      );
+    }
   }
 
   // 5) Per-order summary document.
@@ -282,18 +387,21 @@ export async function sendCompleteProductionPreview(options: {
     );
   }
   if (data.ordersDetail.length) {
-    assertTime(deadline, 'باقي ملف التجميعة بالأوردر والملخص النهائي');
-    const { buildOrdersSummaryBuffer } = await import('./orderSummaryWriter.js');
-    const ordersDocument = await buildOrdersSummaryBuffer(data.ordersDetail as never);
-    await sendArtifactToAll({
-      cursor,
-      artifactKey: `orders-summary:${cursor.sourceFingerprint}`,
-      buffer: ordersDocument,
-      filename: `orders_${date}_${batchName}_${count}.docx`,
-      caption: `التجميعة بالأوردر — ${count} أوردر 📋`,
-      deadline,
-      checkpoint,
-    });
+    const ordersSummaryArtifactKey = `orders-summary:${cursor.sourceFingerprint}`;
+    if (!artifactConfirmedForAll(cursor, ordersSummaryArtifactKey)) {
+      assertTime(deadline, 'باقي ملف التجميعة بالأوردر والملخص النهائي');
+      const { buildOrdersSummaryBuffer } = await import('./orderSummaryWriter.js');
+      const ordersDocument = await buildOrdersSummaryBuffer(data.ordersDetail as never);
+      await sendArtifactToAll({
+        cursor,
+        artifactKey: ordersSummaryArtifactKey,
+        buffer: ordersDocument,
+        filename: `orders_${date}_${batchName}_${count}.docx`,
+        caption: `التجميعة بالأوردر — ${count} أوردر 📋`,
+        deadline,
+        checkpoint,
+      });
+    }
   }
 
   // 6) Plain UTF-8 summary. No Markdown, so product punctuation cannot break it.
@@ -301,8 +409,8 @@ export async function sendCompleteProductionPreview(options: {
     `📋 ملخص التجميعة ${cursor.batchId}`,
     `الأوردرات: ${count}`,
     `منتجات الإنتاج: ${data.productionEntries.length}`,
-    `ملفات الليزر: ${laserFiles.length}`,
-    `شبكات البوكسات: ${boxFiles.length}`,
+    `ملفات الليزر: ${laserFileCount}`,
+    `شبكات البوكسات: ${boxFileCount}`,
     `الصور: ${photos.length}`,
     `التحذيرات: ${data.warnings.length}`,
   ];

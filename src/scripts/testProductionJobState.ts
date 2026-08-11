@@ -11,6 +11,7 @@ import {
   loadJob,
   loadPreviewSourceSnapshot,
   queueRun,
+  retryJob,
   savePreviewSourceSnapshot,
   type PreviewCursor,
   type RunCursor,
@@ -19,6 +20,7 @@ import {
 
 // Reserved negative id: this never collides with a real Telegram chat in this app.
 const chatId = -8_000_000_000_000_000;
+const retryChatId = -8_000_000_000_000_001;
 let batchId = '';
 
 try {
@@ -102,9 +104,32 @@ try {
     where: { source: 'prod_job_history', reason: batchId, externalId: String(chatId) },
   });
   assert.equal(history.length, 1, 'completion history must be durable');
-  console.log(JSON.stringify({ ok: true, batchId, checks: 11 }));
+
+  // A state-only checkpoint at the beginning of a resumed invocation must not
+  // erase consecutive failures. Only real forward progress resets the counter.
+  await clearJob(retryChatId);
+  const retryPreview = (await createPreviewJob(retryChatId, {
+    recipientChatIds: [retryChatId],
+  })).job as PreviewCursor;
+  const retryClaim1 = await claimJob(retryChatId, retryPreview.batchId) as PreviewCursor;
+  await checkpointJob(retryChatId, retryClaim1, retryClaim1.executionToken!, { resetAttempts: false });
+  const retry1 = await retryJob(retryChatId, retryClaim1, retryClaim1.executionToken!, 'temporary-1');
+  assert.equal(retry1.attemptCount, 1);
+
+  const retryClaim2 = await claimJob(retryChatId, retryPreview.batchId) as PreviewCursor;
+  await checkpointJob(retryChatId, retryClaim2, retryClaim2.executionToken!, { resetAttempts: false });
+  const retry2 = await retryJob(retryChatId, retryClaim2, retryClaim2.executionToken!, 'temporary-2');
+  assert.equal(retry2.attemptCount, 2, 'a repeated error without progress must increment');
+
+  const retryClaim3 = await claimJob(retryChatId, retryPreview.batchId) as PreviewCursor;
+  retryClaim3.sentArtifactKeys.push(`${retryChatId}|word:test-progress`);
+  const progressed = await checkpointJob(retryChatId, retryClaim3, retryClaim3.executionToken!);
+  assert.equal(progressed.attemptCount, 0, 'confirmed external progress resets consecutive failures');
+
+  console.log(JSON.stringify({ ok: true, batchId, checks: 14, retryCounterPersists: true }));
 } finally {
   await clearJob(chatId);
+  await clearJob(retryChatId);
   if (batchId) {
     await basePrisma.failedPayload.deleteMany({
       where: { source: 'prod_job_history', reason: batchId, externalId: String(chatId) },

@@ -60,6 +60,12 @@ export interface PreviewCursor extends JobCommon {
   sentPhotoKeys: string[];
   /** Detects edits between continuation segments so a batch cannot mix versions. */
   sourceFingerprint?: string;
+  /** Counts captured after expensive artifact generation so completed stages can be skipped. */
+  artifactManifest?: {
+    laserFileCount: number;
+    boxFileCount: number;
+    uniquePhotoCount: number;
+  };
 }
 
 export type JobCursor = RunCursor | PreviewCursor;

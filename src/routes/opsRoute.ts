@@ -196,7 +196,11 @@ export const createOpsRouter = (
       const failures: string[] = [];
       for (const { chatId, job } of jobs) {
         try {
-          await scheduleProductionContinuation({ chatId, batchId: job.batchId });
+          await scheduleProductionContinuation({
+            chatId,
+            batchId: job.batchId,
+            dispatchKey: String(job.updatedAt),
+          });
           dispatched += 1;
         } catch (error) {
           failures.push(`${job.batchId}: ${String(error).slice(0, 160)}`);
