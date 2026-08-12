@@ -132,3 +132,13 @@ model FailedPayload {
   headersJson String?
   createdAt   DateTime @default(now())
 }
+
+model LocationCatalogSnapshot {
+  id               String   @id
+  payloadJson      String
+  governorateCount Int
+  areaCount        Int
+  sourceFetchedAt  DateTime
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}

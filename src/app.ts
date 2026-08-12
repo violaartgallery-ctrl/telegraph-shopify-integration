@@ -7,7 +7,7 @@ import { logger } from './lib/logger.js';
 import { AccurateMapper } from './services/accurateMapper.js';
 import { ShopifyOrderProcessor } from './services/shopifyOrderProcessor.js';
 import { createAccurateWebhookHandler } from './routes/accurateWebhookRoute.js';
-import { createAdminAppRouter, getLocations } from './routes/adminAppRoute.js';
+import { createAdminAppRouter } from './routes/adminAppRoute.js';
 import { createShopifyWebhookHandler } from './routes/shopifyWebhookRoute.js';
 import { createOpsRouter } from './routes/opsRoute.js';
 import { handler as telegramWebhookHandler } from './netlify/functions/telegram-webhook.js';
@@ -19,6 +19,7 @@ import { env } from './config/env.js';
 import { MetaDeliveryService } from './meta/metaDeliveryService.js';
 import { verifyResumeRequest } from './services/productionContinuation.js';
 import { resumeProductionInvocation } from './netlify/functions/run-production-background.js';
+import { LocationCatalogService } from './services/locationCatalogService.js';
 
 export const createAppServices = () => {
   const accurateClient = new AccurateClient();
@@ -35,13 +36,15 @@ export const createAppServices = () => {
     odooSyncService,
     metaDeliveryService
   );
+  const locationCatalogService = new LocationCatalogService(accurateClient);
 
   return {
     accurateClient,
     shopifyOrderProcessor,
     shipmentStatusSyncService,
     odooSyncService,
-    metaDeliveryService
+    metaDeliveryService,
+    locationCatalogService
   };
 };
 
@@ -129,19 +132,28 @@ export const createApp = () => {
   // Scheduled ops (triggered by GitHub Actions every 30 min). Mounted before the
   // adminAuth guards because it lives under /ops (not /api) and self-guards via
   // OPS_SECRET.
-  app.use(createOpsRouter(services.shipmentStatusSyncService, services.metaDeliveryService));
+  app.use(createOpsRouter(
+    services.shipmentStatusSyncService,
+    services.metaDeliveryService,
+    services.locationCatalogService
+  ));
 
-  // Public, read-only fallback for the Shopify theme. The local theme JSON is
-  // primary; this endpoint must remain reachable without the admin secret when
-  // Shopify's CDN asset is temporarily unavailable.
-  app.get('/api/accurate/locations', async (_request, response, next) => {
+  const sendLocationCatalog = async (_request: Request, response: Response, next: NextFunction) => {
     try {
-      response.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800');
-      response.json({ locations: await getLocations(services.accurateClient) });
+      const catalog = await services.locationCatalogService.getCatalog();
+      response.setHeader('Cache-Control', 'public, max-age=300, s-maxage=3600, stale-while-revalidate=604800');
+      response.setHeader('Content-Type', 'application/json; charset=utf-8');
+      response.json(catalog);
     } catch (error) {
       next(error);
     }
-  });
+  };
+
+  // Shopify App Proxy maps /apps/viola-delivery/* on the storefront to
+  // /storefront/* here. The catalog is served from memory/Neon; Telegraph is
+  // contacted only by the durable refresh path, never on a normal warm request.
+  app.get('/storefront/locations', sendLocationCatalog);
+  app.get('/api/accurate/locations', sendLocationCatalog);
 
   // BUG-SEC-4 FIX: Protect all admin routes under /orders/* and /api/* with adminAuth.
   // Shopify webhook routes (/webhooks/*) are intentionally NOT protected here —
