@@ -8,6 +8,7 @@ import { listRecoverableJobs } from '../services/productionJobStore.js';
 import { scheduleProductionContinuation } from '../services/productionContinuation.js';
 import { checkProductionHealth } from '../services/productionHealthService.js';
 import { sendMessage } from '../telegram/telegramApi.js';
+import type { LocationCatalogService } from '../services/locationCatalogService.js';
 
 /**
  * Ops endpoints triggered by an external scheduler (GitHub Actions every 30 min)
@@ -18,7 +19,8 @@ import { sendMessage } from '../telegram/telegramApi.js';
  */
 export const createOpsRouter = (
   shipmentStatusSyncService: ShipmentStatusSyncService,
-  metaDeliveryService?: MetaDeliveryService
+  metaDeliveryService?: MetaDeliveryService,
+  locationCatalogService?: LocationCatalogService
 ) => {
   const router = Router();
 
@@ -66,6 +68,29 @@ export const createOpsRouter = (
     } catch (error) {
       logger.error('ops/sync-open-shipments failed', { reason: error instanceof Error ? error.message : String(error) });
       response.status(500).json({ ok: false });
+    }
+  });
+
+  router.post('/ops/refresh-location-catalog', async (request, response) => {
+    if (!strictGuard(request, response)) return;
+    if (!locationCatalogService) {
+      response.status(503).json({ ok: false, message: 'Location catalog service is unavailable' });
+      return;
+    }
+    try {
+      const result = await locationCatalogService.refreshIfStale();
+      response.json({
+        ok: true,
+        source: result.source,
+        governorates: result.governorates,
+        areas: result.areas,
+        sourceFetchedAt: result.sourceFetchedAt
+      });
+    } catch (error) {
+      logger.error('ops/refresh-location-catalog failed', {
+        reason: error instanceof Error ? error.message : String(error)
+      });
+      response.status(503).json({ ok: false, message: 'The previous location snapshot remains active' });
     }
   });
 
@@ -196,7 +221,11 @@ export const createOpsRouter = (
       const failures: string[] = [];
       for (const { chatId, job } of jobs) {
         try {
-          await scheduleProductionContinuation({ chatId, batchId: job.batchId });
+          await scheduleProductionContinuation({
+            chatId,
+            batchId: job.batchId,
+            dispatchKey: String(job.updatedAt),
+          });
           dispatched += 1;
         } catch (error) {
           failures.push(`${job.batchId}: ${String(error).slice(0, 160)}`);

@@ -2,7 +2,8 @@
  * Automatic, resumable production pipeline.
  *
  * Every invocation owns a short Neon-backed lease. Before Vercel's hard timeout
- * it checkpoints progress and signs a request that starts a fresh invocation.
+ * it checkpoints progress and publishes a durable queue message that starts a
+ * fresh root invocation.
  * No employee Continue button is involved.
  */
 import { sendMessage } from '../../telegram/telegramApi.js';
@@ -61,9 +62,14 @@ function retryDelayMs(attempt: number): number {
   return Math.min(30_000, 2_000 * (2 ** Math.max(0, attempt - 1)));
 }
 
-async function scheduleNext(chatId: number, batchId: string, delayMs = 0): Promise<boolean> {
+async function scheduleNext(
+  chatId: number,
+  batchId: string,
+  delayMs = 0,
+  dispatchKey?: string
+): Promise<boolean> {
   try {
-    await scheduleProductionContinuation({ chatId, batchId, delayMs });
+    await scheduleProductionContinuation({ chatId, batchId, delayMs, dispatchKey });
     return true;
   } catch (error) {
     console.error('[production] Failed to dispatch automatic continuation', {
@@ -73,7 +79,7 @@ async function scheduleNext(chatId: number, batchId: string, delayMs = 0): Promi
     });
     await sendMessage(
       chatId,
-      `🚨 Batch ${batchId}\nفشل إطلاق الـrequest التالي تلقائيًا. التقدم محفوظ في Neon، والـwatchdog هيحاول يشغله تاني. ابعت رقم الـBatch للدعم لو التنبيه اتكرر.`
+      `🚨 Batch ${batchId}\nفشل وضع الجزء التالي في طابور التشغيل. التقدم محفوظ في Neon، والـwatchdog هيحاول تاني. ابعت رقم الـBatch للدعم لو التنبيه اتكرر.`
     );
     return false;
   }
@@ -93,8 +99,10 @@ export async function runPipeline(chatId: number, expectedBatchId?: string): Pro
 
   const executionToken = cursor.executionToken;
   const deadline = Date.now() + jobDeadlineMs();
-  const checkpoint = async (): Promise<void> => {
-    const saved = await checkpointJob(chatId, cursor, executionToken);
+  const checkpoint = async (progressMade = true): Promise<void> => {
+    const saved = await checkpointJob(chatId, cursor, executionToken, {
+      resetAttempts: progressMade,
+    });
     copyCheckpointState(cursor, saved);
   };
 
@@ -123,7 +131,7 @@ export async function runPipeline(chatId: number, expectedBatchId?: string): Pro
       const next = await finishPreview(chatId, cursor, executionToken);
       if (next.kind === 'run') {
         await sendMessage(chatId, `🚚 طلب /run متسجل — هبدأ شحن نفس الـ${next.orderNumbers.length} أوردر تلقائيًا.`);
-        await scheduleNext(chatId, next.batchId);
+        await scheduleNext(chatId, next.batchId, 0, String(next.updatedAt));
       } else {
         await sendMessage(chatId, '🔒 الأوردرات اتثبتت. ابعت /run وقت ما تكون جاهز؛ الشحن هيستخدم نفس الـBatch بالضبط.');
       }
@@ -147,11 +155,7 @@ export async function runPipeline(chatId: number, expectedBatchId?: string): Pro
     if (error instanceof SoftDeadlineError) {
       try {
         const saved = await yieldJob(chatId, cursor, executionToken, error.progress);
-        await sendMessage(
-          chatId,
-          `⏳ وصلت لنقطة النقل الآمنة في Batch ${saved.batchId}. التقدم محفوظ وهكمل تلقائيًا في request جديد — مش مطلوب منك تعمل حاجة.`
-        );
-        await scheduleNext(chatId, saved.batchId);
+        await scheduleNext(chatId, saved.batchId, 0, String(saved.updatedAt));
       } catch (leaseError) {
         if (!(leaseError instanceof ProductionJobLeaseLostError)) throw leaseError;
       }
@@ -188,14 +192,14 @@ export async function runPipeline(chatId: number, expectedBatchId?: string): Pro
         chatId,
         `🔄 خطأ مؤقت في Batch ${saved.batchId} (محاولة ${saved.attemptCount}/${maxAutoRetries()}). التقدم محفوظ وهعيد المحاولة تلقائيًا بعد ${Math.ceil(delayMs / 1000)} ثانية.`
       );
-      await scheduleNext(chatId, saved.batchId, delayMs);
+      await scheduleNext(chatId, saved.batchId, delayMs, String(saved.updatedAt));
     } catch (leaseError) {
       if (!(leaseError instanceof ProductionJobLeaseLostError)) throw leaseError;
     }
   }
 }
 
-/** Called by the signed internal Vercel endpoint. */
+/** Called by the durable queue consumer and by the signed legacy endpoint. */
 export async function resumeProductionInvocation(
   chatId: number,
   batchId: string,

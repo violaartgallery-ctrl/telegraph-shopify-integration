@@ -22,6 +22,15 @@ jobs:
       - name: Validate scheduler secret
         run: test -n "$OPS_SECRET"
 
+      - name: Keep storefront delivery locations warm
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error --retry 2 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 95 \
+            -X POST -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/refresh-location-catalog"
+
       - name: Drain Meta Delivered outbox
         run: |
           set -euo pipefail
