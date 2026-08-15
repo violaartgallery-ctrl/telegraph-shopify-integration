@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { mergeAccurateSnapshot } from '../services/shipmentRepository.js';
+import {
+  isCollectedAfterPaidReturnChargeConflict,
+  mergeAccurateSnapshot
+} from '../services/shipmentRepository.js';
 import {
   STATUS_POLL_QUARANTINE_PREFIX,
   STATUS_POLL_RETRY_PREFIX,
@@ -43,6 +46,11 @@ const explicitReturn = mergeAccurateSnapshot({
 
 assert.equal(explicitReturn.collectionStatus, 'returned');
 assert.equal(explicitReturn.accurateStatusCode, 'RTRN');
+
+assert.equal(isCollectedAfterPaidReturnChargeConflict('returned-charge-paid'), true);
+assert.equal(isCollectedAfterPaidReturnChargeConflict(' RETURNED-CHARGE-PAID '), true);
+assert.equal(isCollectedAfterPaidReturnChargeConflict('paid'), false);
+assert.equal(isCollectedAfterPaidReturnChargeConflict(null), false);
 
 const retry = buildStatusPollingRetryReason(' exact lookup   missed ');
 const quarantined = buildStatusPollingQuarantineReason('complete catalog scan missed the code');

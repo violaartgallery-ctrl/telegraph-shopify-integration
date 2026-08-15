@@ -45,6 +45,10 @@ const ODOO_COLLECTION_READY_STATUSES = [
   'paid-existing'
 ];
 
+export const isCollectedAfterPaidReturnChargeConflict = (
+  odooSyncStatus?: string | null
+): boolean => odooSyncStatus?.trim().toLowerCase() === 'returned-charge-paid';
+
 export type FinancialHealthStatus =
   | 'healthy'
   | 'backlog-warning'
@@ -977,6 +981,39 @@ export const shipmentRepository = {
   },
 
   queueOdooCollectionSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    const current = await prisma.shipmentRecord.findUnique({
+      where: { id: recordId },
+      select: { odooSyncStatus: true }
+    });
+    if (isCollectedAfterPaidReturnChargeConflict(current?.odooSyncStatus)) {
+      const reason =
+        'Accounting review required: Telegraph now reports a collected delivery, but Odoo already ' +
+        'contains a paid return charge. No sale invoice or payment was created automatically.';
+      await prisma.shipmentRecord.updateMany({
+        where: {
+          id: recordId,
+          collectionStatus: 'collected',
+          collectedAmount: { gt: 0 },
+          OR: [
+            { odooCollectionSyncStatus: { not: 'needs-review' } },
+            { odooCollectionFingerprint: null },
+            { odooCollectionFingerprint: { not: fingerprint } },
+            { odooCollectionLastError: null },
+            { odooCollectionLastError: { not: reason } }
+          ]
+        },
+        data: {
+          odooCollectionSyncStatus: 'needs-review',
+          odooCollectionFingerprint: fingerprint,
+          odooCollectionAttemptCount: 0,
+          odooCollectionRetryAt: null,
+          odooCollectionLastError: reason,
+          odooCollectionClaimedAt: null
+        }
+      });
+      return false;
+    }
+
     const staleBefore = new Date(Date.now() - 10 * 60_000);
     const result = await prisma.shipmentRecord.updateMany({
       where: {
@@ -984,6 +1021,12 @@ export const shipmentRepository = {
         collectionStatus: 'collected',
         collectedAmount: { gt: 0 },
         AND: [
+          {
+            OR: [
+              { odooSyncStatus: null },
+              { odooSyncStatus: { not: 'returned-charge-paid' } }
+            ]
+          },
           {
             OR: [
               { odooCollectionSyncStatus: null },
