@@ -187,6 +187,18 @@ export const createOpsRouter = (
     }
   });
 
+  router.get('/ops/status-polling-health', async (request, response) => {
+    if (!strictGuard(request, response)) return;
+    try {
+      response.json(await shipmentStatusSyncService.getStatusPollingHealth());
+    } catch (error) {
+      logger.error('ops/status-polling-health failed', {
+        reason: error instanceof Error ? error.message : String(error)
+      });
+      response.status(500).json({ ok: false });
+    }
+  });
+
   router.post('/ops/meta-delivered/drain', async (request, response) => {
     if (!strictGuard(request, response)) return;
     if (!metaDeliveryService) {

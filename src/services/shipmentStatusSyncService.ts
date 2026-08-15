@@ -210,6 +210,19 @@ const buildStatusNote = (params: {
     .filter(Boolean)
     .join('\n');
 
+export type StatusPollingOutcome =
+  | 'synced'
+  | 'not-found'
+  | 'skipped-legacy'
+  | 'skipped-no-reference';
+
+export interface StatusPollingRecordRef {
+  id: number;
+  shopifyOrderId: string;
+  accurateShipmentId?: number | null;
+  accurateShipmentCode?: string | null;
+}
+
 export class ShipmentStatusSyncService {
   constructor(
     private readonly accurateClient: AccurateClient,
@@ -633,14 +646,9 @@ export class ShipmentStatusSyncService {
     return summary;
   }
 
-  async syncRecord(record: {
-    id: number;
-    shopifyOrderId: string;
-    accurateShipmentId?: number | null;
-    accurateShipmentCode?: string | null;
-  }): Promise<void> {
+  async syncRecord(record: StatusPollingRecordRef): Promise<StatusPollingOutcome> {
     if (!record.accurateShipmentId && !record.accurateShipmentCode) {
-      return;
+      return 'skipped-no-reference';
     }
 
     let shipment: Awaited<ReturnType<typeof this.accurateClient.getShipment>>;
@@ -667,7 +675,11 @@ export class ShipmentStatusSyncService {
             shipmentCode: record.accurateShipmentCode,
             shipmentId: record.accurateShipmentId
           });
-          return;
+          await shipmentRepository.markStatusPollingMiss(
+            record.id,
+            `Exact Telegraph lookup did not return ${record.accurateShipmentCode ?? record.accurateShipmentId}`
+          );
+          return 'not-found';
         }
         shipment = match;
       } else {
@@ -678,12 +690,31 @@ export class ShipmentStatusSyncService {
     if (!shipment) {
       throw new Error(`Accurate shipment not found for record ${record.id}`);
     }
+    return await this.syncResolvedShipment(record, shipment);
+  }
+
+  /**
+   * Apply a shipment already resolved by an exact-code catalog scan. The
+   * one-time backlog reconciliation uses this path instead of hundreds of
+   * single-shipment lookups that this Telegraph account cannot read.
+   */
+  async syncResolvedShipment(
+    record: StatusPollingRecordRef,
+    shipment: AccurateShipmentSummary
+  ): Promise<StatusPollingOutcome> {
     if (isLegacyNonShopifyShipmentCode(shipment.code)) {
       logger.info('Skipping legacy non-Shopify Telegraph shipment', {
         recordId: record.id,
         shipmentCode: shipment.code
       });
-      return;
+      if (record.accurateShipmentCode) {
+        await shipmentRepository.quarantineStatusPollingRecord(
+          record.id,
+          record.accurateShipmentCode,
+          'Legacy VI + five-zero shipment is excluded from Shopify financial automation'
+        );
+      }
+      return 'skipped-legacy';
     }
 
     const projection = projectAccurateStatusToShopify({
@@ -784,7 +815,7 @@ export class ShipmentStatusSyncService {
           }
         }
       });
-      return;
+      return 'synced';
     }
 
     if (projection.collectionStatus === 'collected') {
@@ -811,6 +842,7 @@ export class ShipmentStatusSyncService {
     if (projection.collectionStatus === 'delivered-not-collected') {
       await this.flagShopifyOrderNotCollected(record);
     }
+    return 'synced';
   }
 
   /** Execute one idempotent Shopify payment action and let the durable queue own retries. */
@@ -1776,6 +1808,10 @@ export class ShipmentStatusSyncService {
     return await shipmentRepository.getFinancialQueueHealth();
   }
 
+  async getStatusPollingHealth() {
+    return await shipmentRepository.getStatusPollingHealth();
+  }
+
   private async syncApprovedPaymentEntry(entry: AccuratePaymentShipmentEntry): Promise<'processed' | 'skipped'> {
     const shipment = entry.shipment;
     if (!shipment?.code) return 'skipped';
@@ -1955,7 +1991,12 @@ export class ShipmentStatusSyncService {
     return { paymentsChecked, processed, skipped, failed };
   }
 
-  async syncOpenShipments(options: { budgetMs?: number; batchSize?: number } = {}): Promise<{ processed: number; failed: number; skipped: number }> {
+  async syncOpenShipments(options: { budgetMs?: number; batchSize?: number } = {}): Promise<{
+    processed: number;
+    failed: number;
+    skipped: number;
+    notFound: number;
+  }> {
     // Time-budget guard: stop well before the hosting request is cut off.
     // Records not reached this run remain open and retry next scheduled run.
     const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? env.syncTimeBudgetMs, 100_000));
@@ -1972,11 +2013,12 @@ export class ShipmentStatusSyncService {
     let processed = 0;
     let failed = 0;
     let skipped = 0;
+    let notFound = 0;
 
     for (let i = 0; i < openShipments.length; i += CONCURRENCY) {
       const elapsedMs = Date.now() - startTime;
       if (elapsedMs >= budgetMs) {
-        skipped = openShipments.length - processed - failed;
+        skipped += openShipments.length - processed - failed - skipped - notFound;
         logger.warn('syncOpenShipments time budget exhausted — stopping early; skipped records will retry next run', {
           processed,
           failed,
@@ -1994,7 +2036,9 @@ export class ShipmentStatusSyncService {
         const result = results[j];
         const record = batch[j];
         if (result.status === 'fulfilled') {
-          processed += 1;
+          if (result.value === 'synced') processed += 1;
+          else if (result.value === 'not-found') notFound += 1;
+          else skipped += 1;
         } else {
           failed += 1;
           const reason = result.reason instanceof Error ? result.reason.message : 'Unknown sync error';
@@ -2023,7 +2067,13 @@ export class ShipmentStatusSyncService {
       failed += paymentSync.failed;
     }
 
-    logger.info('syncOpenShipments complete', { processed, failed, skipped, elapsedMs: Date.now() - startTime });
-    return { processed, failed, skipped };
+    logger.info('syncOpenShipments complete', {
+      processed,
+      failed,
+      skipped,
+      notFound,
+      elapsedMs: Date.now() - startTime
+    });
+    return { processed, failed, skipped, notFound };
   }
 }

@@ -191,3 +191,20 @@ jobs:
             echo "- Stuck: $(echo "$response" | jq -r '.totals.stuck')"
             echo "- Failed: $(echo "$response" | jq -r '.totals.failed')"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check shipment status polling health
+        if: always()
+        run: |
+          set -euo pipefail
+          response=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 15 --max-time 60 \
+            -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/status-polling-health")
+          echo "$response" | jq -c .
+          {
+            echo "## Shipment status polling"
+            echo
+            echo "- Active: $(echo "$response" | jq -r '.active')"
+            echo "- Quarantined missing: $(echo "$response" | jq -r '.quarantined')"
+            echo "- Never attempted: $(echo "$response" | jq -r '.neverAttempted')"
+            echo "- Retryable lookup misses: $(echo "$response" | jq -r '.retryableMisses')"
+          } >> "$GITHUB_STEP_SUMMARY"

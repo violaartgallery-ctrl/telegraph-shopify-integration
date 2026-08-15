@@ -1,5 +1,11 @@
 import { prisma } from '../lib/prisma.js';
 import type { ShopifyOrder } from '../types/shopify.js';
+import {
+  STATUS_POLL_QUARANTINE_PREFIX,
+  buildStatusPollingQuarantineReason,
+  buildStatusPollingRetryReason,
+  isStatusPollingDiagnostic
+} from './statusPollingPolicy.js';
 
 export interface AccurateSnapshotData {
   accurateStatus: string;
@@ -83,7 +89,10 @@ export const mergeAccurateSnapshot = (
       accurateStatusCode: current.accurateStatusCode ?? 'DTR',
       accurateReturnStatus: current.accurateReturnStatus ?? incoming.accurateReturnStatus,
       accurateReturnStatusCode: current.accurateReturnStatusCode ?? incoming.accurateReturnStatusCode,
-      accurateIsTerminal: current.accurateIsTerminal ?? true,
+      // DTR + confirmed collection is terminal. Preserving an old explicit
+      // `false` here kept hundreds of already-paid records in the open polling
+      // queue forever.
+      accurateIsTerminal: true,
       collectionStatus: 'collected',
       collectedAmount: incoming.collectedAmount && incoming.collectedAmount > 0
         ? incoming.collectedAmount
@@ -279,10 +288,22 @@ export const shipmentRepository = {
         OR: [
           { accurateIsTerminal: null },
           { accurateIsTerminal: false }
-        ]
+        ],
+        AND: [{
+          OR: [
+            { lastError: null },
+            { lastError: { not: { startsWith: STATUS_POLL_QUARANTINE_PREFIX } } }
+          ]
+        }]
       },
       omit: omitRaw,
-      orderBy: { updatedAt: 'asc' },
+      // Every attempted row receives lastSyncedAt, including an exact lookup
+      // miss. Ordering by the attempt timestamp prevents the same missing first
+      // page from starving every newer shipment behind it.
+      orderBy: [
+        { lastSyncedAt: { sort: 'asc', nulls: 'first' } },
+        { id: 'asc' }
+      ],
       ...(remaining ? { take: remaining } : {})
     });
 
@@ -360,6 +381,7 @@ export const shipmentRepository = {
       });
       const current = await tx.shipmentRecord.findUniqueOrThrow({ where: { id } });
       const merged = mergeAccurateSnapshot(current, data);
+      const clearPollingDiagnostic = isStatusPollingDiagnostic(current.lastError);
       await tx.shipmentRecord.update({
         where: { id },
         data: {
@@ -377,7 +399,8 @@ export const shipmentRepository = {
           returnFees: merged.returnFees,
           returningDueFees: merged.returningDueFees,
           customerDue: merged.customerDue,
-          lastSyncedAt: new Date()
+          lastSyncedAt: new Date(),
+          lastError: clearPollingDiagnostic ? null : undefined
         }
       });
       const timestamps = await tx.shipmentRecord.findUniqueOrThrow({
@@ -404,6 +427,103 @@ export const shipmentRepository = {
         lastError: error
       }
     }),
+
+  markStatusPollingMiss: async (recordId: number, reason: string): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        accurateShipmentId: { not: null },
+        OR: [{ accurateIsTerminal: null }, { accurateIsTerminal: false }]
+      },
+      data: {
+        lastSyncedAt: new Date(),
+        lastError: buildStatusPollingRetryReason(reason)
+      }
+    });
+    return result.count === 1;
+  },
+
+  quarantineStatusPollingRecord: async (
+    recordId: number,
+    shipmentCode: string,
+    reason: string
+  ): Promise<boolean> => {
+    const result = await prisma.shipmentRecord.updateMany({
+      where: {
+        id: recordId,
+        accurateShipmentCode: shipmentCode,
+        accurateShipmentId: { not: null },
+        OR: [{ accurateIsTerminal: null }, { accurateIsTerminal: false }]
+      },
+      data: {
+        lastSyncedAt: new Date(),
+        lastError: buildStatusPollingQuarantineReason(reason)
+      }
+    });
+    return result.count === 1;
+  },
+
+  getStatusPollingHealth: async () => {
+    const openWhere = {
+      accurateShipmentId: { not: null },
+      OR: [{ accurateIsTerminal: null }, { accurateIsTerminal: false }]
+    };
+    const [active, quarantined, neverAttempted, retryableMisses, oldestActive] = await Promise.all([
+      prisma.shipmentRecord.count({
+        where: {
+          ...openWhere,
+          AND: [{
+            OR: [
+              { lastError: null },
+              { lastError: { not: { startsWith: STATUS_POLL_QUARANTINE_PREFIX } } }
+            ]
+          }]
+        }
+      }),
+      prisma.shipmentRecord.count({
+        where: { ...openWhere, lastError: { startsWith: STATUS_POLL_QUARANTINE_PREFIX } }
+      }),
+      prisma.shipmentRecord.count({
+        where: {
+          ...openWhere,
+          lastSyncedAt: null,
+          AND: [{
+            OR: [
+              { lastError: null },
+              { lastError: { not: { startsWith: STATUS_POLL_QUARANTINE_PREFIX } } }
+            ]
+          }]
+        }
+      }),
+      prisma.shipmentRecord.count({
+        where: { ...openWhere, lastError: { startsWith: 'STATUS_POLL_RETRY:' } }
+      }),
+      prisma.shipmentRecord.findFirst({
+        where: {
+          ...openWhere,
+          AND: [{
+            OR: [
+              { lastError: null },
+              { lastError: { not: { startsWith: STATUS_POLL_QUARANTINE_PREFIX } } }
+            ]
+          }]
+        },
+        orderBy: [
+          { lastSyncedAt: { sort: 'asc', nulls: 'first' } },
+          { id: 'asc' }
+        ],
+        select: { shopifyOrderName: true, accurateShipmentCode: true, lastSyncedAt: true }
+      })
+    ]);
+    return {
+      ok: true,
+      active,
+      quarantined,
+      neverAttempted,
+      retryableMisses,
+      oldestActive
+    };
+  },
 
   updateStatus: async (id: number, status: string) =>
     await prisma.shipmentRecord.update({

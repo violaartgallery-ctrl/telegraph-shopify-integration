@@ -6,6 +6,7 @@ import {
   type AccurateSnapshotData
 } from '../services/shipmentRepository.js';
 import type { ShopifyOrder } from '../types/shopify.js';
+import { isStatusPollingDiagnostic } from '../services/statusPollingPolicy.js';
 import {
   buildMetaDeliveredPayload,
   sha256,
@@ -164,7 +165,10 @@ export class MetaDeliveryService {
       const merged = mergeAccurateSnapshot(currentSnapshot, data);
       await tx.shipmentRecord.update({
         where: { id: shipmentRecordId },
-        data: snapshotDataWithoutDates(merged)
+        data: {
+          ...snapshotDataWithoutDates(merged),
+          lastError: isStatusPollingDiagnostic(currentSnapshot.lastError) ? null : undefined
+        }
       });
 
       // The update above locks this row for the rest of the transaction. Read
