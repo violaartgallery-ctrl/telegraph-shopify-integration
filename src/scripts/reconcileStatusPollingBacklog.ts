@@ -10,7 +10,8 @@ import {
 import { shipmentRepository, type AccurateSnapshotData } from '../services/shipmentRepository.js';
 import {
   isOlderThanStatusPollingCutoff,
-  isStatusPollingDiagnostic
+  isStatusPollingDiagnostic,
+  isStatusPollingQuarantined
 } from '../services/statusPollingPolicy.js';
 
 type ActionKind = 'repair-terminal-flag' | 'sync' | 'quarantine';
@@ -161,6 +162,10 @@ const main = async () => {
     if (!code) continue;
     if (isLegacyNonShopifyShipmentCode(code)) {
       legacy += 1;
+      if (isStatusPollingQuarantined(record.lastError)) {
+        currentWithoutChange += 1;
+        continue;
+      }
       candidates.push({
         kind: 'quarantine',
         record,
@@ -170,6 +175,10 @@ const main = async () => {
     }
     const shipment = carrierByCode.get(code);
     if (!shipment) {
+      if (isStatusPollingQuarantined(record.lastError)) {
+        currentWithoutChange += 1;
+        continue;
+      }
       if (isOlderThanStatusPollingCutoff(record.createdAt, record.shopifyCreatedAt, cutoff)) {
         candidates.push({
           kind: 'quarantine',
