@@ -7,12 +7,21 @@ import {
   planHistoricalDiscoveryPages
 } from '../services/shipmentStatusSyncService.js';
 import { classifyFinancialHealth } from '../services/shipmentRepository.js';
-import { classifyCollectedInvoiceVerification } from '../odoo/odooSyncService.js';
+import {
+  classifyCollectedInvoiceVerification,
+  isDuplicateOdooMoveNameError
+} from '../odoo/odooSyncService.js';
 
 assert.equal(isLegacyNonShopifyShipmentCode('VI00000169'), true);
 assert.equal(isLegacyNonShopifyShipmentCode('vi00000999'), true);
 assert.equal(isLegacyNonShopifyShipmentCode('VI0002417'), false);
 assert.equal(isLegacyNonShopifyShipmentCode('VI0002759'), false);
+
+assert.equal(
+  isDuplicateOdooMoveNameError('The operation cannot be completed: Another entry with the same name already exists.'),
+  true
+);
+assert.equal(isDuplicateOdooMoveNameError('You can only register payment for posted journal entries.'), false);
 
 assert.deepEqual(planHistoricalDiscoveryPages(2, 35, 2), {
   pages: [2, 3],
