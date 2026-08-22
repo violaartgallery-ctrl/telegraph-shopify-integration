@@ -97,6 +97,32 @@ export const buildOdooCollectionFingerprint = (input: {
   normalizedNumber(input.customerDue)
 ]);
 
+export interface PersistedAccurateDecisionState {
+  accurateStatus?: string | null;
+  accurateStatusCode?: string | null;
+  accurateReturnStatus?: string | null;
+  accurateReturnStatusCode?: string | null;
+  collectionStatus?: string | null;
+  customerDue?: number | null;
+}
+
+/**
+ * Rebuild the operational projection from the snapshot that actually won the
+ * database merge. This prevents a stale ordinary lookup from superseding a
+ * newer collection-report fact in the financial queues.
+ */
+export const projectPersistedAccurateState = (state: PersistedAccurateDecisionState) =>
+  projectAccurateStatusToShopify({
+    statusCode: state.accurateStatusCode,
+    statusName: state.accurateStatus,
+    returnStatusCode: state.accurateReturnStatusCode,
+    returnStatusName: state.accurateReturnStatus,
+    collected: state.collectionStatus === 'collected',
+    paidToCustomer: state.collectionStatus === 'returned-settled',
+    cancelled: state.collectionStatus === 'cancelled',
+    customerDue: state.customerDue
+  });
+
 export const isCompletedCollectedDiscoveryReplay = (input: {
   record: {
     accurateStatus?: string | null;
@@ -746,8 +772,23 @@ export class ShipmentStatusSyncService {
       ...actualShipmentDates(shipment)
     }, 'accurate-status');
 
-    const isReturn = projection.collectionStatus === 'returned' ||
-      projection.collectionStatus === 'returned-settled';
+    const persisted = await shipmentRepository.findAccurateDecisionStateById(record.id);
+    if (!persisted) {
+      throw new Error(`Shipment record ${record.id} disappeared after status persistence`);
+    }
+    const effectiveProjection = projectPersistedAccurateState(persisted);
+    const effectiveCollectedAmount = persisted.collectedAmount ?? shipment.collectedAmount;
+    const effectivePendingCollectionAmount =
+      persisted.pendingCollectionAmount ?? shipment.pendingCollectionAmount;
+    const effectiveReturnedValue = persisted.returnedValue ?? shipment.returnedValue;
+    const effectiveDeliveryFees = persisted.deliveryFees ?? shipment.deliveryFees;
+    const effectiveReturnFees = persisted.returnFees ?? shipment.returnFees;
+    const effectiveReturningDueFees = persisted.returningDueFees ?? shipment.returningDueFees;
+    const effectiveCustomerDue = persisted.customerDue ?? shipment.customerDue;
+    const effectiveTrackingUrl = persisted.trackingUrl ?? shipment.trackingUrl;
+
+    const isReturn = effectiveProjection.collectionStatus === 'returned' ||
+      effectiveProjection.collectionStatus === 'returned-settled';
     if (isReturn) {
       await shipmentRepository.supersedeShopifyPaymentSync(
         record.id,
@@ -760,44 +801,44 @@ export class ShipmentStatusSyncService {
     } else {
       await shipmentRepository.supersedeReturnSync(
         record.id,
-        `Superseded because Telegraph now reports ${projection.collectionStatus}`
+        `Superseded because Telegraph now reports ${effectiveProjection.collectionStatus}`
       );
-      if (projection.collectionStatus !== 'collected') {
+      if (effectiveProjection.collectionStatus !== 'collected') {
         await shipmentRepository.supersedeShopifyPaymentSync(
           record.id,
-          `Superseded because Telegraph now reports ${projection.collectionStatus}`
+          `Superseded because Telegraph now reports ${effectiveProjection.collectionStatus}`
         );
         await shipmentRepository.supersedeOdooCollectionSync(
           record.id,
-          `Superseded because Telegraph now reports ${projection.collectionStatus}`
+          `Superseded because Telegraph now reports ${effectiveProjection.collectionStatus}`
         );
       }
     }
 
     await shopifyStatusSyncClient.syncShipmentState({
       orderId: record.shopifyOrderId,
-      shipmentStatus: projection.shipmentStatus,
-      collectionStatus: projection.collectionStatus,
-      collectedAmount: shipment.collectedAmount,
-      returnedValue: shipment.returnedValue,
-      trackingUrl: shipment.trackingUrl,
-      tags: projection.tags,
+      shipmentStatus: effectiveProjection.shipmentStatus,
+      collectionStatus: effectiveProjection.collectionStatus,
+      collectedAmount: effectiveCollectedAmount,
+      returnedValue: effectiveReturnedValue,
+      trackingUrl: effectiveTrackingUrl,
+      tags: effectiveProjection.tags,
       syncSummary: buildStatusNote({
         shipmentCode: shipment.code,
-        shipmentStatus: projection.shipmentStatus,
-        collectionStatus: projection.collectionStatus,
-        collectedAmount: shipment.collectedAmount,
-        pendingCollectionAmount: shipment.pendingCollectionAmount,
-        returnedValue: shipment.returnedValue,
-        deliveryFees: shipment.deliveryFees,
-        returnFees: shipment.returnFees,
-        returningDueFees: shipment.returningDueFees,
-        customerDue: shipment.customerDue,
-        trackingUrl: shipment.trackingUrl
+        shipmentStatus: effectiveProjection.shipmentStatus,
+        collectionStatus: effectiveProjection.collectionStatus,
+        collectedAmount: effectiveCollectedAmount,
+        pendingCollectionAmount: effectivePendingCollectionAmount,
+        returnedValue: effectiveReturnedValue,
+        deliveryFees: effectiveDeliveryFees,
+        returnFees: effectiveReturnFees,
+        returningDueFees: effectiveReturningDueFees,
+        customerDue: effectiveCustomerDue,
+        trackingUrl: effectiveTrackingUrl
       })
     });
 
-    if (projection.collectionStatus === 'payment-review') {
+    if (effectiveProjection.collectionStatus === 'payment-review') {
       await failedPayloadService.save({
         source: 'payment-review',
         externalId: record.shopifyOrderId,
@@ -807,29 +848,29 @@ export class ShipmentStatusSyncService {
           shipment: {
             code: shipment.code,
             statusCode: shipment.status?.code,
-            customerDue: shipment.customerDue,
-            collectedAmount: shipment.collectedAmount,
-            deliveryFees: shipment.deliveryFees,
-            returnFees: shipment.returnFees,
-            returningDueFees: shipment.returningDueFees
+            customerDue: effectiveCustomerDue,
+            collectedAmount: effectiveCollectedAmount,
+            deliveryFees: effectiveDeliveryFees,
+            returnFees: effectiveReturnFees,
+            returningDueFees: effectiveReturningDueFees
           }
         }
       });
       return 'synced';
     }
 
-    if (projection.collectionStatus === 'collected') {
+    if (effectiveProjection.collectionStatus === 'collected') {
       await shipmentRepository.queueShopifyPaymentSync(
         record.id,
-        buildShopifyPaymentFingerprint(Number(shipment.collectedAmount ?? 0))
+        buildShopifyPaymentFingerprint(Number(effectiveCollectedAmount ?? 0))
       );
       await shipmentRepository.queueOdooCollectionSync(
         record.id,
         buildOdooCollectionFingerprint({
           code: shipment.code,
-          collectedAmount: shipment.collectedAmount,
-          deliveryFees: shipment.deliveryFees,
-          customerDue: shipment.customerDue
+          collectedAmount: effectiveCollectedAmount,
+          deliveryFees: effectiveDeliveryFees,
+          customerDue: effectiveCustomerDue
         })
       );
       await shipmentRepository.ensureCollectedProductionQueued(record.id);
@@ -839,7 +880,7 @@ export class ShipmentStatusSyncService {
       await shipmentRepository.queueReturnSync(record.id, buildReturnSyncFingerprint(shipment));
     }
 
-    if (projection.collectionStatus === 'delivered-not-collected') {
+    if (effectiveProjection.collectionStatus === 'delivered-not-collected') {
       await this.flagShopifyOrderNotCollected(record);
     }
     return 'synced';

@@ -3,6 +3,7 @@ import {
   isCollectedAfterPaidReturnChargeConflict,
   mergeAccurateSnapshot
 } from '../services/shipmentRepository.js';
+import { projectPersistedAccurateState } from '../services/shipmentStatusSyncService.js';
 import {
   STATUS_POLL_QUARANTINE_PREFIX,
   STATUS_POLL_RETRY_PREFIX,
@@ -29,6 +30,25 @@ const preservedCollection = mergeAccurateSnapshot({
 
 assert.equal(preservedCollection.collectionStatus, 'collected');
 assert.equal(preservedCollection.accurateIsTerminal, true);
+
+const staleOrdinaryLookup = mergeAccurateSnapshot({
+  accurateStatus: 'delivered',
+  accurateStatusCode: 'DTR',
+  accurateIsTerminal: true,
+  collectionStatus: 'collected',
+  collectedAmount: 920
+}, {
+  accurateStatus: 'delivered',
+  accurateStatusCode: 'DTR',
+  accurateIsTerminal: false,
+  collectionStatus: 'delivered-not-collected',
+  collectedAmount: 920,
+  customerDue: 849
+});
+const staleOrdinaryDecision = projectPersistedAccurateState(staleOrdinaryLookup);
+assert.equal(staleOrdinaryLookup.collectionStatus, 'collected');
+assert.equal(staleOrdinaryDecision.collectionStatus, 'collected');
+assert.equal(staleOrdinaryDecision.isTerminal, true);
 
 const explicitReturn = mergeAccurateSnapshot({
   accurateStatus: 'delivered',
