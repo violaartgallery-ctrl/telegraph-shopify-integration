@@ -141,6 +141,29 @@ export const shipmentRepository = {
   findById: async (id: number) =>
     await prisma.shipmentRecord.findUnique({ where: { id } }),
 
+  findAccurateDecisionStateById: async (id: number) =>
+    await prisma.shipmentRecord.findUnique({
+      where: { id },
+      select: {
+        accurateStatus: true,
+        accurateStatusCode: true,
+        accurateReturnStatus: true,
+        accurateReturnStatusCode: true,
+        accurateIsTerminal: true,
+        collectionStatus: true,
+        trackingUrl: true,
+        collectedAmount: true,
+        pendingCollectionAmount: true,
+        returnedValue: true,
+        deliveryFees: true,
+        returnFees: true,
+        returningDueFees: true,
+        customerDue: true,
+        deliveredAt: true,
+        returnedAt: true
+      }
+    }),
+
   findByShopifyOrderIds: async (shopifyOrderIds: string[]) =>
     await prisma.shipmentRecord.findMany({
       where: {
@@ -232,61 +255,10 @@ export const shipmentRepository = {
     // tens of KB per row) cuts this cron's Neon network egress by ~90%.
     const omitRaw = { rawOrderJson: true } as const;
 
-    const collectedSyncWhere = {
-      accurateShipmentId: { not: null },
-      accurateIsTerminal: true,
-      collectionStatus: 'collected',
-      odooSyncStatus: {
-        in: [
-          'sales-order-created',
-          'sales-order-existing',
-          'delivery-confirmed',
-          'invoice-posted'
-        ]
-      }
-    };
-
-    const collectedRecords = await prisma.shipmentRecord.findMany({
-      where: collectedSyncWhere,
-      omit: omitRaw,
-      orderBy: { updatedAt: 'asc' },
-      ...(limit ? { take: limit } : {})
-    });
-
-    let remaining = limit ? limit - collectedRecords.length : undefined;
-    if (remaining !== undefined && remaining <= 0) {
-      return collectedRecords;
-    }
-
-    const returnedRecords = await prisma.shipmentRecord.findMany({
-      where: {
-        accurateShipmentId: { not: null },
-        accurateIsTerminal: true,
-        collectionStatus: { in: ['returned', 'returned-settled'] },
-        odooSyncStatus: {
-          in: [
-            'sales-order-created',
-            'sales-order-existing',
-            'delivery-confirmed',
-            'invoice-posted'
-          ]
-        },
-        OR: [
-          { returnFees: { gt: 0 } },
-          { returningDueFees: { gt: 0 } }
-        ]
-      },
-      omit: omitRaw,
-      orderBy: { updatedAt: 'asc' },
-      ...(remaining ? { take: remaining } : {})
-    });
-
-    remaining = limit ? limit - collectedRecords.length - returnedRecords.length : undefined;
-    if (remaining !== undefined && remaining <= 0) {
-      return [...collectedRecords, ...returnedRecords];
-    }
-
-    const openRecords = await prisma.shipmentRecord.findMany({
+    // Terminal accounting has independent discovery and processing queues.
+    // Keeping it out of status polling prevents old terminal records from
+    // consuming the batch and starving newly-created shipments for hours.
+    return await prisma.shipmentRecord.findMany({
       where: {
         accurateShipmentId: { not: null },
         OR: [
@@ -308,10 +280,8 @@ export const shipmentRepository = {
         { lastSyncedAt: { sort: 'asc', nulls: 'first' } },
         { id: 'asc' }
       ],
-      ...(remaining ? { take: remaining } : {})
+      ...(limit ? { take: limit } : {})
     });
-
-    return [...collectedRecords, ...returnedRecords, ...openRecords];
   },
 
   createPending: async (order: ShopifyOrder) =>
@@ -1030,6 +1000,15 @@ export const shipmentRepository = {
           {
             OR: [
               { odooCollectionSyncStatus: null },
+              {
+                // Recover the precise stale-status race fixed in
+                // syncResolvedShipment. Other superseded accounting states
+                // stay closed unless their financial fingerprint changes.
+                odooCollectionSyncStatus: 'superseded',
+                odooCollectionLastError: {
+                  startsWith: 'Superseded because Telegraph now reports delivered-not-collected'
+                }
+              },
               { odooCollectionFingerprint: null },
               { odooCollectionFingerprint: { not: fingerprint } }
             ]
