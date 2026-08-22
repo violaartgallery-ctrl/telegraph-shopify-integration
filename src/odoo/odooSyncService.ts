@@ -99,6 +99,9 @@ export const calculateTelegraphReturnCharge = (shipment: {
 export const isTransientNetworkError = (message: string): boolean =>
   /fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|ECONNRESET|socket hang up|ESOCKETTIMEDOUT|timeout|503|504|Gateway/i.test(message);
 
+export const isDuplicateOdooMoveNameError = (message: string): boolean =>
+  /another entry with the same name already exists/i.test(message);
+
 export const classifyCollectedInvoiceVerification = (input: {
   targetAmount: number;
   actualAmount: number;
@@ -684,7 +687,7 @@ export class OdooSyncService {
     }
     const bill = existingBill ?? await this.createReturnShippingBill(reference, returnCharge);
     if (bill.state === 'draft') {
-      await this.odooClient.call('account.move', 'action_post', [[bill.id]]);
+      await this.postDraftMoveWithSequenceRecovery(bill.id);
       bill.state = 'posted';
     }
 
@@ -1089,7 +1092,7 @@ export class OdooSyncService {
         account_id: accountId
       }]]
     });
-    await this.odooClient.call('account.move', 'action_post', [[billId]]);
+    await this.postDraftMoveWithSequenceRecovery(billId);
     const [bill] = await this.odooClient.searchRead<InvoiceRecord>(
       'account.move',
       [['id', '=', billId]],
@@ -1133,7 +1136,7 @@ export class OdooSyncService {
         await this.adjustDraftInvoiceLinesToTotal(invoice.id, target as number);
         invoice = await this.getInvoice(invoice.id);
       }
-      await this.odooClient.call('account.move', 'action_post', [[invoice.id]]);
+      await this.postDraftMoveWithSequenceRecovery(invoice.id);
       invoice = await this.getInvoice(invoice.id);
     } else if (hasTarget) {
       // The Odoo wizard posts the invoice immediately, so most invoices come back already-posted.
@@ -1150,7 +1153,7 @@ export class OdooSyncService {
             invoice = await this.getInvoice(invoice.id);
             if (invoice.state === 'draft') {
               await this.adjustDraftInvoiceLinesToTotal(invoice.id, targetTotal);
-              await this.odooClient.call('account.move', 'action_post', [[invoice.id]]);
+              await this.postDraftMoveWithSequenceRecovery(invoice.id);
               invoice = await this.getInvoice(invoice.id);
               logger.info('Posted invoice was reset/adjusted/re-posted to match net merchant due', {
                 shopifyOrderId, invoiceId: invoice.id, invoiceName: invoice.name,
@@ -1354,6 +1357,54 @@ export class OdooSyncService {
     return invoice;
   }
 
+  /**
+   * Odoo occasionally assigns the same sequence number to two draft moves when
+   * invoice wizards run concurrently. Posting the second draft then fails with
+   * a unique-name error. Recover only after proving that another non-cancelled
+   * move owns that exact name; resetting the draft to `/` lets Odoo allocate the
+   * next sequence atomically during the retry.
+   */
+  private async postDraftMoveWithSequenceRecovery(moveId: number): Promise<void> {
+    try {
+      await this.odooClient.call('account.move', 'action_post', [[moveId]]);
+      return;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (!isDuplicateOdooMoveNameError(reason)) throw error;
+
+      const [move] = await this.odooClient.searchRead<InvoiceRecord>(
+        'account.move',
+        [['id', '=', moveId]],
+        ['name', 'state'],
+        { limit: 1 }
+      );
+      if (!move) throw error;
+      if (move.state === 'posted') return;
+      const duplicateName = typeof move.name === 'string' ? move.name.trim() : '';
+      if (move.state !== 'draft' || !duplicateName || duplicateName === '/') throw error;
+
+      const conflicts = await this.odooClient.searchRead<InvoiceRecord>(
+        'account.move',
+        [
+          ['id', '!=', moveId],
+          ['name', '=', duplicateName],
+          ['state', '!=', 'cancel']
+        ],
+        ['name', 'state'],
+        { limit: 2, order: 'id asc' }
+      );
+      if (conflicts.length === 0) throw error;
+
+      await this.odooClient.executeKw('account.move', 'write', [[moveId], { name: '/' }]);
+      await this.odooClient.call('account.move', 'action_post', [[moveId]]);
+      logger.warn('Recovered duplicate Odoo draft move sequence before posting', {
+        moveId,
+        duplicateName,
+        conflictingMoveIds: conflicts.map((conflict) => conflict.id)
+      });
+    }
+  }
+
   private async createManualSaleInvoiceFromOrderLines(
     saleOrderId: number
   ): Promise<InvoiceRecord> {
@@ -1407,7 +1458,7 @@ export class OdooSyncService {
       invoice_line_ids: invoiceLineIds
     });
 
-    await this.odooClient.call('account.move', 'action_post', [[invoiceId]]);
+    await this.postDraftMoveWithSequenceRecovery(invoiceId);
     return await this.getInvoice(invoiceId);
   }
 
