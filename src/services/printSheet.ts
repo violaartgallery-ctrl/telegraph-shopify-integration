@@ -12,6 +12,7 @@
  */
 import Jimp from "jimp";
 import { PDFDocument } from "pdf-lib";
+import sharp from "sharp";
 
 const DPI = 300;
 const MM = DPI / 25.4; // px per mm @300 DPI
@@ -38,6 +39,42 @@ export interface PrintPhoto {
 }
 
 const px = (mm: number): number => Math.round(mm * MM);
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Jimp 0.22 cannot decode WebP (and may reject other modern browser formats).
+ * Keep its established JPEG/PNG path unchanged, but normalize anything it
+ * cannot read through sharp and retry as PNG. Limiting the normalized image to
+ * 2400px matches the Shopify CDN cap above and prevents oversized uploads from
+ * consuming unnecessary serverless memory while retaining print resolution.
+ */
+export async function decodePrintPhoto(buffer: Buffer): Promise<Jimp> {
+  try {
+    return await Jimp.read(buffer);
+  } catch (jimpError) {
+    try {
+      const normalized = await sharp(buffer, { animated: false })
+        .rotate()
+        .resize({
+          width: 2400,
+          height: 2400,
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .png({ compressionLevel: 6 })
+        .toBuffer();
+      return await Jimp.read(normalized);
+    } catch (normalizationError) {
+      throw new Error(
+        `Print photo could not be decoded (primary: ${errorMessage(jimpError)}; ` +
+        `fallback: ${errorMessage(normalizationError)})`
+      );
+    }
+  }
+}
 
 export function kindForProduct(product: string): PrintKind {
   const p = (product || "").toLowerCase();
@@ -172,7 +209,7 @@ export async function buildPrintSheetPdf(photos: PrintPhoto[]): Promise<Uint8Arr
   for (const placed of pages) {
     const canvas = new Jimp(pageW, pageH, 0xffffffff);
     for (const { item, x, y } of placed) {
-      const photo = await Jimp.read(photos[item.idx]!.buffer);
+      const photo = await decodePrintPhoto(photos[item.idx]!.buffer);
       photo.cover(px(item.iw), px(item.ih)); // crop-to-fill, centred
       const cellX = px(MARGIN_MM + x), cellY = px(MARGIN_MM + y);
       const ox = cellX + px((item.cw - item.iw) / 2);

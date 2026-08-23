@@ -17,6 +17,7 @@
     "test:production-job-state": "tsx src/scripts/testProductionJobState.ts",
     "test:production-automation": "tsx src/scripts/testProductionAutomation.ts",
     "test:production-continuation": "tsx src/scripts/testProductionContinuationQueue.ts",
+    "test:print-sheet": "tsx src/scripts/testPrintSheetFormats.ts",
     "test:financial-queues": "tsx src/scripts/testFinancialQueueAutomation.ts",
     "test:admin-auth": "tsx src/scripts/testAdminAuth.ts",
     "shopify:ensure-validation": "tsx src/scripts/ensureShopifyValidation.ts",
@@ -52,7 +53,8 @@
     "jimp": "^0.22.12",
     "pdf-lib": "^1.17.1",
     "polygon-clipping": "^0.15.7",
-    "serverless-http": "^3.2.0"
+    "serverless-http": "^3.2.0",
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "@types/express": "^4.17.23",
