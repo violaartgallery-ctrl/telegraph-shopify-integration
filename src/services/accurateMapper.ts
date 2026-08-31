@@ -76,6 +76,21 @@ const buildProductsSummary = (lineItems: ShopifyLineItem[]): string =>
 export const buildShipmentDescription = (order: ShopifyOrder): string =>
   buildProductsSummary(activeLineItems(order.line_items));
 
+/**
+ * Telegraph prints shipment notes on a single line. Preserve the complete
+ * Shopify order note while replacing line breaks and repeated whitespace with
+ * a readable separator. Empty Shopify notes remain omitted from the payload.
+ */
+export const buildShipmentNotes = (order: ShopifyOrder): string | undefined => {
+  const flattened = (order.note ?? '')
+    .split(/\r\n?|\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join(' | ');
+
+  return flattened || undefined;
+};
+
 export const buildPiecesCount = (order: ShopifyOrder): number =>
   activeLineItems(order.line_items).reduce((total, item) => total + itemQuantity(item), 0);
 
@@ -159,7 +174,7 @@ export class AccurateMapper {
       recipientSubzoneId: zones.subzoneId,
       serviceId: env.accurate.defaultServiceId ?? 1,
       refNumber: orderReference,
-      notes: undefined,
+      notes: buildShipmentNotes(order),
       description: productDescription || `Shopify order ${order.name}`,
       piecesCount,
       typeCode: env.accurate.defaultShipmentType,
