@@ -21,6 +21,7 @@
     "test:financial-queues": "tsx src/scripts/testFinancialQueueAutomation.ts",
     "test:odoo-sale-returns": "tsx src/scripts/testOdooSaleReturnAutomation.ts",
     "odoo:controlled-new-arrivals-return": "tsx src/scripts/runControlledNewArrivalsOdooReturns.ts",
+    "odoo:backfill-new-arrivals-returns": "tsx src/scripts/backfillNewArrivalsOdooReturns.ts",
     "test:admin-auth": "tsx src/scripts/testAdminAuth.ts",
     "shopify:ensure-validation": "tsx src/scripts/ensureShopifyValidation.ts",
     "health:production": "tsx src/scripts/checkProductionHealth.ts",
