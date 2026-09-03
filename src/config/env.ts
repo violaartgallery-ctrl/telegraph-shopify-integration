@@ -92,7 +92,10 @@ export const env = {
     collectedAmountMetafieldKey: process.env.SHOPIFY_COLLECTED_AMOUNT_METAFIELD_KEY ?? 'collected_amount',
     returnedValueMetafieldKey: process.env.SHOPIFY_RETURNED_VALUE_METAFIELD_KEY ?? 'returned_value',
     trackingUrlMetafieldKey: process.env.SHOPIFY_TRACKING_URL_METAFIELD_KEY ?? 'tracking_url',
-    syncSummaryMetafieldKey: process.env.SHOPIFY_SYNC_SUMMARY_METAFIELD_KEY ?? 'sync_summary'
+    syncSummaryMetafieldKey: process.env.SHOPIFY_SYNC_SUMMARY_METAFIELD_KEY ?? 'sync_summary',
+    // Only orders made exclusively from this collection are eligible for the
+    // Odoo physical-return + Sales Order cancellation automation.
+    odooReturnCollectionHandle: process.env.SHOPIFY_ODOO_RETURN_COLLECTION_HANDLE?.trim() || 'new-arrivals'
   },
   accurate: {
     // Shared secret for incoming Accurate/Telegraph webhook calls.

@@ -12,8 +12,11 @@ import { projectAccurateStatusToShopify } from './accurateStatusMapper.js';
 import { failedPayloadService } from './failedPayloadService.js';
 import { shipmentRepository } from './shipmentRepository.js';
 import { calculateTelegraphReturnCharge, OdooSyncService } from '../odoo/odooSyncService.js';
+import { OdooSaleReturnReviewError } from '../odoo/odooSaleReturnService.js';
 import type { AccurateSnapshotData } from './shipmentRepository.js';
 import type { MetaDeliveryService, MetaDeliverySource } from '../meta/metaDeliveryService.js';
+import { shopifyCollectionReturnPolicyService } from './shopifyCollectionReturnPolicy.js';
+import type { ShopifyOrder } from '../types/shopify.js';
 
 const RETURNED_STATUS_CODES = new Set(['RTRN', 'RTS', 'RJCT']);
 const RETURN_DISCOVERY_CURSOR = 'ops-return-discovery-page-v1';
@@ -1310,13 +1313,14 @@ export class ShipmentStatusSyncService {
       charge: number;
       restock: boolean;
       status: string;
+      odooSaleReturnStatus?: string;
     }>;
     elapsedMs: number;
   }> {
     const apply = options.apply ?? false;
-    // A carrier return does not prove that the warehouse received and inspected
-    // the item. Automated financial recovery therefore leaves live inventory
-    // unchanged unless a deliberately controlled caller opts in.
+    // Carrier status alone still never restocks Shopify inventory. The narrower
+    // Odoo physical-return policy below is independently gated by collection,
+    // invoice and exact Sales Order checks.
     const restock = options.restock ?? false;
     const limit = Math.max(1, Math.min(options.limit ?? 4, 10));
     const budgetMs = Math.max(10_000, Math.min(options.budgetMs ?? 70_000, 100_000));
@@ -1332,12 +1336,20 @@ export class ShipmentStatusSyncService {
       charge: number;
       restock: boolean;
       status: string;
+      odooSaleReturnStatus?: string;
     }> = [];
 
     for (const candidate of records) {
       if (Date.now() - startedAt >= budgetMs) break;
       const charge = calculateTelegraphReturnCharge(candidate);
-      const action = {
+      const action: {
+        order: string;
+        shipmentCode?: string | null;
+        charge: number;
+        restock: boolean;
+        status: string;
+        odooSaleReturnStatus?: string;
+      } = {
         order: candidate.shopifyOrderName ?? candidate.shopifyOrderId,
         shipmentCode: candidate.accurateShipmentCode,
         charge,
@@ -1467,6 +1479,72 @@ export class ShipmentStatusSyncService {
           manualReviewReason = reason.slice('MANUAL_REVIEW:'.length);
         } else {
           errors.push(`Shopify cancel: ${reason}`);
+        }
+      }
+
+      // The existing return workflow continues to handle Shopify cancellation
+      // and Telegraph return charges for every order. Physical stock reversal
+      // and Sales Order cancellation are deliberately narrower: only orders
+      // made exclusively from the configured Shopify collection are eligible.
+      try {
+        if (!record.rawOrderJson) {
+          throw new OdooSaleReturnReviewError('Stored Shopify order payload is missing');
+        }
+        const order = JSON.parse(record.rawOrderJson) as ShopifyOrder;
+        if (String(order.id) !== record.shopifyOrderId) {
+          throw new OdooSaleReturnReviewError('Stored Shopify order payload does not match the shipment record');
+        }
+        const collectionDecision = await shopifyCollectionReturnPolicyService.evaluate(order);
+        action.odooSaleReturnStatus = collectionDecision.classification;
+        if (collectionDecision.eligible) {
+          if (!this.odooSyncService) {
+            errors.push('Odoo Sales Order return service is unavailable');
+          } else if (!record.accurateShipmentCode) {
+            throw new OdooSaleReturnReviewError('Exact Telegraph shipment code is missing');
+          } else if (!record.odooSaleOrderId) {
+            throw new OdooSaleReturnReviewError('Exact Odoo Sales Order link is missing');
+          } else {
+            // Reconfirm the irreversible stock action against Telegraph itself.
+            // A stale DB return marker must never move physical stock in Odoo.
+            const liveShipment = await this.accurateClient.getShipment({ code: record.accurateShipmentCode });
+            if (
+              !liveShipment ||
+              liveShipment.code !== record.accurateShipmentCode ||
+              (record.accurateShipmentId && liveShipment.id !== record.accurateShipmentId)
+            ) {
+              throw new OdooSaleReturnReviewError('Live Telegraph shipment does not match the exact integration record');
+            }
+            const liveProjection = projectAccurateStatusToShopify({
+              statusCode: liveShipment.status?.code,
+              statusName: liveShipment.status?.name,
+              returnStatusCode: liveShipment.returnStatus?.code,
+              returnStatusName: liveShipment.returnStatus?.name,
+              collected: liveShipment.collected,
+              paidToCustomer: liveShipment.paidToCustomer,
+              cancelled: liveShipment.cancelled,
+              customerDue: liveShipment.customerDue
+            });
+            if (!['returned', 'returned-settled'].includes(liveProjection.collectionStatus)) {
+              throw new OdooSaleReturnReviewError(
+                `Live Telegraph state no longer confirms a return (${liveProjection.collectionStatus})`
+              );
+            }
+            const result = await this.odooSyncService.returnDeliveredSaleOrderAndCancel(record.odooSaleOrderId);
+            action.odooSaleReturnStatus = result.status;
+          }
+        } else if (['empty', 'indeterminate'].includes(collectionDecision.classification)) {
+          throw new OdooSaleReturnReviewError(
+            `Shopify collection membership is ${collectionDecision.classification}`
+          );
+        }
+      } catch (error) {
+        if (error instanceof OdooSaleReturnReviewError) {
+          const reason = `Odoo Sales Order return: ${error.message}`;
+          manualReviewReason = manualReviewReason ? `${manualReviewReason} | ${reason}` : reason;
+          action.odooSaleReturnStatus = 'needs-review';
+        } else {
+          errors.push(`Odoo Sales Order return: ${error instanceof Error ? error.message : String(error)}`);
+          action.odooSaleReturnStatus = 'retry-scheduled';
         }
       }
 
