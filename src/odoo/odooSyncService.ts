@@ -3,6 +3,11 @@ import { logger } from '../lib/logger.js';
 import { shipmentRepository } from '../services/shipmentRepository.js';
 import { requestShopifyAdmin } from '../shopify/shopifyAdminGraphql.js';
 import type { ShopifyLineItem, ShopifyOrder } from '../types/shopify.js';
+import {
+  OdooSaleReturnService,
+  type OdooSaleReturnPreview,
+  type OdooSaleReturnResult
+} from './odooSaleReturnService.js';
 import { OdooClient, type OdooRecord } from './odooClient.js';
 
 interface PartnerRecord extends OdooRecord {
@@ -270,8 +275,11 @@ const sleep = async (ms: number): Promise<void> =>
 
 export class OdooSyncService {
   private readonly shopifyVariantSkuCache = new Map<string, string | null>();
+  private readonly saleReturnService: OdooSaleReturnService;
 
-  constructor(private readonly odooClient: OdooClient) {}
+  constructor(private readonly odooClient: OdooClient) {
+    this.saleReturnService = new OdooSaleReturnService(odooClient);
+  }
 
   private assertEnabled(): void {
     if (!env.odoo.enabled) {
@@ -497,6 +505,16 @@ export class OdooSyncService {
     this.assertEnabled();
     const saleOrder = await this.getSaleOrderForOperations(saleOrderId);
     await this.validatePickingsForSaleOrder(saleOrder, 'customer');
+  }
+
+  async previewReturnedSaleOrder(saleOrderId: number): Promise<OdooSaleReturnPreview> {
+    this.assertEnabled();
+    return await this.saleReturnService.preview(saleOrderId);
+  }
+
+  async returnDeliveredSaleOrderAndCancel(saleOrderId: number): Promise<OdooSaleReturnResult> {
+    this.assertEnabled();
+    return await this.saleReturnService.execute(saleOrderId);
   }
 
   /**
