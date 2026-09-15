@@ -10,6 +10,8 @@
     "test:shopify-token": "tsx src/scripts/testShopifyToken.ts",
     "test:accurate-config": "tsx src/scripts/testAccurateConfig.ts",
     "test:odoo-config": "tsx src/scripts/testOdooConfig.ts",
+    "test:recipient-phone": "tsx src/scripts/testRecipientPhoneMapping.ts",
+    "test:waybill-fields": "tsx src/scripts/testWaybillShipmentFields.ts",
     "test:odoo-preview": "tsx src/scripts/testOdooPreview.ts",
     "test:telegraph-scenarios": "tsx src/scripts/testTelegraphScenarioMatrix.ts",
     "test:meta-delivered": "tsx src/scripts/testMetaDeliveredScenarioMatrix.ts && tsx src/meta/metaCapiClient.selfTest.ts",

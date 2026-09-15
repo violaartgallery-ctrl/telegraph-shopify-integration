@@ -3,6 +3,10 @@ import type { ShopifyLineItem, ShopifyOrder } from '../types/shopify.js';
 import type { AccurateShipmentInput } from '../accurate/accurateClient.js';
 import { AccurateZoneResolver } from '../accurate/zoneResolver.js';
 import { getTelegraphLocationSelection } from './telegraphLocation.js';
+import {
+  addInternationalPhoneToShipmentNotes,
+  normalizeRecipientPhone
+} from './recipientPhone.js';
 
 const buildOrderReference = (order: ShopifyOrder): string => `${env.orderReferencePrefix}-${order.order_number}`;
 
@@ -17,13 +21,18 @@ export const buildCustomerName = (order: ShopifyOrder): string => {
 };
 
 export const buildPhone = (order: ShopifyOrder): string => {
-  return (
+  const rawPhone = (
     order.shipping_address?.phone ??
     order.phone ??
     order.customer?.phone ??
     order.billing_address?.phone ??
     ''
   ).trim();
+
+  return normalizeRecipientPhone(
+    rawPhone,
+    order.shipping_address?.country_code ?? order.billing_address?.country_code
+  );
 };
 
 const isCashOnDelivery = (order: ShopifyOrder): boolean => {
@@ -88,7 +97,7 @@ export const buildShipmentNotes = (order: ShopifyOrder): string | undefined => {
     .filter(Boolean)
     .join(' | ');
 
-  return flattened || undefined;
+  return addInternationalPhoneToShipmentNotes(flattened || undefined, buildPhone(order));
 };
 
 export const buildPiecesCount = (order: ShopifyOrder): number =>
