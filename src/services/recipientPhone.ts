@@ -101,6 +101,31 @@ export const normalizeRecipientPhone = (
 export const isNonEgyptianInternationalPhone = (phone: string): boolean =>
   /^\+[1-9]\d{7,14}$/.test(phone) && !phone.startsWith('+20');
 
+const containsPhoneNumber = (value: string, phone: string): boolean => {
+  const valueDigits = digitsOnly(toAsciiDigits(value));
+  const phoneDigits = digitsOnly(phone);
+  return Boolean(phoneDigits) && valueDigits.includes(phoneDigits);
+};
+
+/**
+ * Telegraph strips foreign calling codes from its phone/mobile display while
+ * the account-wide phone-key setting is disabled. Keep the full E.164 number
+ * visible to the courier by appending it to the address for foreign numbers.
+ *
+ * The operation is deliberately idempotent because shipment creation may be
+ * retried with an address that already contains the fallback.
+ */
+export const addInternationalPhoneToRecipientAddress = (
+  recipientAddress: string,
+  recipientPhone: string
+): string => {
+  const address = recipientAddress.trim();
+  if (!isNonEgyptianInternationalPhone(recipientPhone)) return address;
+  if (containsPhoneNumber(address, recipientPhone)) return address;
+
+  return `${address} | واتساب: ${recipientPhone}`;
+};
+
 /**
  * Telegraph currently rewrites an international recipient phone to a domestic
  * display format. Put the E.164 number first in the printable one-line notes as

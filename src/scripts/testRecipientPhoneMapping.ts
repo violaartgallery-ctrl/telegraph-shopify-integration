@@ -1,4 +1,5 @@
 import {
+  addInternationalPhoneToRecipientAddress,
   addInternationalPhoneToShipmentNotes,
   isNonEgyptianInternationalPhone,
   normalizeRecipientPhone
@@ -55,10 +56,31 @@ assertEqual(
   'Intl phone: +966538123456',
   'International phone must remain visible even without Shopify notes'
 );
+assertEqual(
+  addInternationalPhoneToRecipientAddress('شارع الملك فهد', '+966538123456'),
+  'شارع الملك فهد | واتساب: +966538123456',
+  'International phone must be appended to the Telegraph recipient address'
+);
+assertEqual(
+  addInternationalPhoneToRecipientAddress('شارع شهاب', '+201123490784'),
+  'شارع شهاب',
+  'Egypt phone must not change the recipient address'
+);
+assertEqual(
+  addInternationalPhoneToRecipientAddress('شارع شهاب | واتساب: +965 5512 1717', '+96555121717'),
+  'شارع شهاب | واتساب: +965 5512 1717',
+  'An existing formatted international phone must not be duplicated in the address'
+);
+assertEqual(
+  addInternationalPhoneToRecipientAddress('شارع شهاب | واتساب: +96555121717', '+96555121717'),
+  'شارع شهاب | واتساب: +96555121717',
+  'Retrying shipment mapping must keep the international address fallback idempotent'
+);
 
 console.log(JSON.stringify({
   ok: true,
   phoneScenarios: cases.length,
   internationalWaybillFallback: true,
+  internationalAddressFallback: true,
   senderFieldsTouched: false
 }, null, 2));

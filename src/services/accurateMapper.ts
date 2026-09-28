@@ -4,6 +4,7 @@ import type { AccurateShipmentInput } from '../accurate/accurateClient.js';
 import { AccurateZoneResolver } from '../accurate/zoneResolver.js';
 import { getTelegraphLocationSelection } from './telegraphLocation.js';
 import {
+  addInternationalPhoneToRecipientAddress,
   addInternationalPhoneToShipmentNotes,
   normalizeRecipientPhone
 } from './recipientPhone.js';
@@ -138,10 +139,11 @@ export class AccurateMapper {
       throw new Error(`Order ${order.name} has no customer phone number`);
     }
 
-    const recipientAddress = buildAddress(order);
-    if (!recipientAddress) {
+    const originalRecipientAddress = buildAddress(order);
+    if (!originalRecipientAddress) {
       throw new Error(`Order ${order.name} has no shipping/billing address`);
     }
+    const recipientAddress = addInternationalPhoneToRecipientAddress(originalRecipientAddress, phone);
 
     const telegraphLocation = getTelegraphLocationSelection(order);
     // Enforce an explicit governorate/area selection by DEFAULT. Callers must

@@ -65,6 +65,7 @@ assert(input.refNumber === `${env.orderReferencePrefix}-${order.order_number}`, 
 assert(input.piecesCount === 1, 'pieces count must remain unchanged');
 assert(input.recipientPhone === '+201000000000', 'Egypt recipient phone must be sent in E.164 format');
 assert(input.recipientMobile === input.recipientPhone, 'recipient phone/mobile must use the same canonical value');
+assert(input.recipientAddress === 'Test address', 'Egypt recipient address must remain unchanged');
 
 const internationalOrder: ShopifyOrder = {
   ...order,
@@ -86,11 +87,40 @@ assert(buildPhone(internationalOrder) === '+966538123456', 'foreign country code
 assert(internationalInput.recipientPhone === '+966538123456', 'Telegraph phone must receive the full country code');
 assert(internationalInput.recipientMobile === '+966538123456', 'Telegraph mobile must receive the full country code');
 assert(
+  internationalInput.recipientAddress === 'Test address | واتساب: +966538123456',
+  'Telegraph address must visibly preserve the full international WhatsApp number'
+);
+assert(
   internationalInput.notes?.startsWith('Intl phone: +966538123456 | ') === true,
   'printable notes must preserve the full international number before Shopify notes'
 );
 assert(internationalInput.senderPhone === input.senderPhone, 'international handling must not change senderPhone');
 assert(internationalInput.senderMobile === input.senderMobile, 'international handling must not change senderMobile');
+
+const kuwaitOrder: ShopifyOrder = {
+  ...internationalOrder,
+  id: 900003,
+  name: '#900003',
+  order_number: 900003,
+  note: undefined,
+  shipping_address: {
+    ...internationalOrder.shipping_address,
+    phone: '+965 5512 1717'
+  }
+};
+const kuwaitInput = await new AccurateMapper(zoneResolver).mapOrderToShipment(kuwaitOrder, {
+  requireTelegraphLocation: false,
+  shipmentCode: 'VI-WAYBILL-KW-TEST'
+});
+assert(kuwaitInput.recipientPhone === '+96555121717', 'Kuwait country code must survive Shopify mapping');
+assert(
+  kuwaitInput.recipientAddress === 'Test address | واتساب: +96555121717',
+  'Kuwait WhatsApp number must be visible at the end of the Telegraph address'
+);
+assert(
+  kuwaitInput.notes === 'Intl phone: +96555121717',
+  'Kuwait number must remain in Telegraph notes even when Shopify notes are empty'
+);
 
 console.log(JSON.stringify({
   ok: true,
@@ -101,5 +131,6 @@ console.log(JSON.stringify({
   refNumber: input.refNumber,
   piecesCount: input.piecesCount,
   recipientPhoneNormalization: true,
-  internationalPhoneFallback: true
+  internationalPhoneFallback: true,
+  internationalAddressFallback: true
 }));
