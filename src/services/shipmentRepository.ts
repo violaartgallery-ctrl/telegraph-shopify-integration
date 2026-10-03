@@ -556,6 +556,20 @@ export const shipmentRepository = {
       }
     }),
 
+  /** Save an invoice link without changing the queue-owned stage status. */
+  updateOdooInvoiceLinkByShopifyId: async (shopifyOrderId: string, data: {
+    invoiceId: number;
+    invoiceName: string;
+  }) =>
+    await prisma.shipmentRecord.update({
+      where: { shopifyOrderId },
+      data: {
+        odooInvoiceId: data.invoiceId,
+        odooInvoiceName: data.invoiceName,
+        odooSyncedAt: new Date()
+      }
+    }),
+
   updateOdooPayment: async (shopifyOrderId: string, data: {
     paymentId: number;
     status: string;
@@ -672,6 +686,7 @@ export const shipmentRepository = {
           { odooSyncStatus: 'odoo-so-pending' },
           { odooSyncStatus: 'odoo-stock-pending' },
           { odooSyncStatus: 'odoo-delivery-pending' },
+          { odooSyncStatus: 'odoo-paid-invoice-pending' },
           {
             odooSyncStatus: 'odoo-failed-retryable',
             OR: [
@@ -697,6 +712,7 @@ export const shipmentRepository = {
           { odooSyncStatus: 'odoo-so-pending' },
           { odooSyncStatus: 'odoo-stock-pending' },
           { odooSyncStatus: 'odoo-delivery-pending' },
+          { odooSyncStatus: 'odoo-paid-invoice-pending' },
           {
             odooSyncStatus: 'odoo-failed-retryable',
             OR: [{ odooRetryAt: null }, { odooRetryAt: { lte: new Date() } }]
@@ -741,6 +757,19 @@ export const shipmentRepository = {
         odooSyncedAt: new Date(),
         ...(data?.saleOrderId ? { odooSaleOrderId: data.saleOrderId } : {}),
         ...(data?.saleOrderName ? { odooSaleOrderName: data.saleOrderName } : {})
+      }
+    }),
+
+  /** Hold a deterministic prepaid-accounting mismatch for human review. */
+  markOdooPaidInvoiceReview: async (recordId: number, error: string) =>
+    await prisma.shipmentRecord.update({
+      where: { id: recordId },
+      data: {
+        odooSyncStatus: 'paid-invoice-needs-review',
+        odooLastError: error,
+        odooAttemptCount: 0,
+        odooRetryAt: null,
+        odooSyncedAt: new Date()
       }
     }),
 
@@ -857,6 +886,7 @@ export const shipmentRepository = {
    *   odoo-so-creating        → odoo-so-pending
    *   odoo-stock-preparing    → odoo-stock-pending
    *   odoo-delivery-confirming → odoo-delivery-pending
+   *   odoo-paid-invoice-processing → odoo-paid-invoice-pending
    *
    * Uses odooSyncedAt as the timestamp because claimOdooStage sets it when
    * transitioning to the processing status.
@@ -866,7 +896,7 @@ export const shipmentRepository = {
   recoverStuckProcessingRecords: async (stuckThresholdMinutes = 10): Promise<number> => {
     const stuckBefore = new Date(Date.now() - stuckThresholdMinutes * 60_000);
 
-    const [r1, r2, r3, legacyWithoutSo, legacyWithSo] = await Promise.all([
+    const [r1, r2, r3, r4, legacyWithoutSo, legacyWithSo] = await Promise.all([
       prisma.shipmentRecord.updateMany({
         where: { odooSyncStatus: 'odoo-so-creating',        odooSyncedAt: { lt: stuckBefore } },
         data:  { odooSyncStatus: 'odoo-so-pending' }
@@ -878,6 +908,10 @@ export const shipmentRepository = {
       prisma.shipmentRecord.updateMany({
         where: { odooSyncStatus: 'odoo-delivery-confirming', odooSyncedAt: { lt: stuckBefore } },
         data:  { odooSyncStatus: 'odoo-delivery-pending' }
+      }),
+      prisma.shipmentRecord.updateMany({
+        where: { odooSyncStatus: 'odoo-paid-invoice-processing', odooSyncedAt: { lt: stuckBefore } },
+        data:  { odooSyncStatus: 'odoo-paid-invoice-pending' }
       }),
       // Older ensureSalesOrder() code replaced the queue-owned processing state
       // with this legacy value. Recover only records that actually have a
@@ -904,7 +938,7 @@ export const shipmentRepository = {
       })
     ]);
 
-    return r1.count + r2.count + r3.count + legacyWithoutSo.count + legacyWithSo.count;
+    return r1.count + r2.count + r3.count + r4.count + legacyWithoutSo.count + legacyWithSo.count;
   },
 
   /**
@@ -1558,6 +1592,7 @@ export const shipmentRepository = {
       odooPending,
       odooProcessing,
       odooFailed,
+      odooPaidInvoiceNeedsReview,
       odooCollectionPending,
       odooCollectionProcessing,
       odooCollectionFailed,
@@ -1574,17 +1609,18 @@ export const shipmentRepository = {
       prisma.shipmentRecord.count({
         where: {
           odooSyncStatus: {
-            in: ['odoo-so-pending', 'odoo-stock-pending', 'odoo-delivery-pending', 'odoo-failed-retryable']
+            in: ['odoo-so-pending', 'odoo-stock-pending', 'odoo-delivery-pending', 'odoo-paid-invoice-pending', 'odoo-failed-retryable']
           }
         }
       }),
       prisma.shipmentRecord.count({
         where: {
-          odooSyncStatus: { in: ['odoo-so-creating', 'odoo-stock-preparing', 'odoo-delivery-confirming'] },
+          odooSyncStatus: { in: ['odoo-so-creating', 'odoo-stock-preparing', 'odoo-delivery-confirming', 'odoo-paid-invoice-processing'] },
           odooSyncedAt: { lt: staleBefore }
         }
       }),
       prisma.shipmentRecord.count({ where: { odooSyncStatus: 'failed' } }),
+      prisma.shipmentRecord.count({ where: { odooSyncStatus: 'paid-invoice-needs-review' } }),
       prisma.shipmentRecord.count({
         where: {
           collectionStatus: 'collected',
@@ -1621,7 +1657,7 @@ export const shipmentRepository = {
       prisma.shipmentRecord.count({ where: { shopifyPaymentSyncStatus: 'needs-review' } })
     ]);
     const backlog = odooPending + odooCollectionPending + returnPending + paymentPending;
-    const manualReview = odooCollectionNeedsReview + returnNeedsReview + paymentNeedsReview;
+    const manualReview = odooPaidInvoiceNeedsReview + odooCollectionNeedsReview + returnNeedsReview + paymentNeedsReview;
     const stuck = odooProcessing + odooCollectionProcessing + returnProcessing + paymentProcessing;
     const failed = odooFailed + odooCollectionFailed + returnFailed + paymentFailed;
     const status = classifyFinancialHealth({ backlog, manualReview, stuck, failed });
@@ -1629,7 +1665,12 @@ export const shipmentRepository = {
       ok: status !== 'hard-failure',
       status,
       totals: { backlog, manualReview, stuck, failed },
-      odoo: { pending: odooPending, stuck: odooProcessing, failed: odooFailed },
+      odoo: {
+        pending: odooPending,
+        stuck: odooProcessing,
+        failed: odooFailed,
+        needsReview: odooPaidInvoiceNeedsReview
+      },
       odooCollections: {
         pending: odooCollectionPending,
         stuck: odooCollectionProcessing,

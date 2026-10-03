@@ -132,6 +132,13 @@ export const env = {
     username: process.env.ODOO_USERNAME,
     password: process.env.ODOO_PASSWORD,
     paymentJournalId: optionalInt('ODOO_PAYMENT_JOURNAL_ID'),
+    // Shopify orders that were paid before Telegraph collection use the real
+    // bank journal, not the Telegraph/COD collection journal.
+    prepaidPaymentJournalId: optionalInt('PREPAID_BANK_JOURNAL_ID') ?? 6,
+    // Protect accounting from silently absorbing a large order/SO mismatch.
+    // The current domestic delivery charge is covered; international freight
+    // remains a manual review unless this limit is deliberately raised.
+    prepaidMaxSaleOrderGap: optionalFloat('ODOO_PREPAID_MAX_SALE_ORDER_GAP') ?? 150,
     // Odoo account ID for the expense line on Telegraph return-charge vendor bills.
     // REQUIRED when Odoo sync is enabled and returns are expected.
     // Run: Settings → Chart of Accounts, find the appropriate expense account, note its ID.

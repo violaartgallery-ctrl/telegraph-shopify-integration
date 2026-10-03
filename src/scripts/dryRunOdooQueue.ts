@@ -23,6 +23,7 @@ const findQueue = async (limit: number) =>
         { odooSyncStatus: 'odoo-so-pending' },
         { odooSyncStatus: 'odoo-stock-pending' },
         { odooSyncStatus: 'odoo-delivery-pending' },
+        { odooSyncStatus: 'odoo-paid-invoice-pending' },
         {
           odooSyncStatus: 'odoo-failed-retryable',
           OR: [
@@ -61,19 +62,22 @@ const findQueue = async (limit: number) =>
 const PROCESSING_STATUS_MAP: Record<string, string> = {
   'odoo-so-pending':       'odoo-so-creating',
   'odoo-stock-pending':    'odoo-stock-preparing',
-  'odoo-delivery-pending': 'odoo-delivery-confirming'
+  'odoo-delivery-pending': 'odoo-delivery-confirming',
+  'odoo-paid-invoice-pending': 'odoo-paid-invoice-processing'
 };
 
 const NEXT_STATUS_MAP: Record<string, string> = {
   'odoo-so-pending':       'odoo-stock-pending',
   'odoo-stock-pending':    'odoo-delivery-pending',
-  'odoo-delivery-pending': 'delivery-confirmed'
+  'odoo-delivery-pending': 'odoo-paid-invoice-pending',
+  'odoo-paid-invoice-pending': 'paid or delivery-confirmed'
 };
 
 const ODOO_METHOD_MAP: Record<string, string> = {
   'odoo-so-pending':       'ensureSalesOrder(order, { prepareStock: false })',
   'odoo-stock-pending':    'prepareSalesOrderStock(saleOrderId)',
-  'odoo-delivery-pending': 'confirmSalesOrderDelivery(saleOrderId)'
+  'odoo-delivery-pending': 'confirmSalesOrderDelivery(saleOrderId)',
+  'odoo-paid-invoice-pending': 'read live Shopify payment; invoice + bank payment when already paid'
 };
 
 const cleanError = (err: string | null | undefined): string =>
@@ -112,7 +116,9 @@ const analyzeRecord = (record: QRecord): object => {
   const isUnknownStage = !(stageToRun in PROCESSING_STATUS_MAP);
   const maxAttemptsExceeded = (record.odooAttemptCount ?? 0) >= 5;
   const needsSaleOrderRecovery =
-    (stageToRun === 'odoo-stock-pending' || stageToRun === 'odoo-delivery-pending') &&
+    (stageToRun === 'odoo-stock-pending'
+      || stageToRun === 'odoo-delivery-pending'
+      || stageToRun === 'odoo-paid-invoice-pending') &&
     !record.odooSaleOrderId;
 
   return {
@@ -176,7 +182,7 @@ const main = async () => {
     console.log('  ⚠️  No queue records found.');
     console.log('  Possible reasons:');
     console.log('    - No orders with odooSyncStatus in [odoo-so-pending, odoo-stock-pending,');
-    console.log('      odoo-delivery-pending, odoo-failed-retryable (due now)]');
+    console.log('      odoo-delivery-pending, odoo-paid-invoice-pending, odoo-failed-retryable (due now)]');
     console.log('    - All pending records have a future odooRetryAt');
     console.log('    - accurateShipmentId or rawOrderJson is null for all candidates');
     console.log('');
