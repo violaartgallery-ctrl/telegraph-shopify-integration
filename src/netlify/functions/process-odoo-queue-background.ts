@@ -8,17 +8,19 @@
  * Short idempotent checkpoints avoid that hard cut while preserving throughput.
  *
  * Stages per order (one stage advanced per pass; a record re-appears in the
- * next fetch for its next stage, so the loop carries each order through all 3):
+ * next fetch for its next stage, so the loop carries each order through all 4):
  *   Stage 1 (odoo-so-pending)       → ensureSalesOrder()
  *   Stage 2 (odoo-stock-pending)    → prepareSalesOrderStock()
  *   Stage 3 (odoo-delivery-pending) → confirmSalesOrderDelivery()
- *
- * Does NOT create invoices or payments — those are handled by the shipping
- * status sync (sync-open-shipments cron).
+ *   Stage 4 (odoo-paid-invoice-pending) → if Shopify is already paid, create
+ *                                           invoice + bank payment; otherwise stop.
+ * COD invoices remain owned by the Telegraph collection-status sync.
  */
 import { createAppServices } from '../../app.js';
 import { shipmentRepository } from '../../services/shipmentRepository.js';
 import { logger } from '../../lib/logger.js';
+import { shopifyOrdersClient } from '../../shopify/shopifyOrdersClient.js';
+import { shopifyStatusSyncClient } from '../../shopify/shopifyStatusSyncClient.js';
 import type { ShopifyOrder } from '../../types/shopify.js';
 
 const DEFAULT_BATCH_SIZE = 5;
@@ -145,7 +147,8 @@ async function processOne(record: QueueRecord, odooSyncService: OdooSvc): Promis
   const processingStatusMap: Record<string, string> = {
     'odoo-so-pending':       'odoo-so-creating',
     'odoo-stock-pending':    'odoo-stock-preparing',
-    'odoo-delivery-pending': 'odoo-delivery-confirming'
+    'odoo-delivery-pending': 'odoo-delivery-confirming',
+    'odoo-paid-invoice-pending': 'odoo-paid-invoice-processing'
   };
   const toStatus = processingStatusMap[stageToRun];
   if (!toStatus) {
@@ -244,9 +247,79 @@ async function runStage(record: QueueRecord, stageToRun: string, odooSyncService
       });
     }
     await odooSyncService.confirmSalesOrderDelivery(saleOrderId);
-    await shipmentRepository.markOdooStageSuccess(record.id, 'delivery-confirmed');
+    await shipmentRepository.markOdooStageSuccess(record.id, 'odoo-paid-invoice-pending');
     logger.info('process-odoo-queue-background: stage3 complete — delivery confirmed', { id: record.id, saleOrderId });
     return { id: record.id, status: 'stage3-complete' };
+  }
+
+  // ── Stage 4: Close prepaid accounting, or finish as ordinary COD ─────────
+  if (stageToRun === 'odoo-paid-invoice-pending') {
+    // Read Shopify live here rather than trusting the snapshot captured when
+    // Make Shipment was clicked. A manual InstaPay/paid update can happen while
+    // the Odoo production stages are still running.
+    const order = await shopifyOrdersClient.getOrderByLegacyId(record.shopifyOrderId);
+    const gatewayText = (order.payment_gateway_names ?? [order.gateway])
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    const isCodGateway = /cash on delivery|\bcod\b/.test(gatewayText);
+    const hasCarrierCollection = record.collectionStatus === 'collected'
+      || Number(record.collectedAmount ?? 0) > 0;
+    if (isCodGateway && hasCarrierCollection) {
+      // A COD order can become Shopify-paid after Telegraph collection while
+      // this queue is delayed. Its invoice must stay on the Telegraph net-due
+      // path; never create a second full-total prepaid invoice here.
+      await shipmentRepository.markOdooStageSuccess(record.id, 'delivery-confirmed');
+      logger.info('process-odoo-queue-background: stage4 deferred to COD collection accounting', {
+        id: record.id,
+        order: order.name,
+        collectionStatus: record.collectionStatus,
+        collectedAmount: record.collectedAmount
+      });
+      return { id: record.id, status: 'stage4-cod-collected-complete' };
+    }
+    const result = await odooSyncService.syncPaidShopifyOrder(record.id, order);
+
+    if (result.status === 'skipped') {
+      await shipmentRepository.markOdooStageSuccess(record.id, 'delivery-confirmed');
+      logger.info('process-odoo-queue-background: stage4 complete — order is not prepaid', {
+        id: record.id,
+        financialStatus: order.financial_status,
+        reason: result.reason
+      });
+      return { id: record.id, status: 'stage4-cod-complete' };
+    }
+
+    if (result.status === 'needs-review') {
+      await shipmentRepository.markOdooPaidInvoiceReview(record.id, result.reason ?? 'unknown prepaid accounting mismatch');
+      logger.warn('process-odoo-queue-background: prepaid accounting needs review', {
+        id: record.id,
+        order: order.name,
+        reason: result.reason,
+        invoiceId: result.invoiceId
+      });
+      return { id: record.id, status: 'stage4-needs-review', error: result.reason };
+    }
+
+    // Tags are useful for Shopify filtering but must never roll back or retry a
+    // completed Odoo payment if Shopify has a temporary tagging failure.
+    try {
+      await shopifyStatusSyncClient.addOrderTags(order.id, ['Prepaid', 'Odoo Paid']);
+    } catch (tagError) {
+      logger.warn('process-odoo-queue-background: Odoo paid but Shopify tags failed', {
+        id: record.id,
+        order: order.name,
+        reason: tagError instanceof Error ? tagError.message : String(tagError)
+      });
+    }
+    logger.info('process-odoo-queue-background: stage4 complete — prepaid invoice paid', {
+      id: record.id,
+      order: order.name,
+      status: result.status,
+      invoiceId: result.invoiceId,
+      paymentId: result.paymentId
+    });
+    return { id: record.id, status: `stage4-${result.status}` };
   }
 
   logger.error('process-odoo-queue-background: unexpected stageToRun after validation', { id: record.id, stageToRun });

@@ -36,6 +36,14 @@ interface PaymentRecord extends OdooRecord {
   name?: string;
 }
 
+export interface PaidShopifyOrderSyncResult {
+  status: 'skipped' | 'paid' | 'paid-existing' | 'needs-review';
+  reason?: string;
+  invoiceId?: number;
+  invoiceName?: string;
+  paymentId?: number;
+}
+
 interface ManufacturingOrderRecord extends OdooRecord {
   name?: string;
   state?: string;
@@ -106,6 +114,9 @@ export const isTransientNetworkError = (message: string): boolean =>
 
 export const isDuplicateOdooMoveNameError = (message: string): boolean =>
   /another entry with the same name already exists/i.test(message);
+
+const moneyCents = (value: number): number => Math.round(Number(value) * 100);
+const sameMoney = (left: number, right: number): boolean => moneyCents(left) === moneyCents(right);
 
 export const classifyCollectedInvoiceVerification = (input: {
   targetAmount: number;
@@ -515,6 +526,157 @@ export class OdooSyncService {
   async returnDeliveredSaleOrderAndCancel(saleOrderId: number): Promise<OdooSaleReturnResult> {
     this.assertEnabled();
     return await this.saleReturnService.execute(saleOrderId);
+  }
+
+  /**
+   * Close the accounting side of a Shopify order that was already paid before
+   * Telegraph collected any COD money. This is deliberately separate from
+   * syncCollectedShipment(): prepaid money belongs to the bank journal and the
+   * invoice target is Shopify's paid total, while COD uses Telegraph's net due.
+   *
+   * The method is idempotent. Existing SOs/invoices/payments are reused, and a
+   * deterministic accounting mismatch is returned as needs-review instead of
+   * being retried forever or silently forced into an arbitrary product price.
+   */
+  async syncPaidShopifyOrder(
+    recordId: number,
+    order: ShopifyOrder
+  ): Promise<PaidShopifyOrderSyncResult> {
+    this.assertEnabled();
+
+    const financialStatus = String(order.financial_status ?? '').toLowerCase();
+    const outstanding = Number(order.total_outstanding ?? 0);
+    if (financialStatus !== 'paid') {
+      return { status: 'skipped', reason: `shopify-financial-status-${financialStatus || 'unknown'}` };
+    }
+    if (order.cancelled_at || order.test) {
+      return { status: 'needs-review', reason: `unsafe-shopify-order cancelled=${Boolean(order.cancelled_at)} test=${Boolean(order.test)}` };
+    }
+    if (!Number.isFinite(outstanding) || Math.abs(moneyCents(outstanding)) > 1) {
+      return { status: 'needs-review', reason: `shopify-outstanding-${outstanding}` };
+    }
+
+    const paidTotal = Number(order.current_total_price ?? order.total_price);
+    if (!Number.isFinite(paidTotal) || paidTotal <= 0) {
+      return { status: 'needs-review', reason: `invalid-shopify-paid-total-${paidTotal}` };
+    }
+
+    const record = await shipmentRepository.findById(recordId);
+    if (!record || !record.odooSaleOrderId) {
+      return { status: 'needs-review', reason: 'missing-odoo-sale-order' };
+    }
+
+    const [saleOrder] = await this.odooClient.searchRead<OdooRecord & {
+      name?: string;
+      state?: string;
+      amount_total?: number;
+    }>(
+      'sale.order',
+      [['id', '=', record.odooSaleOrderId]],
+      ['name', 'state', 'amount_total'],
+      { limit: 1 }
+    );
+    if (!saleOrder || saleOrder.state !== 'sale') {
+      return {
+        status: 'needs-review',
+        reason: `unsafe-odoo-sale-order-state-${saleOrder?.state ?? 'missing'}`
+      };
+    }
+
+    const saleOrderTotal = Number(saleOrder.amount_total ?? 0);
+    const gapInCents = moneyCents(paidTotal) - moneyCents(saleOrderTotal);
+    const maxGapInCents = moneyCents(env.odoo.prepaidMaxSaleOrderGap);
+    if (gapInCents < -1 || gapInCents > maxGapInCents) {
+      return {
+        status: 'needs-review',
+        reason: `sale-order-gap-needs-review gap=${(gapInCents / 100).toFixed(2)} max=${env.odoo.prepaidMaxSaleOrderGap.toFixed(2)}`
+      };
+    }
+
+    const invoice = await this.findOrCreatePostedSaleInvoice(
+      String(order.id),
+      saleOrder.id,
+      { targetInvoiceTotal: paidTotal, preserveQueueStatus: true }
+    );
+    let verified = await this.getInvoice(invoice.id);
+    const invoiceName = verified.name ?? String(verified.id);
+    const invoiceTotal = Number(verified.amount_total ?? 0);
+    const residual = Number(verified.amount_residual ?? 0);
+
+    if (verified.state !== 'posted' || !sameMoney(invoiceTotal, paidTotal)) {
+      return {
+        status: 'needs-review',
+        reason: `invoice-verification-failed state=${verified.state} total=${invoiceTotal} target=${paidTotal}`,
+        invoiceId: verified.id,
+        invoiceName
+      };
+    }
+
+    if (verified.payment_state === 'paid' && Math.abs(moneyCents(residual)) <= 1) {
+      await shipmentRepository.markOdooInvoicePaid(String(order.id), {
+        invoiceId: verified.id,
+        invoiceName,
+        paymentId: record.odooSalePaymentId ?? record.odooPaymentId ?? null,
+        status: 'paid-existing'
+      });
+      return { status: 'paid-existing', invoiceId: verified.id, invoiceName };
+    }
+
+    if (record.odooSalePaymentId || record.odooPaymentId) {
+      return {
+        status: 'needs-review',
+        reason: `linked-payment-but-invoice-not-paid payment=${record.odooSalePaymentId ?? record.odooPaymentId}`,
+        invoiceId: verified.id,
+        invoiceName
+      };
+    }
+    if (!sameMoney(residual, paidTotal)) {
+      return {
+        status: 'needs-review',
+        reason: `partial-payment-needs-review residual=${residual} target=${paidTotal}`,
+        invoiceId: verified.id,
+        invoiceName
+      };
+    }
+
+    const payment = await this.registerPayment(
+      verified.id,
+      residual,
+      env.odoo.prepaidPaymentJournalId,
+      orderReference(order)
+    );
+    verified = await this.getInvoice(verified.id);
+    if (verified.payment_state !== 'paid' || Math.abs(moneyCents(Number(verified.amount_residual ?? 0))) > 1) {
+      return {
+        status: 'needs-review',
+        reason: `payment-verification-failed state=${verified.payment_state} residual=${verified.amount_residual}`,
+        invoiceId: verified.id,
+        invoiceName,
+        paymentId: payment.id
+      };
+    }
+
+    await shipmentRepository.markOdooInvoicePaid(String(order.id), {
+      invoiceId: verified.id,
+      invoiceName,
+      paymentId: payment.id,
+      status: 'paid'
+    });
+    logger.info('Odoo prepaid Shopify invoice and bank payment synced', {
+      shopifyOrderId: order.id,
+      saleOrderId: saleOrder.id,
+      invoiceId: verified.id,
+      paymentId: payment.id,
+      paidTotal,
+      saleOrderTotal,
+      gap: gapInCents / 100
+    });
+    return {
+      status: 'paid',
+      invoiceId: verified.id,
+      invoiceName,
+      paymentId: payment.id
+    };
   }
 
   /**
@@ -1123,7 +1285,7 @@ export class OdooSyncService {
   private async findOrCreatePostedSaleInvoice(
     shopifyOrderId: string,
     saleOrderId: number,
-    options?: { targetInvoiceTotal?: number | null }
+    options?: { targetInvoiceTotal?: number | null; preserveQueueStatus?: boolean }
   ): Promise<InvoiceRecord> {
     const [saleOrder] = await this.odooClient.searchRead<OdooRecord & {
       name?: string;
@@ -1162,7 +1324,7 @@ export class OdooSyncService {
       // If reset fails (linked payments, locked period) keep the warning + manual review.
       const currentTotal = Number(invoice.amount_total ?? 0);
       const targetTotal = target as number;
-      if (Math.abs(currentTotal - targetTotal) > 0.01) {
+      if (!sameMoney(currentTotal, targetTotal)) {
         const residual = Number(invoice.amount_residual ?? 0);
         const looksUnpaid = invoice.payment_state !== 'paid' && residual >= currentTotal - 0.01;
         if (looksUnpaid) {
@@ -1198,11 +1360,18 @@ export class OdooSyncService {
       }
     }
 
-    await shipmentRepository.updateOdooInvoice(shopifyOrderId, {
-      invoiceId: invoice.id,
-      invoiceName: invoice.name ?? String(invoice.id),
-      status: invoice.payment_state === 'paid' ? 'paid-existing' : 'invoice-posted'
-    });
+    if (options?.preserveQueueStatus) {
+      await shipmentRepository.updateOdooInvoiceLinkByShopifyId(shopifyOrderId, {
+        invoiceId: invoice.id,
+        invoiceName: invoice.name ?? String(invoice.id)
+      });
+    } else {
+      await shipmentRepository.updateOdooInvoice(shopifyOrderId, {
+        invoiceId: invoice.id,
+        invoiceName: invoice.name ?? String(invoice.id),
+        status: invoice.payment_state === 'paid' ? 'paid-existing' : 'invoice-posted'
+      });
+    }
     return invoice;
   }
 
@@ -1227,20 +1396,31 @@ export class OdooSyncService {
     if (!invoice || invoice.state !== 'draft') return;
 
     const currentTotal = Number(Number(invoice.amount_total ?? 0).toFixed(2));
-    if (Math.abs(currentTotal - target) <= 0.01) return;
+    if (sameMoney(currentTotal, target)) return;
 
     const lineIds = invoice.invoice_line_ids ?? [];
     if (lineIds.length === 0) return;
 
     const lines = await this.odooClient.searchRead<OdooRecord & {
+      name?: string;
+      product_id?: [number, string] | number;
+      product_uom_id?: [number, string] | number;
+      account_id?: [number, string] | number;
       price_unit?: number;
       quantity?: number;
       price_subtotal?: number;
+      discount?: number;
+      tax_ids?: number[];
+      sale_line_ids?: number[];
       display_type?: string | false;
     }>(
       'account.move.line',
       [['id', 'in', lineIds]],
-      ['price_unit', 'quantity', 'price_subtotal', 'display_type'],
+      [
+        'name', 'product_id', 'product_uom_id', 'account_id', 'price_unit',
+        'quantity', 'price_subtotal', 'discount', 'tax_ids', 'sale_line_ids',
+        'display_type'
+      ],
       { limit: 200 }
     );
 
@@ -1250,42 +1430,140 @@ export class OdooSyncService {
     const productLines = lines.filter((line) => !line.display_type || line.display_type === 'product');
     if (productLines.length === 0) return;
 
-    if (productLines.length === 1) {
-      const only = productLines[0];
-      const qty = Number(only.quantity ?? 0) > 0 ? Number(only.quantity) : 1;
-      const newUnit = Number((target / qty).toFixed(2));
-      await this.odooClient.executeKw('account.move.line', 'write', [[only.id], {
-        price_unit: newUnit,
-        quantity: qty
-      }]);
-      return;
-    }
-
     const subtotals = productLines.map((line) => Number(line.price_subtotal ?? Number(line.price_unit ?? 0) * Number(line.quantity ?? 1)));
     const currentSubtotal = subtotals.reduce((sum, value) => sum + value, 0);
     if (!Number.isFinite(currentSubtotal) || currentSubtotal <= 0) return;
 
     const factor = target / currentSubtotal;
     let runningTotal = 0;
-    const updates: Array<{ id: number; price_unit: number }> = [];
+    const updates: Array<{ id: number; price_unit: number; quantity: number }> = [];
     for (let i = 0; i < productLines.length; i += 1) {
       const line = productLines[i];
       const qty = Number(line.quantity ?? 1) || 1;
+      const discountFactor = 1 - Number(line.discount ?? 0) / 100;
+      if (discountFactor <= 0) {
+        throw new Error(`Cannot align invoice ${invoiceId}: product line ${line.id} has a 100% discount`);
+      }
       let scaledSubtotal = Number((subtotals[i] * factor).toFixed(2));
       // Absorb rounding remainder into the last product line so totals match exactly.
       if (i === productLines.length - 1) {
         scaledSubtotal = Number((target - runningTotal).toFixed(2));
       }
       runningTotal = Number((runningTotal + scaledSubtotal).toFixed(2));
-      const newUnit = Number((scaledSubtotal / qty).toFixed(2));
-      updates.push({ id: line.id, price_unit: newUnit });
+      // Keep enough precision for quantity > 1. Rounding price_unit to two
+      // decimals is what produced 2425.01 for a 2425.00 target.
+      const newUnit = Number((scaledSubtotal / (qty * discountFactor)).toFixed(8));
+      updates.push({ id: line.id, price_unit: newUnit, quantity: qty });
     }
 
     for (const update of updates) {
       await this.odooClient.executeKw('account.move.line', 'write', [[update.id], {
-        price_unit: update.price_unit
+        price_unit: update.price_unit,
+        quantity: update.quantity
       }]);
     }
+
+    // Odoo rounds each subtotal independently. Re-read and, if needed, apply
+    // the remaining cent delta to a single line using high-precision unit price.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const refreshed = await this.getInvoice(invoiceId);
+      const refreshedTotal = Number(refreshed.amount_total ?? 0);
+      if (sameMoney(refreshedTotal, target)) return;
+
+      const delta = (moneyCents(target) - moneyCents(refreshedTotal)) / 100;
+      const preferred = [...productLines]
+        .sort((left, right) => {
+          const leftQty = Number(left.quantity ?? 1) || 1;
+          const rightQty = Number(right.quantity ?? 1) || 1;
+          return Math.abs(leftQty - 1) - Math.abs(rightQty - 1) || left.id - right.id;
+        })[0];
+      const [currentLine] = await this.odooClient.searchRead<OdooRecord & {
+        price_unit?: number;
+        quantity?: number;
+        discount?: number;
+      }>(
+        'account.move.line',
+        [['id', '=', preferred.id]],
+        ['price_unit', 'quantity', 'discount'],
+        { limit: 1 }
+      );
+      if (!currentLine) break;
+      const qty = Number(currentLine.quantity ?? 1) || 1;
+      const discountFactor = 1 - Number(currentLine.discount ?? 0) / 100;
+      if (discountFactor <= 0) break;
+      const correctedUnit = Number((Number(currentLine.price_unit ?? 0) + delta / (qty * discountFactor)).toFixed(8));
+      await this.odooClient.executeKw('account.move.line', 'write', [[currentLine.id], {
+        price_unit: correctedUnit
+      }]);
+    }
+
+    // Odoo can enforce two-decimal Product Price precision. A quantity-three
+    // line therefore moves in three-piastre increments and cannot represent a
+    // target ending in .00 when its unit rounds to .33. Split one unit onto a
+    // second line (same product/SO link) so currency totals remain exact while
+    // the invoiced product quantity stays unchanged. The x2many write is one
+    // Odoo transaction, avoiding a half-split invoice on timeout.
+    const beforeSplit = await this.getInvoice(invoiceId);
+    const splitCandidate = productLines.find((line) => {
+      const quantity = Number(line.quantity ?? 0);
+      return Number.isInteger(quantity)
+        && quantity > 1
+        && Number(line.discount ?? 0) < 100
+        && (line.tax_ids ?? []).length === 0
+        && Boolean(line.product_id)
+        && Boolean(line.account_id);
+    });
+    if (splitCandidate) {
+      const [currentLine] = await this.odooClient.searchRead<typeof splitCandidate>(
+        'account.move.line',
+        [['id', '=', splitCandidate.id]],
+        [
+          'name', 'product_id', 'product_uom_id', 'account_id', 'price_unit',
+          'quantity', 'price_subtotal', 'discount', 'tax_ids', 'sale_line_ids'
+        ],
+        { limit: 1 }
+      );
+      if (currentLine) {
+        const quantity = Number(currentLine.quantity ?? 0);
+        const priceUnit = Number(currentLine.price_unit ?? 0);
+        const discount = Number(currentLine.discount ?? 0);
+        const discountFactor = 1 - discount / 100;
+        const currentLineSubtotal = Number(Number(currentLine.price_subtotal ?? 0).toFixed(2));
+        const remainingSubtotal = Number(((quantity - 1) * priceUnit * discountFactor).toFixed(2));
+        const otherSubtotal = Number((Number(beforeSplit.amount_total ?? 0) - currentLineSubtotal).toFixed(2));
+        const newLineSubtotal = Number((target - otherSubtotal - remainingSubtotal).toFixed(2));
+        const newLineUnit = Number((newLineSubtotal / discountFactor).toFixed(8));
+        const productId = Array.isArray(currentLine.product_id) ? currentLine.product_id[0] : currentLine.product_id;
+        const productUomId = Array.isArray(currentLine.product_uom_id) ? currentLine.product_uom_id[0] : currentLine.product_uom_id;
+        const accountId = Array.isArray(currentLine.account_id) ? currentLine.account_id[0] : currentLine.account_id;
+
+        if (quantity > 1 && newLineSubtotal > 0 && productId && accountId) {
+          await this.odooClient.executeKw('account.move', 'write', [[invoiceId], {
+            invoice_line_ids: [
+              [1, currentLine.id, { quantity: quantity - 1 }],
+              [0, 0, {
+                name: currentLine.name,
+                product_id: productId,
+                ...(productUomId ? { product_uom_id: productUomId } : {}),
+                account_id: accountId,
+                quantity: 1,
+                price_unit: newLineUnit,
+                discount,
+                tax_ids: [[6, 0, currentLine.tax_ids ?? []]],
+                sale_line_ids: [[6, 0, currentLine.sale_line_ids ?? []]]
+              }]
+            ]
+          }]);
+          const splitInvoice = await this.getInvoice(invoiceId);
+          if (sameMoney(Number(splitInvoice.amount_total ?? 0), target)) return;
+        }
+      }
+    }
+
+    const finalInvoice = await this.getInvoice(invoiceId);
+    throw new Error(
+      `Could not align Odoo invoice ${invoiceId} exactly: total=${finalInvoice.amount_total}, target=${target}`
+    );
   }
 
   private async findSaleOrderInvoices(saleOrder: { name?: string; invoice_ids?: number[] }): Promise<InvoiceRecord[]> {
