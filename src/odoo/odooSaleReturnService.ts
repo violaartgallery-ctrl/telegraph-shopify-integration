@@ -59,6 +59,9 @@ interface InvoiceRecord extends OdooRecord {
   amount_residual?: number;
   invoice_origin?: string | false;
   reversed_entry_id?: Relation;
+  journal_id?: Relation;
+  company_id?: Relation;
+  date?: string;
 }
 
 export interface OdooSaleReturnSnapshot {
@@ -87,6 +90,7 @@ export interface OdooSaleReturnResult extends OdooSaleReturnPreview {
   createdReturnPickingIds: number[];
   resumedReturnPickingIds: number[];
   cancelledSaleOrder: boolean;
+  createdCreditNoteIds?: number[];
 }
 
 export class OdooSaleReturnReviewError extends Error {
@@ -125,6 +129,35 @@ const activeInvoices = (snapshot: OdooSaleReturnSnapshot): InvoiceRecord[] =>
   snapshot.invoices.filter((invoice) =>
     ['out_invoice', 'out_refund'].includes(invoice.move_type ?? '') && invoice.state !== 'cancel'
   );
+
+// A posted customer invoice plus posted credit note(s) that reverse the exact
+// gross amount is a complete accounting reversal. The original customer
+// payment deliberately remains visible as customer credit until an actual cash
+// refund is recorded; deleting or cancelling that real payment would corrupt
+// the bank/cash history.
+const blockingInvoices = (snapshot: OdooSaleReturnSnapshot): InvoiceRecord[] => {
+  const invoices = activeInvoices(snapshot);
+  const originals = new Map(
+    invoices.filter((invoice) => invoice.move_type === 'out_invoice').map((invoice) => [invoice.id, invoice])
+  );
+  const refundTotals = new Map<number, number>();
+  for (const refund of invoices.filter((invoice) => invoice.move_type === 'out_refund' && invoice.state === 'posted')) {
+    const originalId = relationId(refund.reversed_entry_id);
+    if (!originalId) continue;
+    refundTotals.set(originalId, (refundTotals.get(originalId) ?? 0) + Number(refund.amount_total ?? 0));
+  }
+  const fullyReversed = new Set<number>();
+  for (const [id, invoice] of originals) {
+    if (Math.abs((refundTotals.get(id) ?? 0) - Number(invoice.amount_total ?? 0)) <= 0.01) {
+      fullyReversed.add(id);
+    }
+  }
+  return invoices.filter((invoice) => {
+    if (invoice.move_type === 'out_invoice') return !fullyReversed.has(invoice.id);
+    const originalId = relationId(invoice.reversed_entry_id);
+    return !originalId || !fullyReversed.has(originalId);
+  });
+};
 
 const originalPickingsForPhase = (
   snapshot: OdooSaleReturnSnapshot,
@@ -222,7 +255,7 @@ export const classifyOdooSaleReturnSnapshot = (snapshot: OdooSaleReturnSnapshot)
   const internalPhaseComplete = phaseComplete(snapshot, 'internal');
   const deliveredQuantityZero = snapshot.saleOrderLines.length > 0 &&
     snapshot.saleOrderLines.every((line) => Math.abs(Number(line.qty_delivered ?? 0)) <= tolerance);
-  const invoices = activeInvoices(snapshot);
+  const invoices = blockingInvoices(snapshot);
   const base = {
     fingerprint: snapshotFingerprint(snapshot),
     saleOrderId: snapshot.saleOrder.id,
@@ -339,6 +372,108 @@ export class OdooSaleReturnService {
       resumedReturnPickingIds,
       cancelledSaleOrder
     };
+  }
+
+  /**
+   * Accounting-safe return for an exact carrier-confirmed return. Customer
+   * invoices are reversed with full posted credit notes; real cash/bank
+   * payments are deliberately kept so they remain visible as customer credit
+   * until an actual cash refund is recorded.
+   */
+  async reverseAccountingAndExecute(
+    saleOrderId: number,
+    options: { reason: string; reversalDate?: string }
+  ): Promise<OdooSaleReturnResult> {
+    let snapshot = await this.readSnapshot(saleOrderId);
+    const initial = classifyOdooSaleReturnSnapshot(snapshot);
+    if (initial.status === 'already-complete' || initial.status === 'ready') {
+      return await this.execute(saleOrderId);
+    }
+
+    const invoices = activeInvoices(snapshot);
+    const originals = invoices.filter((invoice) => invoice.move_type === 'out_invoice');
+    const standaloneRefunds = invoices.filter((invoice) =>
+      invoice.move_type === 'out_refund' && !relationId(invoice.reversed_entry_id)
+    );
+    if (originals.length === 0 || standaloneRefunds.length > 0) {
+      throw new OdooSaleReturnReviewError(initial.reason ?? 'Customer accounting cannot be reversed automatically');
+    }
+
+    const createdCreditNoteIds: number[] = [];
+    for (const invoice of originals) {
+      if (invoice.state !== 'posted') {
+        throw new OdooSaleReturnReviewError(`Customer invoice ${invoice.name ?? invoice.id} is not posted`);
+      }
+      const refunds = invoices.filter((candidate) =>
+        candidate.move_type === 'out_refund' &&
+        relationId(candidate.reversed_entry_id) === invoice.id &&
+        candidate.state !== 'cancel'
+      );
+      const postedRefundTotal = refunds
+        .filter((refund) => refund.state === 'posted')
+        .reduce((total, refund) => total + Number(refund.amount_total ?? 0), 0);
+      const invoiceTotal = Number(invoice.amount_total ?? 0);
+      if (postedRefundTotal > invoiceTotal + 0.01) {
+        throw new OdooSaleReturnReviewError(`Credit notes exceed invoice ${invoice.name ?? invoice.id}`);
+      }
+      if (Math.abs(postedRefundTotal - invoiceTotal) <= 0.01) continue;
+      if (refunds.length > 0 || postedRefundTotal > 0.01) {
+        throw new OdooSaleReturnReviewError(`Invoice ${invoice.name ?? invoice.id} has a partial or draft credit note`);
+      }
+
+      const journalId = relationId(invoice.journal_id);
+      const companyId = relationId(invoice.company_id);
+      const reversalDate = options.reversalDate ?? new Date().toISOString().slice(0, 10);
+      if (!journalId || !companyId) {
+        throw new OdooSaleReturnReviewError(`Invoice ${invoice.name ?? invoice.id} accounting metadata is incomplete`);
+      }
+      const wizardId = await this.odoo.create('account.move.reversal', {
+        move_ids: [[6, 0, [invoice.id]]],
+        date: reversalDate,
+        reason: options.reason.slice(0, 200),
+        journal_id: journalId,
+        company_id: companyId
+      });
+      await this.odoo.call('account.move.reversal', 'reverse_moves', [[wizardId]], {
+        context: { active_model: 'account.move', active_ids: [invoice.id], active_id: invoice.id }
+      });
+      let creditNotes = await this.odoo.searchRead<InvoiceRecord>(
+        'account.move',
+        [['move_type', '=', 'out_refund'], ['reversed_entry_id', '=', invoice.id], ['state', '!=', 'cancel']],
+        ['name', 'move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'invoice_origin', 'reversed_entry_id', 'journal_id', 'company_id', 'date'],
+        { limit: 10, order: 'id asc' }
+      );
+      if (creditNotes.length !== 1) {
+        throw new Error(`Expected one credit note for ${invoice.name ?? invoice.id}, found ${creditNotes.length}`);
+      }
+      if (creditNotes[0]!.state === 'draft') {
+        await this.odoo.call('account.move', 'action_post', [[creditNotes[0]!.id]]);
+        creditNotes = await this.odoo.searchRead<InvoiceRecord>(
+          'account.move', [['id', '=', creditNotes[0]!.id]],
+          ['name', 'move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'invoice_origin', 'reversed_entry_id', 'journal_id', 'company_id', 'date'],
+          { limit: 1 }
+        );
+      }
+      const creditNote = creditNotes[0];
+      if (
+        !creditNote || creditNote.state !== 'posted' ||
+        relationId(creditNote.reversed_entry_id) !== invoice.id ||
+        Math.abs(Number(creditNote.amount_total ?? 0) - invoiceTotal) > 0.01
+      ) {
+        throw new Error(`Credit note verification failed for ${invoice.name ?? invoice.id}`);
+      }
+      createdCreditNoteIds.push(creditNote.id);
+    }
+
+    snapshot = await this.readSnapshot(saleOrderId);
+    const afterAccounting = classifyOdooSaleReturnSnapshot(snapshot);
+    if (afterAccounting.status !== 'ready') {
+      throw new OdooSaleReturnReviewError(
+        `Sales Order is not ready after accounting reversal: ${afterAccounting.reason ?? afterAccounting.status}`
+      );
+    }
+    const result = await this.execute(saleOrderId);
+    return { ...result, createdCreditNoteIds };
   }
 
   private async processPhase(
@@ -715,7 +850,10 @@ export class OdooSaleReturnService {
     const invoices = await this.odoo.searchRead<InvoiceRecord>(
       'account.move',
       invoiceDomain,
-      ['name', 'move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'invoice_origin', 'reversed_entry_id'],
+      [
+        'name', 'move_type', 'state', 'payment_state', 'amount_total', 'amount_residual',
+        'invoice_origin', 'reversed_entry_id', 'journal_id', 'company_id', 'date'
+      ],
       { limit: 500, order: 'id asc' }
     );
 
