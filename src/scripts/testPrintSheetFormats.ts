@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import Jimp from 'jimp';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, rgb } from 'pdf-lib';
 import sharp from 'sharp';
-import { buildPrintSheetPdf, decodePrintPhoto } from '../services/printSheet.js';
+import {
+  buildPrintSheetPdf,
+  decodePrintPhoto,
+  isPdfPrintPhoto,
+} from '../services/printSheet.js';
 
 const webp = await sharp({
   create: {
@@ -25,9 +29,23 @@ const decodedJpeg = await decodePrintPhoto(jpeg);
 assert.equal(decodedJpeg.bitmap.width, 320);
 assert.equal(decodedJpeg.bitmap.height, 240);
 
+const sourcePdf = await PDFDocument.create();
+const sourcePdfPage = sourcePdf.addPage([595, 841]);
+sourcePdfPage.drawRectangle({
+  x: 0,
+  y: 0,
+  width: 595,
+  height: 841,
+  color: rgb(0.75, 0.1, 0.25),
+});
+const onePagePdf = Buffer.from(await sourcePdf.save());
+assert.equal(isPdfPrintPhoto(onePagePdf), true);
+assert.equal(isPdfPrintPhoto(jpeg), false);
+
 const bytes = await buildPrintSheetPdf([
   { buffer: webp, kind: 'keychain' },
   { buffer: jpeg, kind: 'wallet' },
+  { buffer: onePagePdf, kind: 'keychain' },
 ]);
 assert.ok(bytes, 'print sheet should be generated');
 const pdf = await PDFDocument.load(bytes);
@@ -42,6 +60,7 @@ console.log(JSON.stringify({
   ok: true,
   webpDecoded: true,
   jpegUnchanged: true,
+  onePagePdfEmbedded: true,
   pdfPages: pdf.getPageCount(),
   invalidImageRejectedClearly: true,
 }));
