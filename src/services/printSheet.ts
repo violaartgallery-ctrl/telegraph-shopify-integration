@@ -9,6 +9,8 @@
  * Each photo is cropped to fill its inner size, drawn centred inside its outer
  * frame (white margin), wrapped in a dotted cut frame, and packed with a skyline
  * bin-packer so a sheet is used to the max (sizes mixed on one page).
+ * Shopify file uploads can also be one-page PDFs. Those are embedded directly
+ * into the generated PDF instead of being passed to a raster image decoder.
  */
 import Jimp from "jimp";
 import { PDFDocument } from "pdf-lib";
@@ -113,6 +115,65 @@ export function printPhotoSourceUrl(sourceUrl: string): string {
 type Seg = { x: number; w: number; y: number };
 interface Item { idx: number; iw: number; ih: number; cw: number; ch: number }
 type Placed = { item: Item; x: number; y: number };
+type PdfOverlay = {
+  buffer: Buffer;
+  xPx: number;
+  yPx: number;
+  widthPx: number;
+  heightPx: number;
+};
+
+export function isPdfPrintPhoto(buffer: Buffer): boolean {
+  // The PDF header normally starts at byte zero, but ISO 32000 permits leading
+  // bytes. Restrict the search to the header area to avoid false positives in
+  // ordinary image payloads.
+  return buffer.subarray(0, 1024).toString('latin1').includes('%PDF-');
+}
+
+function centredCropBox(
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number
+): { left: number; bottom: number; right: number; top: number } {
+  const sourceAspect = sourceWidth / sourceHeight;
+  const targetAspect = targetWidth / targetHeight;
+  if (sourceAspect > targetAspect) {
+    const width = sourceHeight * targetAspect;
+    const left = (sourceWidth - width) / 2;
+    return { left, bottom: 0, right: left + width, top: sourceHeight };
+  }
+  const height = sourceWidth / targetAspect;
+  const bottom = (sourceHeight - height) / 2;
+  return { left: 0, bottom, right: sourceWidth, top: bottom + height };
+}
+
+async function drawPdfOverlay(
+  destination: PDFDocument,
+  destinationPage: ReturnType<PDFDocument['addPage']>,
+  overlay: PdfOverlay,
+  pageWidthPx: number,
+  pageHeightPx: number,
+  pageWidthPt: number,
+  pageHeightPt: number
+): Promise<void> {
+  try {
+    const source = await PDFDocument.load(overlay.buffer, { ignoreEncryption: true });
+    const sourcePage = source.getPage(0);
+    if (!sourcePage) throw new Error('PDF has no pages');
+    const { width, height } = sourcePage.getSize();
+    const crop = centredCropBox(width, height, overlay.widthPx, overlay.heightPx);
+    const embedded = await destination.embedPage(sourcePage, crop);
+    destinationPage.drawPage(embedded, {
+      x: (overlay.xPx / pageWidthPx) * pageWidthPt,
+      y: pageHeightPt - ((overlay.yPx + overlay.heightPx) / pageHeightPx) * pageHeightPt,
+      width: (overlay.widthPx / pageWidthPx) * pageWidthPt,
+      height: (overlay.heightPx / pageHeightPx) * pageHeightPt,
+    });
+  } catch (error) {
+    throw new Error(`Print PDF could not be embedded: ${errorMessage(error)}`);
+  }
+}
 
 function skylinePack(items: Item[], W: number, H: number): Placed[][] {
   const pages: Placed[][] = [];
@@ -208,19 +269,35 @@ export async function buildPrintSheetPdf(photos: PrintPhoto[]): Promise<Uint8Arr
 
   for (const placed of pages) {
     const canvas = new Jimp(pageW, pageH, 0xffffffff);
+    const pdfOverlays: PdfOverlay[] = [];
     for (const { item, x, y } of placed) {
-      const photo = await decodePrintPhoto(photos[item.idx]!.buffer);
-      photo.cover(px(item.iw), px(item.ih)); // crop-to-fill, centred
+      const source = photos[item.idx]!.buffer;
       const cellX = px(MARGIN_MM + x), cellY = px(MARGIN_MM + y);
       const ox = cellX + px((item.cw - item.iw) / 2);
       const oy = cellY + px((item.ch - item.ih) / 2);
-      canvas.composite(photo, ox, oy);
+      const innerWidth = px(item.iw), innerHeight = px(item.ih);
+      if (isPdfPrintPhoto(source)) {
+        pdfOverlays.push({
+          buffer: source,
+          xPx: ox,
+          yPx: oy,
+          widthPx: innerWidth,
+          heightPx: innerHeight,
+        });
+      } else {
+        const photo = await decodePrintPhoto(source);
+        photo.cover(innerWidth, innerHeight); // crop-to-fill, centred
+        canvas.composite(photo, ox, oy);
+      }
       drawDottedRect(canvas, cellX, cellY, cellX + px(item.cw), cellY + px(item.ch));
     }
     const pngBuf = await canvas.getBufferAsync(Jimp.MIME_PNG);
     const pngImg = await pdf.embedPng(pngBuf);
     const page = pdf.addPage(A4_PT);
     page.drawImage(pngImg, { x: 0, y: 0, width: A4_PT[0], height: A4_PT[1] });
+    for (const overlay of pdfOverlays) {
+      await drawPdfOverlay(pdf, page, overlay, pageW, pageH, A4_PT[0], A4_PT[1]);
+    }
   }
 
   return pdf.save();
