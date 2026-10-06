@@ -228,6 +228,22 @@ const paidPreview = classifyOdooSaleReturnSnapshot(paid);
 assert.equal(paidPreview.status, 'needs-review');
 assert.match(paidPreview.reason ?? '', /payment/i);
 
+const fullyCredited = structuredClone(paid);
+fullyCredited.saleOrderLines[0].qty_invoiced = 0;
+fullyCredited.invoices.push({
+  id: 61,
+  name: 'RINV/1',
+  move_type: 'out_refund',
+  state: 'posted',
+  payment_state: 'not_paid',
+  amount_total: 100,
+  amount_residual: 100,
+  reversed_entry_id: [60, 'INV/1']
+});
+const fullyCreditedPreview = classifyOdooSaleReturnSnapshot(fullyCredited);
+assert.equal(fullyCreditedPreview.status, 'ready');
+assert.equal(fullyCreditedPreview.activeInvoiceCount, 0);
+
 const overReturned = structuredClone(complete);
 overReturned.moves.find((move) => move.id === 52)!.quantity = 2;
 overReturned.saleOrder.state = 'sale';

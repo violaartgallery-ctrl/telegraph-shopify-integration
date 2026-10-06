@@ -528,6 +528,14 @@ export class OdooSyncService {
     return await this.saleReturnService.execute(saleOrderId);
   }
 
+  async reverseReturnedSaleOrderAccountingAndCancel(
+    saleOrderId: number,
+    options: { reason: string; reversalDate?: string }
+  ): Promise<OdooSaleReturnResult> {
+    this.assertEnabled();
+    return await this.saleReturnService.reverseAccountingAndExecute(saleOrderId, options);
+  }
+
   /**
    * Close the accounting side of a Shopify order that was already paid before
    * Telegraph collected any COD money. This is deliberately separate from

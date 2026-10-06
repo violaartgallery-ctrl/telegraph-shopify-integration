@@ -15,8 +15,6 @@ import { calculateTelegraphReturnCharge, OdooSyncService } from '../odoo/odooSyn
 import { OdooSaleReturnReviewError } from '../odoo/odooSaleReturnService.js';
 import type { AccurateSnapshotData } from './shipmentRepository.js';
 import type { MetaDeliveryService, MetaDeliverySource } from '../meta/metaDeliveryService.js';
-import { shopifyCollectionReturnPolicyService } from './shopifyCollectionReturnPolicy.js';
-import type { ShopifyOrder } from '../types/shopify.js';
 
 const RETURNED_STATUS_CODES = new Set(['RTRN', 'RTS', 'RJCT']);
 const RETURN_DISCOVERY_CURSOR = 'ops-return-discovery-page-v1';
@@ -1482,60 +1480,48 @@ export class ShipmentStatusSyncService {
         }
       }
 
-      // The existing return workflow continues to handle Shopify cancellation
-      // and Telegraph return charges for every order. Physical stock reversal
-      // and Sales Order cancellation are deliberately narrower: only orders
-      // made exclusively from the configured Shopify collection are eligible.
+      // A completed carrier return must also be represented physically and
+      // financially in Odoo. Re-read Telegraph immediately before the
+      // irreversible stock/accounting action; stale database state is never
+      // sufficient by itself.
       try {
-        if (!record.rawOrderJson) {
-          throw new OdooSaleReturnReviewError('Stored Shopify order payload is missing');
-        }
-        const order = JSON.parse(record.rawOrderJson) as ShopifyOrder;
-        if (String(order.id) !== record.shopifyOrderId) {
-          throw new OdooSaleReturnReviewError('Stored Shopify order payload does not match the shipment record');
-        }
-        const collectionDecision = await shopifyCollectionReturnPolicyService.evaluate(order);
-        action.odooSaleReturnStatus = collectionDecision.classification;
-        if (collectionDecision.eligible) {
-          if (!this.odooSyncService) {
-            errors.push('Odoo Sales Order return service is unavailable');
-          } else if (!record.accurateShipmentCode) {
-            throw new OdooSaleReturnReviewError('Exact Telegraph shipment code is missing');
-          } else if (!record.odooSaleOrderId) {
-            throw new OdooSaleReturnReviewError('Exact Odoo Sales Order link is missing');
-          } else {
-            // Reconfirm the irreversible stock action against Telegraph itself.
-            // A stale DB return marker must never move physical stock in Odoo.
-            const liveShipment = await this.accurateClient.getShipment({ code: record.accurateShipmentCode });
-            if (
-              !liveShipment ||
-              liveShipment.code !== record.accurateShipmentCode ||
-              (record.accurateShipmentId && liveShipment.id !== record.accurateShipmentId)
-            ) {
-              throw new OdooSaleReturnReviewError('Live Telegraph shipment does not match the exact integration record');
-            }
-            const liveProjection = projectAccurateStatusToShopify({
-              statusCode: liveShipment.status?.code,
-              statusName: liveShipment.status?.name,
-              returnStatusCode: liveShipment.returnStatus?.code,
-              returnStatusName: liveShipment.returnStatus?.name,
-              collected: liveShipment.collected,
-              paidToCustomer: liveShipment.paidToCustomer,
-              cancelled: liveShipment.cancelled,
-              customerDue: liveShipment.customerDue
-            });
-            if (!['returned', 'returned-settled'].includes(liveProjection.collectionStatus)) {
-              throw new OdooSaleReturnReviewError(
-                `Live Telegraph state no longer confirms a return (${liveProjection.collectionStatus})`
-              );
-            }
-            const result = await this.odooSyncService.returnDeliveredSaleOrderAndCancel(record.odooSaleOrderId);
-            action.odooSaleReturnStatus = result.status;
+        if (!this.odooSyncService) {
+          errors.push('Odoo Sales Order return service is unavailable');
+        } else if (!record.accurateShipmentCode) {
+          throw new OdooSaleReturnReviewError('Exact Telegraph shipment code is missing');
+        } else if (!record.odooSaleOrderId) {
+          throw new OdooSaleReturnReviewError('Exact Odoo Sales Order link is missing');
+        } else {
+          const liveShipment = await this.accurateClient.getShipment({ code: record.accurateShipmentCode });
+          if (
+            !liveShipment ||
+            liveShipment.code !== record.accurateShipmentCode ||
+            (record.accurateShipmentId && liveShipment.id !== record.accurateShipmentId)
+          ) {
+            throw new OdooSaleReturnReviewError('Live Telegraph shipment does not match the exact integration record');
           }
-        } else if (['empty', 'indeterminate'].includes(collectionDecision.classification)) {
+          const liveProjection = projectAccurateStatusToShopify({
+            statusCode: liveShipment.status?.code,
+            statusName: liveShipment.status?.name,
+            returnStatusCode: liveShipment.returnStatus?.code,
+            returnStatusName: liveShipment.returnStatus?.name,
+            collected: liveShipment.collected,
+            paidToCustomer: liveShipment.paidToCustomer,
+            cancelled: liveShipment.cancelled,
+            customerDue: liveShipment.customerDue
+          });
+          if (!['returned', 'returned-settled'].includes(liveProjection.collectionStatus)) {
           throw new OdooSaleReturnReviewError(
-            `Shopify collection membership is ${collectionDecision.classification}`
+              `Live Telegraph state no longer confirms a return (${liveProjection.collectionStatus})`
+            );
+          }
+          const result = await this.odooSyncService.reverseReturnedSaleOrderAccountingAndCancel(
+            record.odooSaleOrderId,
+            {
+              reason: `Telegraph returned shipment ${record.accurateShipmentCode}; Shopify ${record.shopifyOrderName ?? record.shopifyOrderId}`
+            }
           );
+          action.odooSaleReturnStatus = result.status;
         }
       } catch (error) {
         if (error instanceof OdooSaleReturnReviewError) {
