@@ -4,6 +4,7 @@ import type { ShopifyAddress, ShopifyLineItem, ShopifyOrder } from '../types/sho
 interface MoneySet {
   shopMoney: {
     amount: string;
+    currencyCode?: string;
   };
 }
 
@@ -68,6 +69,8 @@ interface ShopifyGraphqlOrder {
   totalPriceSet: MoneySet;
   totalOutstandingSet?: MoneySet;
   currentTotalPriceSet?: MoneySet;
+  currencyCode: string;
+  currentShippingPriceSet: MoneySet;
   shippingAddress?: ShopifyGraphqlAddress | null;
   billingAddress?: ShopifyGraphqlAddress | null;
   customer?: {
@@ -116,6 +119,13 @@ const ORDER_FIELDS = `
       value
     }
     paymentGatewayNames
+    currencyCode
+    currentShippingPriceSet {
+      shopMoney {
+        amount
+        currencyCode
+      }
+    }
     totalPriceSet {
       shopMoney {
         amount
@@ -308,6 +318,13 @@ const mapOrder = (order: ShopifyGraphqlOrder): ShopifyOrder => ({
   total_price: order.totalPriceSet.shopMoney.amount,
   total_outstanding: order.totalOutstandingSet?.shopMoney.amount,
   current_total_price: order.currentTotalPriceSet?.shopMoney.amount,
+  currency: order.currencyCode,
+  current_shipping_price_set: {
+    shop_money: {
+      amount: order.currentShippingPriceSet.shopMoney.amount,
+      currency_code: order.currentShippingPriceSet.shopMoney.currencyCode ?? order.currencyCode
+    }
+  },
   gateway: order.paymentGatewayNames?.[0],
   payment_gateway_names: order.paymentGatewayNames,
   test: order.test ?? false,

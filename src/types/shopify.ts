@@ -36,6 +36,20 @@ export interface ShopifyNoteAttribute {
   value?: string | null;
 }
 
+export interface ShopifyMoneySet {
+  shop_money?: { amount: string; currency_code?: string | null } | null;
+}
+
+export interface ShopifyShippingLine {
+  price?: string | null;
+  price_set?: ShopifyMoneySet | null;
+  discounted_price?: string | null;
+  discounted_price_set?: ShopifyMoneySet | null;
+  current_discounted_price_set?: ShopifyMoneySet | null;
+  is_removed?: boolean;
+  discount_allocations?: Array<{ amount?: string; amount_set?: ShopifyMoneySet | null }>;
+}
+
 export interface ShopifyOrder {
   id: number;
   admin_graphql_api_id?: string;
@@ -55,6 +69,9 @@ export interface ShopifyOrder {
   current_total_price?: string;
   total_discounts?: string | null;
   currency?: string | null;
+  /** Normalized from GraphQL currentShippingPriceSet, after discounts/refunds. */
+  current_shipping_price_set?: ShopifyMoneySet | null;
+  shipping_lines?: ShopifyShippingLine[] | null;
   discount_codes?: Array<{ code: string; amount: string; type: string }> | null;
   gateway?: string | null;
   payment_gateway_names?: string[];

@@ -3,6 +3,7 @@ import type { ShopifyLineItem, ShopifyOrder } from '../types/shopify.js';
 import type { AccurateShipmentInput } from '../accurate/accurateClient.js';
 import { AccurateZoneResolver } from '../accurate/zoneResolver.js';
 import { getTelegraphLocationSelection } from './telegraphLocation.js';
+import { buildRefusalShippingNote, buildShipmentNotes as buildRefusalShipmentNotes } from './shipmentRefusalPolicy.js';
 import {
   addInternationalPhoneToRecipientAddress,
   addInternationalPhoneToShipmentNotes,
@@ -84,7 +85,10 @@ const buildProductsSummary = (lineItems: ShopifyLineItem[]): string =>
     .join('\n');
 
 export const buildShipmentDescription = (order: ShopifyOrder): string =>
-  buildProductsSummary(activeLineItems(order.line_items));
+  [
+    buildProductsSummary(activeLineItems(order.line_items)),
+    buildRefusalShippingNote(order)
+  ].filter(Boolean).join('\n\n');
 
 /**
  * Telegraph prints shipment notes on a single line. Preserve the complete
@@ -92,7 +96,7 @@ export const buildShipmentDescription = (order: ShopifyOrder): string =>
  * a readable separator. Empty Shopify notes remain omitted from the payload.
  */
 export const buildShipmentNotes = (order: ShopifyOrder): string | undefined => {
-  const flattened = (order.note ?? '')
+  const flattened = (buildRefusalShipmentNotes(order) ?? '')
     .split(/\r\n?|\n/)
     .map((line) => line.replace(/\s+/g, ' ').trim())
     .filter(Boolean)
