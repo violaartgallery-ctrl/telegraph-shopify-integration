@@ -256,6 +256,13 @@ export const classifyOdooSaleReturnSnapshot = (snapshot: OdooSaleReturnSnapshot)
   const deliveredQuantityZero = snapshot.saleOrderLines.length > 0 &&
     snapshot.saleOrderLines.every((line) => Math.abs(Number(line.qty_delivered ?? 0)) <= tolerance);
   const invoices = blockingInvoices(snapshot);
+  // A cancelled SO whose transfers never executed has no stock to return.
+  // Accept only a fully cancelled, zero-delivered/zero-invoiced snapshot;
+  // active orders without delivery proof still require explicit review.
+  const cancelledWithoutDispatch = snapshot.pickings.length > 0 && snapshot.moves.length > 0 &&
+    snapshot.pickings.every((picking) => picking.state === 'cancel') &&
+    snapshot.moves.every((move) => move.state === 'cancel') &&
+    snapshot.saleOrderLines.every((line) => Math.abs(Number(line.qty_invoiced ?? 0)) <= tolerance);
   const base = {
     fingerprint: snapshotFingerprint(snapshot),
     saleOrderId: snapshot.saleOrder.id,
@@ -275,8 +282,7 @@ export const classifyOdooSaleReturnSnapshot = (snapshot: OdooSaleReturnSnapshot)
   }
   if (
     snapshot.saleOrder.state === 'cancel' &&
-    customerPhaseComplete &&
-    internalPhaseComplete &&
+    ((customerPhaseComplete && internalPhaseComplete) || cancelledWithoutDispatch) &&
     deliveredQuantityZero &&
     invoices.length === 0
   ) {

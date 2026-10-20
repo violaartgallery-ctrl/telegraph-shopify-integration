@@ -39,6 +39,7 @@ interface ShopifyGraphqlLineItem {
       id: string;
     } | null;
   } | null;
+  originalUnitPriceSet: MoneySet;
   discountedUnitPriceSet: MoneySet;
   discountAllocations?: Array<{
     allocatedAmountSet: MoneySet;
@@ -194,6 +195,9 @@ const ORDER_FIELDS = `
             id
           }
         }
+        originalUnitPriceSet {
+          shopMoney { amount }
+        }
         discountedUnitPriceSet {
           shopMoney {
             amount
@@ -280,14 +284,17 @@ const parseOrderNumber = (order: ShopifyGraphqlOrder): number => {
   return Number.isNaN(fromId) ? 0 : fromId;
 };
 
-const mapLineItems = (lineItems: ShopifyGraphqlLineItem[]): ShopifyLineItem[] =>
+export const mapLineItems = (lineItems: ShopifyGraphqlLineItem[]): ShopifyLineItem[] =>
   lineItems.map((item) => ({
     id: Number.parseInt(item.id.replace(/\D/g, ''), 10),
     title: item.title,
     sku: item.sku ?? item.variant?.sku ?? null,
     quantity: item.currentQuantity,
     current_quantity: item.currentQuantity,
-    price: item.discountedUnitPriceSet.shopMoney.amount,
+    // ShopifyOrder mirrors the REST shape: price is BEFORE discounts. Odoo
+    // applies discount_allocations separately; using the discounted unit price
+    // here would apply the same discount twice (1000 - 750 became 0, not 250).
+    price: item.originalUnitPriceSet.shopMoney.amount,
     variant_title: item.variantTitle,
     variant_id: item.variant ? Number.parseInt(item.variant.id.replace(/\D/g, ''), 10) : null,
     product_id: item.variant?.product

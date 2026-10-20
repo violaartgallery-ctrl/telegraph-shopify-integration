@@ -8,6 +8,7 @@
     "build": "prisma generate && tsc -p tsconfig.json && node -e \"const fs=require('fs');fs.mkdirSync('dist/assets/fonts',{recursive:true});fs.copyFileSync('src/assets/fonts/Cairo-Regular.ttf','dist/assets/fonts/Cairo-Regular.ttf');\"",
     "start": "node dist/index.js",
     "test:shopify-token": "tsx src/scripts/testShopifyToken.ts",
+    "test:shopify-line-prices": "tsx src/scripts/testShopifyLinePriceMapping.ts",
     "test:accurate-config": "tsx src/scripts/testAccurateConfig.ts",
     "test:odoo-config": "tsx src/scripts/testOdooConfig.ts",
     "test:recipient-phone": "tsx src/scripts/testRecipientPhoneMapping.ts",

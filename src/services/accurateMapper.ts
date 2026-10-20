@@ -51,9 +51,8 @@ const activeLineItems = (lineItems: ShopifyLineItem[]): ShopifyLineItem[] =>
 /**
  * Net unit price AFTER all discounts (line-level + order-level codes like "20Eid").
  *
- * Shopify's `discountedUnitPriceSet` (mapped to item.price) only reflects line-level
- * discounts; order-level discount codes are reported separately in discount_allocations.
- * So the true per-unit price the customer pays =
+ * item.price is the original unit price in both normalized GraphQL orders and
+ * REST webhooks. Allocations contain the discounts, applied exactly once:
  *   (item.price * qty - sum(discount_allocations)) / qty
  *
  * Returns a 2-decimal string for the shipment description / Accurate product price.

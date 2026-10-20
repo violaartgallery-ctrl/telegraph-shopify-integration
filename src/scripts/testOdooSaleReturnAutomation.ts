@@ -512,4 +512,19 @@ const newerOdooFake = new FakeOdooReturnRpc({ actionOnly: true });
 const newerOdooResult = await new OdooSaleReturnService(newerOdooFake).execute(10);
 assert.equal(newerOdooResult.status, 'already-complete', 'Odoo action_create_returns fallback failed');
 
+const neverDispatched = baseSnapshot();
+neverDispatched.saleOrder.state = 'cancel';
+neverDispatched.saleOrderLines.forEach((line) => { line.qty_delivered = 0; line.qty_invoiced = 0; });
+neverDispatched.pickings.forEach((picking) => { picking.state = 'cancel'; });
+neverDispatched.moves.forEach((move) => { move.state = 'cancel'; });
+assert.equal(classifyOdooSaleReturnSnapshot(neverDispatched).status, 'already-complete');
+neverDispatched.saleOrder.state = 'sale';
+assert.equal(classifyOdooSaleReturnSnapshot(neverDispatched).status, 'needs-review', 'No automatic cancellation without dispatch proof');
+neverDispatched.saleOrder.state = 'cancel';
+neverDispatched.saleOrderLines[0]!.qty_delivered = 1;
+assert.equal(classifyOdooSaleReturnSnapshot(neverDispatched).status, 'needs-review', 'Never hide a nonzero delivered quantity');
+neverDispatched.saleOrderLines[0]!.qty_delivered = 0;
+neverDispatched.saleOrderLines[0]!.qty_invoiced = 1;
+assert.equal(classifyOdooSaleReturnSnapshot(neverDispatched).status, 'needs-review', 'Never hide nonzero invoiced quantities');
+
 console.log('Odoo Sales Order return automation self-test passed.');
