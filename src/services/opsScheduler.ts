@@ -122,24 +122,43 @@ async function mutate<T>(lane: OpsLane, change: (state: OpsState) => { state: Op
 async function runLane(lane: OpsLane): Promise<unknown> {
   const { createAppServices } = await import('../app.js');
   const { shipmentStatusSyncService: sync, metaDeliveryService: meta, locationCatalogService } = createAppServices();
+  const results: Record<string, unknown> = {};
+  const errors: string[] = [];
+  const attempt = async (name: string, run: () => Promise<unknown>, diagnosticOnly = false) => {
+    try { results[name] = await run(); }
+    catch (error) { results[name] = { error: String(error).slice(0, 500) }; if (!diagnosticOnly) errors.push(name); }
+  };
+  const finish = () => { if (errors.length) throw new Error(`Ops lane stages failed: ${errors.join(', ')}`); return results; };
   if (lane === 'status') {
-    const metaResult = await meta.processPending();
-    const status = await sync.syncOpenShipments({ budgetMs: 70_000, batchSize: 100 });
-    return { meta: metaResult, status };
+    await attempt('meta', () => meta.processPending());
+    await attempt('status', () => sync.syncOpenShipments({ budgetMs: 70_000, batchSize: 100 }));
+    await attempt('productionRecovery', async () => {
+      const { prisma } = await import('../lib/prisma.js');
+      if (await prisma.failedPayload.findFirst({ where: { source: 'bot_control', reason: 'bot_paused' } })) return { paused: true };
+      const { listRecoverableJobs } = await import('./productionJobStore.js');
+      const { scheduleProductionContinuation } = await import('./productionContinuation.js');
+      const jobs = await listRecoverableJobs();
+      for (const { chatId, job } of jobs) await scheduleProductionContinuation({ chatId, batchId: job.batchId, dispatchKey: String(job.updatedAt) });
+      return { dispatched: jobs.length };
+    });
+    return finish();
   }
   if (lane === 'discovery') {
-    await locationCatalogService.refreshIfStale();
-    const collections = await sync.discoverCollectedShipmentsFromReports({ historyPages: 2, budgetMs: 70_000, apply: true, durableCursor: true });
-    const returns = await sync.discoverReturnedShipmentsResumable({ historyPages: 2, budgetMs: 70_000, apply: true });
-    return { collections, returns };
+    await attempt('locations', () => locationCatalogService.refreshIfStale(), true);
+    await attempt('collections', () => sync.discoverCollectedShipmentsFromReports({ historyPages: 2, budgetMs: 70_000, apply: true, durableCursor: true }));
+    await attempt('returns', () => sync.discoverReturnedShipmentsResumable({ historyPages: 2, budgetMs: 70_000, apply: true }));
+    return finish();
   }
   const { handler } = await import('../netlify/functions/process-odoo-queue-background.js');
-  const queue = await handler({ batchSize: 5, budgetMs: 75_000, maxSteps: 15 });
-  if (queue.statusCode !== 200) throw new Error('Odoo queue scheduler stage failed');
-  const returns = await sync.processReturnQueue({ apply: true, limit: 10, budgetMs: 35_000 });
-  const shopify = await sync.processShopifyPaymentQueue({ apply: true, limit: 12, budgetMs: 35_000, allowDiscounts: false });
-  const collections = await sync.processOdooCollectionQueue({ apply: true, limit: 20, budgetMs: 50_000 });
-  return { odoo: JSON.parse(queue.body), returns, shopify, collections };
+  await attempt('odoo', async () => {
+    const queue = await handler({ batchSize: 5, budgetMs: 75_000, maxSteps: 15 });
+    if (queue.statusCode !== 200) throw new Error('Odoo queue stage failed');
+    return JSON.parse(queue.body);
+  });
+  await attempt('returns', () => sync.processReturnQueue({ apply: true, limit: 10, budgetMs: 35_000 }));
+  await attempt('shopify', () => sync.processShopifyPaymentQueue({ apply: true, limit: 12, budgetMs: 35_000, allowDiscounts: false }));
+  await attempt('collections', () => sync.processOdooCollectionQueue({ apply: true, limit: 20, budgetMs: 50_000 }));
+  return finish();
 }
 
 export const opsScheduler = new OpsScheduler({
