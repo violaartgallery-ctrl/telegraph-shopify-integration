@@ -22,6 +22,8 @@ const getArg = (name: string): string | undefined => {
 };
 
 const apply = process.argv.includes('--apply');
+const retrySince = getArg('retry-since') ? new Date(getArg('retry-since')!) : undefined;
+if (retrySince && !Number.isFinite(retrySince.getTime())) throw new Error('Invalid retry-since timestamp');
 const requestedAction = (getArg('action') ?? 'all') as ActionKind | 'all';
 const limitArg = Number.parseInt(getArg('limit') ?? '', 10);
 const limit = Number.isFinite(limitArg) && limitArg > 0 ? limitArg : Number.POSITIVE_INFINITY;
@@ -126,7 +128,10 @@ const main = async () => {
   const rows = await prisma.shipmentRecord.findMany({
     where: {
       accurateShipmentId: { not: null },
-      OR: [{ accurateIsTerminal: null }, { accurateIsTerminal: false }]
+      OR: [
+        { accurateIsTerminal: null }, { accurateIsTerminal: false },
+        ...(retrySince ? [{ lastSyncedAt: { gte: retrySince } }] : [])
+      ]
     },
     orderBy: { id: 'asc' }
   });
@@ -135,15 +140,30 @@ const main = async () => {
   // quarantined. A partial/timeout scan therefore performs zero unsafe writes.
   const first = await accurateClient.listShipments({}, 100, 1);
   const lastPage = first.paginatorInfo?.lastPage ?? 1;
-  const carrierByCode = new Map<string, AccurateShipmentSummary>();
-  for (const shipment of first.data ?? []) if (shipment.code) carrierByCode.set(shipment.code, shipment);
-  for (let page = 2; page <= lastPage; page += 1) {
-    const response = await accurateClient.listShipments({}, 100, page);
-    for (const shipment of response.data ?? []) if (shipment.code) carrierByCode.set(shipment.code, shipment);
-    if (page % 5 === 0 || page === lastPage) {
-      console.error(`Telegraph catalog ${page}/${lastPage}`);
-    }
+  const expectedTotal = first.paginatorInfo?.total;
+  if (!expectedTotal || expectedTotal < 1 || !Number.isInteger(lastPage) || lastPage < 1) {
+    throw new Error('Invalid/zero Telegraph catalog; no reconciliation is allowed');
   }
+  const carrierByCode = new Map<string, AccurateShipmentSummary>();
+  const addPage = (response: typeof first, page: number) => {
+    if (response.paginatorInfo.total !== expectedTotal || response.paginatorInfo.lastPage !== lastPage ||
+      response.paginatorInfo.currentPage !== page || response.data.length !== response.paginatorInfo.count ||
+      response.paginatorInfo.hasMorePages !== (page < lastPage)) {
+      throw new Error('Telegraph catalog changed or is incomplete; no reconciliation is allowed');
+    }
+    for (const shipment of response.data) {
+      if (!shipment.code || carrierByCode.has(shipment.code)) throw new Error('Missing/duplicate carrier code; no reconciliation is allowed');
+      carrierByCode.set(shipment.code, shipment);
+    }
+  };
+  addPage(first, 1);
+  for (let start = 2; start <= lastPage; start += 4) {
+    const pages = Array.from({ length: Math.min(4, lastPage - start + 1) }, (_, offset) => start + offset);
+    const responses = await Promise.all(pages.map((page) => accurateClient.listShipments({}, 100, page)));
+    responses.forEach((response, index) => addPage(response, pages[index]!));
+    console.error(`Telegraph catalog ${pages.at(-1)}/${lastPage}`);
+  }
+  if (carrierByCode.size !== expectedTotal) throw new Error('Carrier catalog total did not verify; no reconciliation is allowed');
 
   const candidates: Array<{
     kind: ActionKind;
@@ -201,7 +221,7 @@ const main = async () => {
       });
       continue;
     }
-    if (!sameSnapshot(record, snapshot)) {
+    if (!sameSnapshot(record, snapshot) || (retrySince && record.lastSyncedAt && record.lastSyncedAt >= retrySince)) {
       candidates.push({
         kind: 'sync',
         record,
@@ -223,9 +243,13 @@ const main = async () => {
   );
   const applied = { repaired: 0, synced: 0, quarantined: 0, failed: 0 };
   const failures: Array<{ order: string | null; code: string | null; reason: string }> = [];
+  const audit = apply ? await prisma.failedPayload.create({ data: {
+    source: 'status-polling-recovery-audit', reason: startedAt.toISOString(),
+    payloadJson: JSON.stringify({ phase: 'before', expectedTotal, selected: selected.map((c) => ({ id: c.record.id, order: c.record.shopifyOrderName, code: c.record.accurateShipmentCode, kind: c.kind })) })
+  } }) : null;
 
   if (apply) {
-    for (const candidate of selected) {
+    const processCandidate = async (candidate: typeof selected[number]) => {
       try {
         if (candidate.kind === 'repair-terminal-flag') {
           await shipmentRepository.updateAccurateSnapshot(candidate.record.id, candidate.snapshot!);
@@ -254,11 +278,19 @@ const main = async () => {
           reason: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500)
         });
       }
-    }
+    };
+    // A single local worker may perform several parallel queries internally.
+    // Keep record concurrency at one so it cannot exhaust Neon's small pool.
+    for (const candidate of selected) await processCandidate(candidate);
+    await prisma.failedPayload.update({ where: { id: audit!.id }, data: { payloadJson: JSON.stringify({
+      phase: 'completed', expectedTotal, applied, failures,
+      selected: selected.map((c) => ({ id: c.record.id, order: c.record.shopifyOrderName, code: c.record.accurateShipmentCode, kind: c.kind }))
+    }) } });
   }
 
   console.log(JSON.stringify({
     apply,
+    auditId: audit?.id,
     requestedAction,
     limit: Number.isFinite(limit) ? limit : null,
     safeAgeDays,
@@ -267,6 +299,9 @@ const main = async () => {
     selected: selected.length,
     currentWithoutChange,
     missingTooNew,
+    recentMissing: rows.filter((r) => r.accurateShipmentCode && !carrierByCode.has(r.accurateShipmentCode) &&
+      !isOlderThanStatusPollingCutoff(r.createdAt, r.shopifyCreatedAt, cutoff))
+      .map((r) => ({ order: r.shopifyOrderName, code: r.accurateShipmentCode })),
     legacy,
     applied,
     failures

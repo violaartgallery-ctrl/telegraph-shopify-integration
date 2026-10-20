@@ -3,6 +3,10 @@
   "buildCommand": "npm run build && npm run prisma:deploy",
   "functions": {
     "api/index.ts": { "maxDuration": 300 },
+    "api/ops-scheduler-queue.ts": {
+      "maxDuration": 300,
+      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "viola-ops-scheduler", "retryAfterSeconds": 60, "initialDelaySeconds": 0 }]
+    },
     "api/production-continuation-queue.ts": {
       "maxDuration": 300,
       "experimentalTriggers": [
@@ -15,6 +19,7 @@
       ]
     }
   },
+  "crons": [{ "path": "/ops/scheduler/ensure", "schedule": "13 0 * * *" }],
   "rewrites": [
     { "source": "/(.*)", "destination": "/api" }
   ]

@@ -9,6 +9,7 @@ import { scheduleProductionContinuation } from '../services/productionContinuati
 import { checkProductionHealth } from '../services/productionHealthService.js';
 import { sendMessage } from '../telegram/telegramApi.js';
 import type { LocationCatalogService } from '../services/locationCatalogService.js';
+import { authorizedCron, opsScheduler } from '../services/opsScheduler.js';
 
 /**
  * Ops endpoints triggered by an external scheduler (GitHub Actions every 30 min)
@@ -23,6 +24,16 @@ export const createOpsRouter = (
   locationCatalogService?: LocationCatalogService
 ) => {
   const router = Router();
+
+  router.get('/ops/scheduler/ensure', async (request, response) => {
+    const secret = process.env.OPS_SECRET?.trim();
+    if (!authorizedCron(request.header('authorization')) && !(secret && request.header('x-ops-secret') === secret)) {
+      response.status(401).json({ ok: false });
+      return;
+    }
+    try { response.json({ ok: true, ...await opsScheduler.ensure() }); }
+    catch (error) { logger.error('Ops scheduler bootstrap failed', { reason: String(error) }); response.status(503).json({ ok: false }); }
+  });
 
   // Ops routes can create shipments, invoices, payments, returns, and alerts,
   // so an incomplete deployment must fail closed rather than expose a write path.
@@ -43,6 +54,12 @@ export const createOpsRouter = (
     const value = Number.parseInt(raw, 10);
     return Number.isFinite(value) ? value : fallback;
   };
+
+  router.get('/ops/scheduler/health', async (request, response) => {
+    if (!authorizedCron(request.header('authorization')) && !strictGuard(request, response)) return;
+    try { const health = await opsScheduler.health(); response.status(health.ok ? 200 : 503).json(health); }
+    catch { response.status(503).json({ ok: false }); }
+  });
 
   const queryApply = (request: Request): boolean =>
     ['1', 'true', 'yes'].includes(String(request.query.apply ?? '').toLowerCase());
