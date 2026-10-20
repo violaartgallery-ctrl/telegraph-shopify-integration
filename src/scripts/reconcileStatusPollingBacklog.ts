@@ -135,15 +135,30 @@ const main = async () => {
   // quarantined. A partial/timeout scan therefore performs zero unsafe writes.
   const first = await accurateClient.listShipments({}, 100, 1);
   const lastPage = first.paginatorInfo?.lastPage ?? 1;
-  const carrierByCode = new Map<string, AccurateShipmentSummary>();
-  for (const shipment of first.data ?? []) if (shipment.code) carrierByCode.set(shipment.code, shipment);
-  for (let page = 2; page <= lastPage; page += 1) {
-    const response = await accurateClient.listShipments({}, 100, page);
-    for (const shipment of response.data ?? []) if (shipment.code) carrierByCode.set(shipment.code, shipment);
-    if (page % 5 === 0 || page === lastPage) {
-      console.error(`Telegraph catalog ${page}/${lastPage}`);
-    }
+  const expectedTotal = first.paginatorInfo?.total;
+  if (!expectedTotal || expectedTotal < 1 || !Number.isInteger(lastPage) || lastPage < 1) {
+    throw new Error('Invalid/zero Telegraph catalog; no reconciliation is allowed');
   }
+  const carrierByCode = new Map<string, AccurateShipmentSummary>();
+  const addPage = (response: typeof first, page: number) => {
+    if (response.paginatorInfo.total !== expectedTotal || response.paginatorInfo.lastPage !== lastPage ||
+      response.paginatorInfo.currentPage !== page || response.data.length !== response.paginatorInfo.count ||
+      response.paginatorInfo.hasMorePages !== (page < lastPage)) {
+      throw new Error('Telegraph catalog changed or is incomplete; no reconciliation is allowed');
+    }
+    for (const shipment of response.data) {
+      if (!shipment.code || carrierByCode.has(shipment.code)) throw new Error('Missing/duplicate carrier code; no reconciliation is allowed');
+      carrierByCode.set(shipment.code, shipment);
+    }
+  };
+  addPage(first, 1);
+  for (let start = 2; start <= lastPage; start += 4) {
+    const pages = Array.from({ length: Math.min(4, lastPage - start + 1) }, (_, offset) => start + offset);
+    const responses = await Promise.all(pages.map((page) => accurateClient.listShipments({}, 100, page)));
+    responses.forEach((response, index) => addPage(response, pages[index]!));
+    console.error(`Telegraph catalog ${pages.at(-1)}/${lastPage}`);
+  }
+  if (carrierByCode.size !== expectedTotal) throw new Error('Carrier catalog total did not verify; no reconciliation is allowed');
 
   const candidates: Array<{
     kind: ActionKind;
@@ -225,7 +240,7 @@ const main = async () => {
   const failures: Array<{ order: string | null; code: string | null; reason: string }> = [];
 
   if (apply) {
-    for (const candidate of selected) {
+    const processCandidate = async (candidate: typeof selected[number]) => {
       try {
         if (candidate.kind === 'repair-terminal-flag') {
           await shipmentRepository.updateAccurateSnapshot(candidate.record.id, candidate.snapshot!);
@@ -254,6 +269,9 @@ const main = async () => {
           reason: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500)
         });
       }
+    };
+    for (let offset = 0; offset < selected.length; offset += 5) {
+      await Promise.all(selected.slice(offset, offset + 5).map(processCandidate));
     }
   }
 

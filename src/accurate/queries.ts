@@ -111,6 +111,7 @@ export const LIST_SHIPMENTS_QUERY = `
   query ListShipments($input: ListShipmentsFilterInput, $first: Int!, $page: Int) {
     listShipments(input: $input, first: $first, page: $page) {
       paginatorInfo {
+        count
         hasMorePages
         currentPage
         lastPage
