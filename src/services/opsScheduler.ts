@@ -1,6 +1,9 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 
 export const OPS_TOPIC = 'viola-ops-scheduler';
+// PostgreSQL advisory locks return void. Project a supported scalar so Prisma
+// can deserialize the result while keeping the lock in this transaction.
+export const OPS_LOCK_SQL = 'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))';
 export const OPS_INTERVALS = { status: 600_000, discovery: 900_000, financial: 300_000 } as const;
 export type OpsLane = keyof typeof OPS_INTERVALS;
 export interface OpsTick { version: 1; lane: OpsLane; slot: number }
@@ -108,7 +111,7 @@ export class OpsScheduler {
 async function mutate<T>(lane: OpsLane, change: (state: OpsState) => { state: OpsState; result: T }): Promise<T> {
   const { basePrisma } = await import('../lib/prisma.js');
   return basePrisma.$transaction(async (tx) => {
-    await tx.$queryRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', `viola_ops_scheduler_${lane}`);
+    await tx.$queryRawUnsafe(OPS_LOCK_SQL, `viola_ops_scheduler_${lane}`);
     const row = await tx.failedPayload.findFirst({ where: { source: 'ops_scheduler', reason: lane } });
     const current = row ? JSON.parse(row.payloadJson) as OpsState : {};
     const changed = change(current);

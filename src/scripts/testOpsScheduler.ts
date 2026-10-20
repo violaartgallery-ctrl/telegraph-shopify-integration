@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { OpsScheduler, OPS_INTERVALS, authorizedCron, parseOpsTick, type OpsState, type OpsLane, type OpsTick } from '../services/opsScheduler.js';
+import { OpsScheduler, OPS_INTERVALS, OPS_LOCK_SQL, authorizedCron, parseOpsTick, type OpsState, type OpsLane, type OpsTick } from '../services/opsScheduler.js';
+
+assert.equal(OPS_LOCK_SQL, 'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))', 'Prisma must not deserialize PostgreSQL void');
 
 let now = 1_800_000_000_000;
 let enabled = true;
@@ -73,4 +75,4 @@ assert.equal(authorizedCron(undefined), false);
 assert.equal(authorizedCron('Bearer test-only-secret'), true);
 assert.equal(authorizedCron('Bearer wrong'), false);
 if (old === undefined) delete process.env.CRON_SECRET; else process.env.CRON_SECRET = old;
-console.log(JSON.stringify({ ok: true, checks: 31, lanes: Object.keys(OPS_INTERVALS), externalCalls: 0 }));
+console.log(JSON.stringify({ ok: true, checks: 32, lanes: Object.keys(OPS_INTERVALS), externalCalls: 0 }));
