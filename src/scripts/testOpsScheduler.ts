@@ -25,7 +25,7 @@ assert.deepEqual(parseOpsTick({ version: 1, lane: 'financial', slot: now }), { v
 await scheduler.ensure(); await scheduler.ensure();
 assert.equal(messages.length, 6);
 assert.equal(messages[0]!.idempotencyKey, messages[3]!.idempotencyKey);
-assert.ok(messages.every((m) => m.retentionSeconds === 86400 && m.delaySeconds > 0));
+assert.ok(messages.every((m) => m.retentionSeconds === 86400 && m.delaySeconds === 0));
 assert.equal((await scheduler.health()).ok, false, 'publishing is not evidence of successful work');
 
 let release!: () => void;

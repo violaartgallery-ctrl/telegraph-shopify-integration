@@ -53,7 +53,7 @@ export class OpsScheduler {
     for (const lane of Object.keys(OPS_INTERVALS) as OpsLane[]) {
       // The same time slot is also used by the consumer: watchdogs cannot grow
       // independent recurring chains, even if GitHub and the daily cron overlap.
-      const slot = Math.floor(now / OPS_INTERVALS[lane]) * OPS_INTERVALS[lane] + OPS_INTERVALS[lane];
+      const slot = Math.floor(now / OPS_INTERVALS[lane]) * OPS_INTERVALS[lane];
       await this.publish(lane, slot);
     }
     const health = await this.health();

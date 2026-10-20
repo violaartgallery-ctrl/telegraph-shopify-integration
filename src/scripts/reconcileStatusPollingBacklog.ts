@@ -285,6 +285,9 @@ const main = async () => {
     selected: selected.length,
     currentWithoutChange,
     missingTooNew,
+    recentMissing: rows.filter((r) => r.accurateShipmentCode && !carrierByCode.has(r.accurateShipmentCode) &&
+      !isOlderThanStatusPollingCutoff(r.createdAt, r.shopifyCreatedAt, cutoff))
+      .map((r) => ({ order: r.shopifyOrderName, code: r.accurateShipmentCode })),
     legacy,
     applied,
     failures
