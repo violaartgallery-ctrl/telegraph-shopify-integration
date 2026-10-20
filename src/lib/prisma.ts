@@ -14,7 +14,7 @@ import { PrismaClient, Prisma } from '@prisma/client';
  * idempotent anyway (upserts / conditional updates by id). We retry a few times
  * with short backoff, which is plenty for a Neon resume (~1s).
  */
-const RETRYABLE_CODES = new Set(['P1001', 'P1002', 'P1008', 'P1017']);
+const RETRYABLE_CODES = new Set(['P1001', 'P1002', 'P1008', 'P1017', 'P2024']);
 
 function isTransientConnectionError(error: unknown): boolean {
   if (error instanceof Prisma.PrismaClientInitializationError) return true;

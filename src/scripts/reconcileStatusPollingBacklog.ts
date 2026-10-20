@@ -22,6 +22,8 @@ const getArg = (name: string): string | undefined => {
 };
 
 const apply = process.argv.includes('--apply');
+const retrySince = getArg('retry-since') ? new Date(getArg('retry-since')!) : undefined;
+if (retrySince && !Number.isFinite(retrySince.getTime())) throw new Error('Invalid retry-since timestamp');
 const requestedAction = (getArg('action') ?? 'all') as ActionKind | 'all';
 const limitArg = Number.parseInt(getArg('limit') ?? '', 10);
 const limit = Number.isFinite(limitArg) && limitArg > 0 ? limitArg : Number.POSITIVE_INFINITY;
@@ -126,7 +128,10 @@ const main = async () => {
   const rows = await prisma.shipmentRecord.findMany({
     where: {
       accurateShipmentId: { not: null },
-      OR: [{ accurateIsTerminal: null }, { accurateIsTerminal: false }]
+      OR: [
+        { accurateIsTerminal: null }, { accurateIsTerminal: false },
+        ...(retrySince ? [{ lastSyncedAt: { gte: retrySince } }] : [])
+      ]
     },
     orderBy: { id: 'asc' }
   });
@@ -216,7 +221,7 @@ const main = async () => {
       });
       continue;
     }
-    if (!sameSnapshot(record, snapshot)) {
+    if (!sameSnapshot(record, snapshot) || (retrySince && record.lastSyncedAt && record.lastSyncedAt >= retrySince)) {
       candidates.push({
         kind: 'sync',
         record,
@@ -238,6 +243,10 @@ const main = async () => {
   );
   const applied = { repaired: 0, synced: 0, quarantined: 0, failed: 0 };
   const failures: Array<{ order: string | null; code: string | null; reason: string }> = [];
+  const audit = apply ? await prisma.failedPayload.create({ data: {
+    source: 'status-polling-recovery-audit', reason: startedAt.toISOString(),
+    payloadJson: JSON.stringify({ phase: 'before', expectedTotal, selected: selected.map((c) => ({ id: c.record.id, order: c.record.shopifyOrderName, code: c.record.accurateShipmentCode, kind: c.kind })) })
+  } }) : null;
 
   if (apply) {
     const processCandidate = async (candidate: typeof selected[number]) => {
@@ -270,13 +279,18 @@ const main = async () => {
         });
       }
     };
-    for (let offset = 0; offset < selected.length; offset += 5) {
-      await Promise.all(selected.slice(offset, offset + 5).map(processCandidate));
-    }
+    // A single local worker may perform several parallel queries internally.
+    // Keep record concurrency at one so it cannot exhaust Neon's small pool.
+    for (const candidate of selected) await processCandidate(candidate);
+    await prisma.failedPayload.update({ where: { id: audit!.id }, data: { payloadJson: JSON.stringify({
+      phase: 'completed', expectedTotal, applied, failures,
+      selected: selected.map((c) => ({ id: c.record.id, order: c.record.shopifyOrderName, code: c.record.accurateShipmentCode, kind: c.kind }))
+    }) } });
   }
 
   console.log(JSON.stringify({
     apply,
+    auditId: audit?.id,
     requestedAction,
     limit: Number.isFinite(limit) ? limit : null,
     safeAgeDays,
