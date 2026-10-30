@@ -13,10 +13,14 @@ concurrency:
 
 jobs:
   scheduler:
+    # This kill switch is outside Neon and Vercel: no paid function is called
+    # while emergency receipts await reconciliation. Empty/default stays active.
+    if: vars.OPS_AUTOMATION_HOLD != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       primary_healthy: ${{ steps.ensure.outputs.primary_healthy }}
+      fallback_allowed: ${{ steps.ensure.outputs.fallback_allowed }}
     steps:
       - name: Watchdog for durable Vercel ops scheduler
         id: ensure
@@ -27,17 +31,18 @@ jobs:
           test -n "$OPS_SECRET"
           response=$(curl --fail-with-body --silent --show-error --retry 2 \
             --connect-timeout 15 --max-time 60 -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration.vercel.app/ops/scheduler/ensure")
+            "https://viola-telegraph-integration-violaaa.vercel.app/ops/scheduler/ensure")
           echo "$response" | jq -c .
           echo "primary_healthy=$(echo "$response" | jq -r '.primaryHealthy // false')" >> "$GITHUB_OUTPUT"
+          echo "fallback_allowed=$(echo "$response" | jq -r '.fallbackAllowed // false')" >> "$GITHUB_OUTPUT"
 
   status-sync:
     needs: [scheduler]
-    if: always() && needs.scheduler.outputs.primary_healthy != 'true'
+    if: always() && needs.scheduler.result == 'success' && needs.scheduler.outputs.fallback_allowed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      BASE: https://viola-telegraph-integration.vercel.app
+      BASE: https://viola-telegraph-integration-violaaa.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Validate scheduler secret
@@ -135,12 +140,12 @@ jobs:
             -H "x-ops-secret: $OPS_SECRET" "$BASE/ops/resume-production-jobs"
 
   odoo-queue:
-    if: always() && needs.status-sync.result != 'skipped'
-    needs: [status-sync]
+    if: always() && needs.scheduler.result == 'success' && needs.scheduler.outputs.fallback_allowed == 'true' && needs.status-sync.result == 'success'
+    needs: [scheduler, status-sync]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      BASE: https://viola-telegraph-integration.vercel.app
+      BASE: https://viola-telegraph-integration-violaaa.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Drain Odoo in short checkpoints
@@ -180,11 +185,11 @@ jobs:
           done
 
   health:
-    if: always()
-    needs: [status-sync, odoo-queue]
+    if: always() && needs.scheduler.result == 'success' && needs.scheduler.outputs.primary_healthy == 'true'
+    needs: [scheduler, status-sync, odoo-queue]
     runs-on: ubuntu-latest
     env:
-      BASE: https://viola-telegraph-integration.vercel.app
+      BASE: https://viola-telegraph-integration-violaaa.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Check production safety layers

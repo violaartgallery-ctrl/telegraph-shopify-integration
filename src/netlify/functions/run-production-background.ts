@@ -7,6 +7,7 @@
  * No employee Continue button is involved.
  */
 import { sendMessage } from '../../telegram/telegramApi.js';
+import { assertAutomationReleased } from '../../services/automationSafety.js';
 import {
   checkpointJob,
   claimJob,
@@ -94,6 +95,7 @@ function copyCheckpointState(target: JobCursor, saved: JobCursor): void {
 }
 
 export async function runPipeline(chatId: number, expectedBatchId?: string): Promise<void> {
+  assertAutomationReleased();
   const cursor = await claimJob(chatId, expectedBatchId);
   if (!cursor?.executionToken) return;
 
@@ -205,6 +207,7 @@ export async function resumeProductionInvocation(
   batchId: string,
   delayMs = 0
 ): Promise<void> {
+  assertAutomationReleased();
   const boundedDelay = Math.min(30_000, Math.max(0, Number(delayMs) || 0));
   if (boundedDelay) {
     await new Promise((resolve) => setTimeout(resolve, boundedDelay));
@@ -215,6 +218,7 @@ export async function resumeProductionInvocation(
 // Compatibility entrypoint for any old direct invocation. It now creates the
 // same preview-first durable workflow instead of running a second code path.
 export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
+  assertAutomationReleased();
   if (!event.body) return { statusCode: 400, body: 'Missing body' };
   let payload: JobPayload;
   try {

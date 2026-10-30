@@ -10,6 +10,7 @@ import { checkProductionHealth } from '../services/productionHealthService.js';
 import { sendMessage } from '../telegram/telegramApi.js';
 import type { LocationCatalogService } from '../services/locationCatalogService.js';
 import { authorizedCron, opsScheduler } from '../services/opsScheduler.js';
+import { automationHoldReason } from '../services/automationSafety.js';
 
 /**
  * Ops endpoints triggered by an external scheduler (GitHub Actions every 30 min)
@@ -32,7 +33,7 @@ export const createOpsRouter = (
       return;
     }
     try { response.json({ ok: true, ...await opsScheduler.ensure() }); }
-    catch (error) { logger.error('Ops scheduler bootstrap failed', { reason: String(error) }); response.status(503).json({ ok: false }); }
+    catch (error) { logger.error('Ops scheduler bootstrap failed', { reason: String(error) }); response.status(503).json({ ok: false, primaryHealthy: false, fallbackAllowed: false, reason: 'scheduler-unavailable' }); }
   });
 
   // Ops routes can create shipments, invoices, payments, returns, and alerts,
@@ -59,6 +60,15 @@ export const createOpsRouter = (
     if (!authorizedCron(request.header('authorization')) && !strictGuard(request, response)) return;
     try { const health = await opsScheduler.health(); response.status(health.ok ? 200 : 503).json(health); }
     catch { response.status(503).json({ ok: false }); }
+  });
+
+  // Applies to ALL legacy fallback paths, including GET endpoints that write.
+  // Authenticate before exposing the hold; do not query Neon to read this flag.
+  router.use('/ops', (request, response, next) => {
+    if (!automationHoldReason()) { next(); return; }
+    if (!strictGuard(request, response)) return;
+    response.setHeader('Retry-After', '3600');
+    response.status(503).json({ ok: false, fallbackAllowed: false, reason: automationHoldReason() });
   });
 
   const queryApply = (request: Request): boolean =>

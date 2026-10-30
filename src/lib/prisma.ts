@@ -1,4 +1,5 @@
 import { PrismaClient, Prisma } from '@prisma/client';
+import { isDatabaseQuotaError } from '../services/automationSafety.js';
 
 /**
  * Transient-connection retry wrapper.
@@ -17,6 +18,7 @@ import { PrismaClient, Prisma } from '@prisma/client';
 const RETRYABLE_CODES = new Set(['P1001', 'P1002', 'P1008', 'P1017', 'P2024']);
 
 function isTransientConnectionError(error: unknown): boolean {
+  if (isDatabaseQuotaError(error)) return false;
   if (error instanceof Prisma.PrismaClientInitializationError) return true;
   if (error instanceof Prisma.PrismaClientKnownRequestError) return RETRYABLE_CODES.has(error.code);
   const message = error instanceof Error ? error.message : String(error);

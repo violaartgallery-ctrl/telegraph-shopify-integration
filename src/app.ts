@@ -20,6 +20,7 @@ import { MetaDeliveryService } from './meta/metaDeliveryService.js';
 import { verifyResumeRequest } from './services/productionContinuation.js';
 import { resumeProductionInvocation } from './netlify/functions/run-production-background.js';
 import { LocationCatalogService } from './services/locationCatalogService.js';
+import { automationHoldReason } from './services/automationSafety.js';
 
 export const createAppServices = () => {
   const accurateClient = new AccurateClient();
@@ -67,6 +68,19 @@ export const createApp = () => {
 
   app.get('/health', (_request, response) => {
     response.status(200).json({ ok: true });
+  });
+
+  // Do not acknowledge webhook writes or permit manual shipment routes during
+  // emergency reconciliation. Public GET location catalogs remain available.
+  // Scheduler diagnostics are handled separately and do not query Neon on hold.
+  app.use((request, response, next) => {
+    if (!automationHoldReason() || request.path.startsWith('/ops/')) { next(); return; }
+    const publicLocations = ['/storefront/locations', '/api/accurate/locations'].includes(request.path);
+    const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
+    const admin = request.path.startsWith('/orders') || (request.path.startsWith('/api/') && !publicLocations);
+    if (!mutation && !admin) { next(); return; }
+    response.setHeader('Retry-After', '3600');
+    response.status(503).json({ ok: false, reason: automationHoldReason() });
   });
 
   // Shopify's documented fallback for an embedded document request that lost
