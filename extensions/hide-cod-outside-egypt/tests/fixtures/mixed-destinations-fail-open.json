@@ -1,0 +1,26 @@
+{
+  "payload": {
+    "export": "cart-payment-methods-transform-run",
+    "target": "cart.payment-methods.transform.run",
+    "input": {
+      "localization": {
+        "country": { "isoCode": "EG" }
+      },
+      "cart": {
+        "deliveryGroups": [
+          { "deliveryAddress": { "countryCode": "EG" } },
+          { "deliveryAddress": { "countryCode": "AE" } }
+        ]
+      },
+      "paymentMethods": [
+        {
+          "id": "gid://shopify/PaymentCustomizationPaymentMethod/cod",
+          "name": "Cash on Delivery (COD)"
+        }
+      ]
+    },
+    "output": {
+      "operations": []
+    }
+  }
+}

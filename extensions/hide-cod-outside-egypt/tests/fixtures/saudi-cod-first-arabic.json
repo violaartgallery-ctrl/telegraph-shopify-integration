@@ -1,0 +1,35 @@
+{
+  "payload": {
+    "export": "cart-payment-methods-transform-run",
+    "target": "cart.payment-methods.transform.run",
+    "input": {
+      "localization": {
+        "country": { "isoCode": "SA" }
+      },
+      "cart": {
+        "deliveryGroups": [
+          { "deliveryAddress": { "countryCode": "SA" } }
+        ]
+      },
+      "paymentMethods": [
+        {
+          "id": "gid://shopify/PaymentCustomizationPaymentMethod/kashier",
+          "name": "Kashier"
+        },
+        {
+          "id": "gid://shopify/PaymentCustomizationPaymentMethod/cod-ar",
+          "name": "الدفع عند الاستلام"
+        }
+      ]
+    },
+    "output": {
+      "operations": [
+        {
+          "paymentMethodHide": {
+            "paymentMethodId": "gid://shopify/PaymentCustomizationPaymentMethod/cod-ar"
+          }
+        }
+      ]
+    }
+  }
+}

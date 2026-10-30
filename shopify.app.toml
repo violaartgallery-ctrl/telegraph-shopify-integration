@@ -1,7 +1,7 @@
 client_id = "eaf022045694e907d4ed6d02bbbfd49a"
 name = "viola-telegraph"
 handle = "viola-telegraph"
-application_url = "https://viola-telegraph-integration-violaaa.vercel.app/"
+application_url = "https://viola-telegraph-integration-ahmed-4a74.vercel.app/"
 embedded = true
 
 [build]
@@ -14,9 +14,9 @@ api_version = "2026-01"
 scopes = "read_all_orders,read_customers,read_merchant_managed_fulfillment_orders,read_orders,read_payment_customizations,read_products,read_themes,read_validations,write_merchant_managed_fulfillment_orders,write_order_edits,write_orders,write_payment_customizations,write_products,write_theme_code,write_themes,write_validations"
 
 [auth]
-redirect_urls = [ "https://viola-telegraph-integration-violaaa.vercel.app/api/auth", "https://viola-integration-recovery.netlify.app/api/auth", "https://viola-telegraph-integration.vercel.app/api/auth" ]
+redirect_urls = [ "https://viola-telegraph-integration-ahmed-4a74.vercel.app/api/auth", "https://viola-telegraph-integration-violaaa.vercel.app/api/auth","https://viola-integration-recovery.netlify.app/api/auth", "https://viola-telegraph-integration.vercel.app/api/auth" ]
 
 [app_proxy]
-url = "https://viola-telegraph-integration-violaaa.vercel.app/storefront"
+url = "https://viola-telegraph-integration-ahmed-4a74.vercel.app/storefront"
 subpath = "viola-delivery"
 prefix = "apps"

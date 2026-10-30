@@ -1,0 +1,33 @@
+{
+  "payload": {
+    "export": "cart-payment-methods-transform-run",
+    "target": "cart.payment-methods.transform.run",
+    "input": {
+      "localization": {
+        "country": { "isoCode": "KW" }
+      },
+      "cart": {
+        "deliveryGroups": []
+      },
+      "paymentMethods": [
+        {
+          "id": "gid://shopify/PaymentCustomizationPaymentMethod/kashier",
+          "name": "Pay with Card via Kashier"
+        },
+        {
+          "id": "gid://shopify/PaymentCustomizationPaymentMethod/cod",
+          "name": "Cash on Delivery (COD)"
+        }
+      ]
+    },
+    "output": {
+      "operations": [
+        {
+          "paymentMethodHide": {
+            "paymentMethodId": "gid://shopify/PaymentCustomizationPaymentMethod/cod"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "payload": {
+    "export": "cart-payment-methods-transform-run",
+    "target": "cart.payment-methods.transform.run",
+    "input": {
+      "localization": {
+        "country": { "isoCode": "AE" }
+      },
+      "cart": {
+        "deliveryGroups": [
+          { "deliveryAddress": { "countryCode": "AE" } }
+        ]
+      },
+      "paymentMethods": [
+        {
+          "id": "gid://shopify/PaymentCustomizationPaymentMethod/kashier",
+          "name": "Kashier"
+        },
+        {
+          "id": "gid://shopify/PaymentCustomizationPaymentMethod/cod",
+          "name": "Cash on Delivery (COD)"
+        }
+      ]
+    },
+    "output": {
+      "operations": [
+        {
+          "paymentMethodHide": {
+            "paymentMethodId": "gid://shopify/PaymentCustomizationPaymentMethod/cod"
+          }
+        }
+      ]
+    }
+  }
+}
