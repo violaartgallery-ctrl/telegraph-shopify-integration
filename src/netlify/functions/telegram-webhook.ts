@@ -74,7 +74,7 @@ function isTelegraphEnabled(): boolean {
   return process.env.TELEGRAPH_ENABLED?.trim().toLowerCase() === 'true';
 }
 
-function triggerBackground(chatId: number, job: JobCursor): void {
+async function triggerBackground(chatId: number, job: JobCursor): Promise<void> {
   const dispatch = scheduleProductionContinuation({
     chatId,
     batchId: job.batchId,
@@ -86,6 +86,10 @@ function triggerBackground(chatId: number, job: JobCursor): void {
       `🚨 تعذر وضع Batch ${job.batchId} في طابور التشغيل. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
     );
   });
+  if (process.env.PRODUCTION_CONTINUATION_TRANSPORT === 'netlify') {
+    await dispatch;
+    return;
+  }
   try {
     waitUntil(dispatch);
   } catch (error) {
@@ -129,7 +133,7 @@ async function startPreview(chatId: number, orderId?: string): Promise<void> {
       chatId,
       `⏳ بدأ Preview آلي${orderId ? ` للأوردر #${orderId}` : ''}.\nBatch: ${result.job.batchId}\nلو الوقت خلص هكمل لوحدي في request جديد.`
     );
-    triggerBackground(chatId, result.job);
+    await triggerBackground(chatId, result.job);
     return;
   }
 
@@ -150,7 +154,7 @@ async function startPreview(chatId: number, orderId?: string): Promise<void> {
     );
     // If a prior self-request failed to dispatch, this harmless claim attempt
     // restarts a retrying job; a fresh running lease simply rejects it.
-    triggerBackground(chatId, result.job);
+    await triggerBackground(chatId, result.job);
   }
 }
 
@@ -185,7 +189,7 @@ async function startRun(chatId: number, orderId?: string): Promise<void> {
       chatId,
       `🚚 شحن Batch ${result.job.batchId} شغال بالفعل أو هيُعاد تلقائيًا. مفيش ضغطة Continue ومفيش شحنة هتتكرر.`
     );
-    triggerBackground(chatId, result.job);
+    await triggerBackground(chatId, result.job);
     return;
   }
   if (result.action === 'created_preview') {
@@ -204,7 +208,7 @@ async function startRun(chatId: number, orderId?: string): Promise<void> {
       `🚚 Preview مكتمل — بدأ شحن نفس ${result.job.orderNumbers.length} أوردر في Batch ${result.job.batchId}.`
     );
   }
-  triggerBackground(chatId, result.job);
+  await triggerBackground(chatId, result.job);
 }
 
 async function statusMessage(chatId: number): Promise<void> {
@@ -271,7 +275,7 @@ async function handleCommand(chatId: number, command: string, fullText: string):
     await prisma.failedPayload.deleteMany({ where: { source: 'bot_control' } });
     await sendMessage(chatId, '✅ البوت شغال تاني. أي Batch محفوظ يقدر يكمل تلقائيًا.');
     const job = await loadJob(chatId);
-    if (job) triggerBackground(chatId, job);
+    if (job) await triggerBackground(chatId, job);
     return;
   }
 
@@ -343,7 +347,7 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
       const job = await loadJob(chatId);
       if (job) {
         await sendMessage(chatId, `✅ مش محتاج تدوس Continue تاني. Batch ${job.batchId} بيكمل تلقائيًا.`);
-        triggerBackground(chatId, job);
+        await triggerBackground(chatId, job);
       } else {
         await sendMessage(chatId, 'ℹ️ الـBatch القديم انتهى أو اتلغى.');
       }

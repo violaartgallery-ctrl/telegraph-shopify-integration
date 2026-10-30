@@ -1,12 +1,12 @@
 [build]
-command = "npm run build && npm run prisma:deploy"
+command = "npm run build"
 publish = "public"
-functions = "dist/netlify/functions"
+functions = "netlify-recovery"
 
-[[redirects]]
-from = "/*"
-to = "/.netlify/functions/api/:splat"
-status = 200
+[functions]
+node_bundler = "esbuild"
+included_files = ["src/assets/fonts/**", "node_modules/.prisma/client/**", "node_modules/harfbuzzjs/dist/**", "!node_modules/.prisma/client/*windows*", "!node_modules/.prisma/client/*.tmp*", "!node_modules/@img/sharp-win32-*/**", "!node_modules/@img/sharp-wasm32/**"]
+external_node_modules = ["harfbuzzjs", "sharp"]
 
 # All three DB-touching crons run every 30 min ALIGNED (same :00/:30 ticks) so
 # Neon's compute is woken once per burst and can scale to zero in the long idle
@@ -18,22 +18,5 @@ status = 200
 # drainer (process-odoo-queue-background) which has Netlify's 15-min budget to
 # clear the whole queue in one wake. This removes the old 1-order-per-run ceiling
 # that could not keep up with 30–80 orders/day.
-[functions."sync-open-shipments"]
-schedule = "*/30 * * * *"
-
-[functions."process-odoo-queue"]
-schedule = "*/30 * * * *"
-
-[functions."sync-collections-from-reports"]
-schedule = "*/30 * * * *"
-
-[functions."run-production-background"]
-background = true
-node_bundler = "esbuild"
-included_files = ["dist/assets/fonts/**", "node_modules/harfbuzzjs/dist/**"]
-# harfbuzzjs is ESM with a top-level await — keep it unbundled so it loads as a
-# real ESM module at runtime (dynamic import) instead of being inlined into CJS.
-external_node_modules = ["harfbuzzjs"]
-
-[functions."ensure-telegram-webhook"]
-schedule = "*/5 * * * *"
+# Only netlify-recovery/recovery-watchdog supplies the temporary schedule.
+# Do not deploy the old independent crons or webhook takeover task.

@@ -30,6 +30,8 @@ export type MetaDeliverySource =
   | 'reconciliation';
 
 export interface MetaDeliveryConfig {
+  /** Preserve new outbox events during recovery while send credentials are unavailable. */
+  transportPaused?: boolean;
   enabled: boolean;
   mode: MetaCapiMode;
   pixelId: string;
@@ -50,6 +52,7 @@ export interface MetaDeliveryObservationResult {
 }
 
 export interface MetaDeliveryDrainSummary {
+  transportPaused?: boolean;
   enabled: boolean;
   mode: MetaCapiMode;
   reconciled: number;
@@ -129,7 +132,7 @@ export class MetaDeliveryService {
       throw new Error('META_DELIVERED_CUTOVER_AT is required when Meta Delivered is enabled');
     }
 
-    if (config.enabled) {
+    if (config.enabled && !config.transportPaused) {
       this.client = client ?? new MetaCapiClient({
         pixelId: config.pixelId,
         accessToken: config.accessToken,
@@ -399,6 +402,11 @@ export class MetaDeliveryService {
       health: null
     };
     if (!this.config.enabled) return empty;
+    if (this.config.transportPaused) {
+      empty.transportPaused = true;
+      empty.health = await metaDeliveryOutboxRepository.getHealth(this.config.mode);
+      return empty;
+    }
 
     // No automatic reconciliation/backfill: only the same transaction that
     // first observes an eligible carrier transition may enqueue a live event.
