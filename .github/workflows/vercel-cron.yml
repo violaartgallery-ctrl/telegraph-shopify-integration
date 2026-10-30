@@ -1,10 +1,12 @@
 name: vercel-scheduled-sync
 
-# GitHub documents that schedules at :00/:30 are the most likely to be delayed
-# or dropped. Keep the 30-minute cadence but move it away from peak minutes.
+# The watchdog only repairs a broken scheduler chain, and each check wakes Neon.
+# Run every 2 hours just after an even-UTC-hour wake (a scheduler slot by day
+# and by night in Cairo), so it usually finds Neon already awake. GitHub delays
+# :00/:30 schedules the most, so stay a few minutes past the hour.
 on:
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '3 */2 * * *'
   workflow_dispatch:
 
 concurrency:

@@ -40,6 +40,7 @@
     "test:location-catalog": "tsx src/scripts/testLocationCatalog.ts",
     "test:status-polling": "tsx src/scripts/testStatusPollingAutomation.ts",
     "test:ops-scheduler": "tsx src/scripts/testOpsScheduler.ts",
+    "test:ops-cairo-schedule": "tsx src/scripts/testOpsCairoSchedule.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",

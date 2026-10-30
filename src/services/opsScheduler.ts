@@ -7,6 +7,50 @@ export const OPS_TOPIC = 'viola-ops-scheduler';
 export const OPS_LOCK_SQL = 'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))';
 export const OPS_INTERVALS = { status: 600_000, discovery: 900_000, financial: 300_000 } as const;
 export type OpsLane = keyof typeof OPS_INTERVALS;
+
+/** Which instants a lane may wake. Slots are epoch milliseconds. */
+export interface OpsSchedule {
+  isSlot(lane: OpsLane, slot: number): boolean;
+  /** Latest slot at or before `at`. */
+  floor(lane: OpsLane, at: number): number;
+  /** First slot strictly after `after`. */
+  next(lane: OpsLane, after: number): number;
+}
+
+export function fixedIntervalSchedule(intervals: Record<OpsLane, number>): OpsSchedule {
+  return {
+    isSlot: (lane, slot) => slot % intervals[lane] === 0,
+    floor: (lane, at) => Math.floor(at / intervals[lane]) * intervals[lane],
+    next: (lane, after) => Math.floor(after / intervals[lane]) * intervals[lane] + intervals[lane],
+  };
+}
+
+// Neon suspends compute after 5 idle minutes, so independent 5/10/15-minute
+// lanes kept it awake around the clock (528 wakes/day). Every lane now wakes on
+// the same instants so Neon can sleep between bursts: every 30 minutes from
+// 10:00 to 22:00 Cairo time (discovery hourly), every 2 hours overnight.
+// Shopify/carrier webhooks and Telegram requests stay immediate.
+const HALF_HOUR = 1_800_000;
+const HOUR = 3_600_000;
+const TWO_HOURS = 7_200_000;
+export const CAIRO_DAY_HOURS = { start: 10, end: 22 } as const;
+const cairoHour = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Cairo', hour: '2-digit', hourCycle: 'h23' });
+
+function isCairoSlot(lane: OpsLane, slot: number): boolean {
+  if (slot % HALF_HOUR !== 0) return false;
+  const hour = Number(cairoHour.format(slot));
+  // Overnight slots are even UTC hours, so they stay aligned with the 2-hourly
+  // GitHub watchdog in both winter and Egyptian summer time.
+  if (hour < CAIRO_DAY_HOURS.start || hour >= CAIRO_DAY_HOURS.end) return slot % TWO_HOURS === 0;
+  return lane !== 'discovery' || slot % HOUR === 0;
+}
+
+export const cairoBusinessSchedule: OpsSchedule = {
+  isSlot: isCairoSlot,
+  floor: (lane, at) => { let slot = Math.floor(at / HALF_HOUR) * HALF_HOUR; while (!isCairoSlot(lane, slot)) slot -= HALF_HOUR; return slot; },
+  next: (lane, after) => { let slot = Math.floor(after / HALF_HOUR) * HALF_HOUR + HALF_HOUR; while (!isCairoSlot(lane, slot)) slot += HALF_HOUR; return slot; },
+};
+
 export interface OpsTick { version: 1; lane: OpsLane; slot: number }
 export interface OpsState {
   lastStartedAt?: number; lastSuccessAt?: number; completedSlot?: number;
@@ -14,6 +58,8 @@ export interface OpsState {
 }
 export interface OpsDependencies {
   intervals?: Record<OpsLane, number>;
+  /** Overrides `intervals`; defaults to fixed OPS_INTERVALS. */
+  schedule?: OpsSchedule;
   now(): number;
   enabled(): boolean;
   holdReason?(): string | undefined;
@@ -41,9 +87,18 @@ export function authorizedCron(header: string | undefined): boolean {
 }
 
 export class OpsScheduler {
-  constructor(private readonly deps: OpsDependencies) {}
+  private readonly schedule: OpsSchedule;
 
-  private interval(lane: OpsLane): number { return this.deps.intervals?.[lane] ?? OPS_INTERVALS[lane]; }
+  constructor(private readonly deps: OpsDependencies) {
+    this.schedule = deps.schedule ?? fixedIntervalSchedule(deps.intervals ?? OPS_INTERVALS);
+  }
+
+  /** Three of the longer surrounding gaps: two missed wakes, even across 2-hour night slots. */
+  private staleAfter(lane: OpsLane, now: number): number {
+    const current = this.schedule.floor(lane, now);
+    const before = current - this.schedule.floor(lane, current - 1);
+    return 3 * Math.max(before, this.schedule.next(lane, current) - current);
+  }
 
   private async publish(lane: OpsLane, slot: number): Promise<void> {
     const now = this.deps.now();
@@ -70,7 +125,7 @@ export class OpsScheduler {
     for (const lane of Object.keys(OPS_INTERVALS) as OpsLane[]) {
       // The same time slot is also used by the consumer: watchdogs cannot grow
       // independent recurring chains, even if GitHub and the daily cron overlap.
-      const slot = Math.floor(now / this.interval(lane)) * this.interval(lane);
+      const slot = this.schedule.floor(lane, now);
       await this.publish(lane, slot);
     }
     // Successful dispatch owns recovery. Never race the legacy drain against it.
@@ -84,7 +139,7 @@ export class OpsScheduler {
     if (hold || !enabled) return { ok: false, enabled: false, checkedAt: new Date(now).toISOString(), lanes: [], reason: hold ?? 'scheduler-disabled' };
     const lanes = await Promise.all((Object.keys(OPS_INTERVALS) as OpsLane[]).map(async (lane) => {
       const state = await this.deps.read(lane);
-      const healthy = Boolean(state.lastSuccessAt && now - state.lastSuccessAt < this.interval(lane) * 3);
+      const healthy = Boolean(state.lastSuccessAt && now - state.lastSuccessAt < this.staleAfter(lane, now));
       return { lane, healthy, ...state, token: undefined };
     }));
     return { ok: enabled && lanes.every((s) => s.healthy), enabled, checkedAt: new Date(now).toISOString(), lanes };
@@ -96,11 +151,13 @@ export class OpsScheduler {
     const hold = this.deps.holdReason?.();
     if (hold) return { skipped: hold };
     if (!this.deps.enabled()) return { skipped: 'disabled-outside-production' };
+    // Ticks left over from an older cadence die out without touching Neon;
+    // ensure() starts the current chain.
+    if (!this.schedule.isSlot(tick.lane, tick.slot)) return { skipped: 'off-schedule-tick' };
     const now = this.deps.now();
     if (tick.slot > now + 30_000) throw new Error('Ops tick arrived before its scheduled slot');
-    const interval = this.interval(tick.lane);
-    if (now - tick.slot >= interval * 3) return { skipped: 'stale-control-tick' };
-    const next = Math.max(tick.slot + interval, Math.floor(now / interval) * interval + interval);
+    if (now - tick.slot >= 3 * (this.schedule.next(tick.lane, tick.slot) - tick.slot)) return { skipped: 'stale-control-tick' };
+    const next = this.schedule.next(tick.lane, Math.max(tick.slot, now));
     const token = randomUUID();
     const claimed = await this.deps.mutate(tick.lane, (s) => {
       if ((s.completedSlot ?? 0) >= tick.slot || (s.leaseUntil ?? 0) > now) return { state: s, result: false };
@@ -186,7 +243,7 @@ async function runLane(lane: OpsLane): Promise<unknown> {
   return finish();
 }
 
-export function createPersistentOpsScheduler(runtime: Pick<OpsDependencies, 'enabled' | 'publish' | 'intervals'>): OpsScheduler {
+export function createPersistentOpsScheduler(runtime: Pick<OpsDependencies, 'enabled' | 'publish' | 'intervals' | 'schedule'>): OpsScheduler {
   return new OpsScheduler({
   now: Date.now,
   holdReason: automationHoldReason,
@@ -206,7 +263,8 @@ export const opsScheduler = createPersistentOpsScheduler({
     ? process.env.RECOVERY_LIVE === '1'
     : process.env.VERCEL_ENV === 'production') && process.env.OPS_SCHEDULER_ENABLED !== 'false',
   ...(process.env.PRODUCTION_CONTINUATION_TRANSPORT === 'netlify'
-    ? { intervals: { status: 1_800_000, discovery: 1_800_000, financial: 1_800_000 } } : {}),
+    ? { intervals: { status: 1_800_000, discovery: 1_800_000, financial: 1_800_000 } }
+    : { schedule: cairoBusinessSchedule }),
   publish: async (tick, options) => {
     if (process.env.PRODUCTION_CONTINUATION_TRANSPORT === 'netlify') return { nativeSchedule: 'recovery-watchdog' };
     const { send } = await import('@vercel/queue');
