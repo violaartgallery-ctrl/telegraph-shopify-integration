@@ -33,7 +33,7 @@ jobs:
           test -n "$OPS_SECRET"
           response=$(curl --fail-with-body --silent --show-error --retry 2 \
             --connect-timeout 15 --max-time 60 -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration-violaaa.vercel.app/ops/scheduler/ensure")
+            "https://viola-telegraph-integration-ahmed-4a74.vercel.app/ops/scheduler/ensure")
           echo "$response" | jq -c .
           echo "primary_healthy=$(echo "$response" | jq -r '.primaryHealthy // false')" >> "$GITHUB_OUTPUT"
           echo "fallback_allowed=$(echo "$response" | jq -r '.fallbackAllowed // false')" >> "$GITHUB_OUTPUT"
@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      BASE: https://viola-telegraph-integration-violaaa.vercel.app
+      BASE: https://viola-telegraph-integration-ahmed-4a74.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Validate scheduler secret
@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      BASE: https://viola-telegraph-integration-violaaa.vercel.app
+      BASE: https://viola-telegraph-integration-ahmed-4a74.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Drain Odoo in short checkpoints
@@ -191,7 +191,7 @@ jobs:
     needs: [scheduler, status-sync, odoo-queue]
     runs-on: ubuntu-latest
     env:
-      BASE: https://viola-telegraph-integration-violaaa.vercel.app
+      BASE: https://viola-telegraph-integration-ahmed-4a74.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Check production safety layers
