@@ -182,6 +182,32 @@ function engraveBlackWhite(g: Gray): Uint8Array {
 
 export interface PreppedRaster { cols: number; rows: number; hex: string }
 
+const BLACK_HEX = Buffer.from(RICH_BLACK).toString("hex").toUpperCase();
+const PROBE_PT = 144.0;          // 2-inch probe: enough to tell line art from a photo
+
+/** Share of a prepared raster the laser burns. */
+export function burnShare(r: PreppedRaster): number {
+  let n = 0;
+  for (let i = 0; i < r.hex.length; i += 8) if (r.hex.startsWith(BLACK_HEX, i)) n++;
+  return n / Math.max(1, r.cols * r.rows);
+}
+
+/** Several photos for ONE place (customers often send a mock-up of the finished
+ *  piece next to the design itself): engrave the one that burns least - the
+ *  lettering / line art, not a photo of a whole wallet or a black background. */
+export async function pickDesign<T>(images: Array<{ item: T; buf: Buffer }>): Promise<[T, T[]]> {
+  if (images.length <= 1) return [images[0]!.item, []];
+  const shares: number[] = [];
+  for (const { buf } of images) {
+    const r = await prepPhotoRaster(buf, PROBE_PT, PROBE_PT).catch(() => null);
+    shares.push(r ? burnShare(r) : 0);
+  }
+  let usable = shares.map((s, i) => [s, i] as const).filter(([s]) => s > 0.002).map(([, i]) => i);
+  if (!usable.length) usable = [0];
+  const best = usable.reduce((b, i) => (shares[i]! < shares[b]! ? i : b), usable[0]!);
+  return [images[best]!.item, images.filter((_x, i) => i !== best).map((x) => x.item)];
+}
+
 /** Crop the whitespace, size to 300 DPI at its real placement (zone in points),
  *  finish black/white and encode as the factory's CMYK. null = nothing to engrave. */
 export async function prepPhotoRaster(buf: Buffer, zoneWPt: number, zoneHPt: number): Promise<PreppedRaster | null> {
@@ -224,8 +250,7 @@ export async function prepPhotoRaster(buf: Buffer, zoneWPt: number, zoneHPt: num
     for (let i = 0; i < g.v.length; i++) g.v[i] = Math.round(g.v[i]!);
   }
   const bw = engraveBlackWhite(g);
-  const black = Buffer.from(RICH_BLACK).toString("hex").toUpperCase();
   const parts: string[] = new Array(bw.length);
-  for (let i = 0; i < bw.length; i++) parts[i] = bw[i] ? "00000000" : black;
+  for (let i = 0; i < bw.length; i++) parts[i] = bw[i] ? "00000000" : BLACK_HEX;
   return { cols: g.w, rows: g.h, hex: parts.join("") };
 }

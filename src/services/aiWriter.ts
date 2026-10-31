@@ -32,7 +32,7 @@ export interface AiEntry {
 import { ARABIC_FONT_B64, LATIN_FONT_B64 } from "./fontsData.js";
 import { BOX_TEMPLATE } from "./boxAssets.js";
 import { type LaserOp, writeLaserAi } from "./laser/laserCore.js";
-import { prepPhotoRaster } from "./laser/laserPhoto.js";
+import { burnShare, prepPhotoRaster } from "./laser/laserPhoto.js";
 import { cleanText, entryPieces, type LaserEntry, partFields, partPhotos, sourcesOf } from "./laser/laserRouting.js";
 
 type Ring = [number, number][];
@@ -621,6 +621,11 @@ async function boxCellContents(entries: LaserEntry[], photos: Map<string, Buffer
           const buf = p.attachment_url ? photos.get(p.attachment_url) : undefined;
           const r = buf ? await prepPhotoRaster(buf, zoneWPt, zoneHPt).catch(() => null) : null;
           if (r) prepped.push(r);
+        }
+        // More photos than boxes: engrave the designs, not the mock-ups.
+        if (prepped.length > qty) {
+          const key = (r: { cols: number; rows: number; hex: string }) => { const s = burnShare(r); return [s <= 0.002 ? 1 : 0, s] as const; };
+          prepped.sort((a, b) => { const [a0, a1] = key(a), [b0, b1] = key(b); return a0 - b0 || a1 - b1; });
         }
         for (let i = 0; i < qty; i++) {
           if (prepped.length) cells.push({ kind: "photo", ...prepped[i % prepped.length]! });

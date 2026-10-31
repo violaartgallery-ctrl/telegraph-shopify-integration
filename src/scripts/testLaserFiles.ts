@@ -10,7 +10,7 @@ import { buildBoxGridBuffers } from "../services/aiWriter.js";
 import { buildKeychainFiles } from "../services/laser/keychainFile.js";
 import { BED_H_MM, BED_W_MM } from "../services/laser/laserCore.js";
 import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
-import { prepPhotoRaster } from "../services/laser/laserPhoto.js";
+import { pickDesign, prepPhotoRaster } from "../services/laser/laserPhoto.js";
 import { bundleLeftover, entryPieces, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
 import { buildPieceFiles, pieceCell } from "../services/laser/pieceFile.js";
 import { buildWalletFiles } from "../services/laser/walletFile.js";
@@ -68,6 +68,19 @@ await test("photos engrave solid black/white in UPPERCASE hex", async () => {
   const px = new Set<string>();
   for (let i = 0; i < r!.hex.length; i += 8) px.add(r!.hex.slice(i, i + 8));
   assert.deepEqual([...px].sort(), ["00000000", "BFADA7E6"]);
+});
+
+await test("several photos for one place: the design is engraved, not the dark mock-up", async () => {
+  const mockup = new Jimp(300, 200, 0xffffffff);
+  mockup.scan(30, 30, 240, 140, (_x, _y, idx) => { mockup.bitmap.data.writeUInt32BE(0x3c281eff, idx); });
+  const design = new Jimp(300, 200, 0xffffffff);
+  design.scan(100, 90, 100, 6, (_x, _y, idx) => { design.bitmap.data.writeUInt32BE(0x000000ff, idx); });
+  const [chosen, others] = await pickDesign([
+    { item: "photo 1", buf: await mockup.getBufferAsync(Jimp.MIME_PNG) },
+    { item: "photo 2", buf: await design.getBufferAsync(Jimp.MIME_PNG) },
+  ]);
+  assert.equal(chosen, "photo 2");
+  assert.deepEqual(others, ["photo 1"]);
 });
 
 await test("a plain box is still cut, with no marker frame; a box photo is engraved", async () => {

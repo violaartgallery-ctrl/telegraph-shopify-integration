@@ -16,9 +16,9 @@ import {
   BED_H_MM, BED_W_MM, bounds, contoursGeom, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, type RGB, scale,
   TAN, TITLE_GAP_MM, TITLE_H_MM, translate, writeLaserAi,
 } from "./laserCore.js";
-import { entryColor, entryPieces, type LaserEntry, partFields, partPhotos, sourcesOf } from "./laserRouting.js";
+import { entryColor, entryPieces, type LaserEntry, partFields, sourcesOf } from "./laserRouting.js";
 import { titleGeom, type Zone } from "./laserText.js";
-import { cleanValue, zoneOps } from "./walletFile.js";
+import { cleanValue, placedByZone, titleNote, zoneOps } from "./walletFile.js";
 
 export type PieceProduct = "passport" | "purse" | "purse_box";
 const GAP_MM = 10.0;
@@ -96,10 +96,10 @@ export function pieceZoneFor(product: PieceProduct, model: string, label: unknow
 
 interface Item {
   product: PieceProduct; model: string; color: string; order: string | null; title: string;
-  texts: Record<string, string[]>; photos: Record<string, Buffer>; markers: Record<string, string[]>;
+  texts: Record<string, string[]>; photos: Record<string, Buffer>; markers: Record<string, string[]>; extra: string[];
 }
 
-function items(product: PieceProduct, entries: LaserEntry[], photos: Map<string, Buffer>): Item[] {
+async function items(product: PieceProduct, entries: LaserEntry[], photos: Map<string, Buffer>): Promise<Item[]> {
   const out: Item[] = [];
   for (const e of entries) {
     if (!entryPieces(e).has(product)) continue;
@@ -112,25 +112,13 @@ function items(product: PieceProduct, entries: LaserEntry[], photos: Map<string,
       if (!zone) { console.warn(`[laser] ${product} (${model}): no writing place for "${label}" — not engraved.`); continue; }
       (texts[zone] ??= []).push(s);
     }
-    const byOrder = new Map<string | null, Record<string, Buffer>>();
-    const markers = new Map<string | null, Record<string, string[]>>();
-    for (const p of partPhotos(e, product)) {
-      const zone = pieceZoneFor(product, model, p.position_label);
-      const k = p.order_name ?? null;
-      if (!zone) { console.warn(`[laser] ${product} ${k} (${model}): no place for ${p.display_label} — not engraved.`); continue; }
-      const buf = p.attachment_url ? photos.get(p.attachment_url) : undefined;
-      if (buf) {
-        if (!byOrder.has(k)) byOrder.set(k, {});
-        byOrder.get(k)![zone] ??= buf;
-      } else {
-        if (!markers.has(k)) markers.set(k, {});
-        (markers.get(k)![zone] ??= []).push(p.display_label ?? "photo");
-      }
-    }
+    const placed = await placedByZone(e, photos, product, (label) => pieceZoneFor(product, model, label),
+      `${product} (${model})`);
     for (const { order, qty } of sourcesOf(e)) {
       for (let i = 0; i < qty; i++) {
         out.push({ product, model, color: entryColor(e), order, title: e.display_product || DEFAULT_TITLE[product],
-          texts, photos: byOrder.get(order) ?? {}, markers: markers.get(order) ?? {} });
+          texts, photos: placed.photos.get(order) ?? {}, markers: placed.markers.get(order) ?? {},
+          extra: placed.extras.get(order) ?? [] });
       }
     }
   }
@@ -159,7 +147,7 @@ async function setOps(it: Item, ox: number, oy: number): Promise<LaserOp[]> {
     if (g) ops.push({ t: "fill", geom: translate(scale(g, MM), ox * MM, oy * MM), color: TAN });
   }
   const [setW, setH] = tpl.size as [number, number];
-  const title = titleGeom(it.title, it.color, setW);
+  const title = titleGeom(it.title, it.color, setW, titleNote(it.extra));
   if (title) {
     const tw = bounds(title)[2] / MM;
     ops.push({ t: "fill", geom: placeAt(title, (ox + (setW - tw) / 2) * MM, (oy + setH + TITLE_GAP_MM) * MM), color: TAN });
@@ -179,7 +167,7 @@ export async function buildPieceFiles(product: PieceProduct, entries: LaserEntry
   photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
   const order = MODEL_ORDER[product];
-  const its = items(product, entries, photos).sort((a, b) => order.indexOf(a.model) - order.indexOf(b.model));
+  const its = (await items(product, entries, photos)).sort((a, b) => order.indexOf(a.model) - order.indexOf(b.model));
   const [cellW, cellH, maxCols, maxRows] = pieceCell(product);
   const out: Buffer[] = [];
   for (const rows of pagesByColour(its, maxCols, maxRows)) {

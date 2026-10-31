@@ -5,10 +5,11 @@
 import { textWidth, weldLinesBlock, wrapToWidth } from "../aiWriter.js";
 import { bounds, MM, type MultiPoly, scale, TITLE_H_MM, translate } from "./laserCore.js";
 
-/** The factory's title over each set, e.g. "1 X LINES WALLET BROWN": one line,
- *  TITLE_H_MM tall, at most maxWmm wide, bottom-left at (0, 0). */
-export function titleGeom(title: string, color: string, maxWmm: number): MultiPoly | null {
-  const text = `1 X ${title} ${color}`.toUpperCase().split(/\s+/).filter(Boolean).join(" ");
+/** The factory's title over each set, e.g. "1 X LINES WALLET BROWN" (+ a note such
+ *  as "+ PHOTO 13" for the operator): one line, TITLE_H_MM tall, at most maxWmm
+ *  wide, bottom-left at (0, 0). */
+export function titleGeom(title: string, color: string, maxWmm: number, note = ""): MultiPoly | null {
+  const text = `1 X ${title} ${color} ${note}`.toUpperCase().split(/\s+/).filter(Boolean).join(" ");
   const block = weldLinesBlock([text]);
   if (!block || !block.length) return null;
   const [minx, miny, maxx, maxy] = bounds(block);

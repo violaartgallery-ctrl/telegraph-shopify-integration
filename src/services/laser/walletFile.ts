@@ -15,8 +15,8 @@ import {
   bounds, contoursGeom, CUT, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE, type RGB, scale, TAN,
   TITLE_GAP_MM, TITLE_H_MM, translate, writeLaserAi,
 } from "./laserCore.js";
-import { prepPhotoRaster } from "./laserPhoto.js";
-import { BOX_STRIP, entryColor, entryPieces, type LaserEntry, partFields, partPhotos, sourcesOf } from "./laserRouting.js";
+import { pickDesign, prepPhotoRaster } from "./laserPhoto.js";
+import { BOX_STRIP, entryColor, entryPieces, type LaserEntry, type LaserPhoto, partFields, partPhotos, type Piece, sourcesOf } from "./laserRouting.js";
 import { fitBlock, placeBox, titleGeom, type Zone } from "./laserText.js";
 
 const PER_FILE = 25;
@@ -80,10 +80,55 @@ export function walletZoneFor(label: unknown, model: Model, hint = ""): string |
 
 interface Item {
   color: string; model: Model; order: string | null; title: string;
-  texts: Record<string, string[]>; photos: Record<string, Buffer>; markers: Record<string, string[]>;
+  texts: Record<string, string[]>; photos: Record<string, Buffer>; markers: Record<string, string[]>; extra: string[];
 }
 
-function items(entries: LaserEntry[], photos: Map<string, Buffer>): Item[] {
+export interface PlacedByZone {
+  photos: Map<string | null, Record<string, Buffer>>;
+  /** photos of a place that got several, not engraved: listed in the title */
+  extras: Map<string | null, string[]>;
+  /** photos that could not be read: a "photo N" marker in their place */
+  markers: Map<string | null, Record<string, string[]>>;
+}
+
+/** The entry's placed photos by order and writing place. When one place got
+ *  several photos, the design is engraved (pickDesign) and the others listed. */
+export async function placedByZone(e: LaserEntry, photos: Map<string, Buffer>, part: Piece,
+  zoneFor: (label: unknown) => string | null, who: string): Promise<PlacedByZone> {
+  const lists = new Map<string | null, Record<string, Array<{ item: LaserPhoto; buf: Buffer }>>>();
+  const markers = new Map<string | null, Record<string, string[]>>();
+  for (const p of partPhotos(e, part)) {
+    const zone = zoneFor(p.position_label);
+    const k = p.order_name ?? null;
+    if (!zone) { console.warn(`[laser] ${who} ${k}: no place for ${p.display_label} — not engraved.`); continue; }
+    const buf = p.attachment_url ? photos.get(p.attachment_url) : undefined;
+    if (buf) {
+      if (!lists.has(k)) lists.set(k, {});
+      (lists.get(k)![zone] ??= []).push({ item: p, buf });
+    } else {
+      if (!markers.has(k)) markers.set(k, {});
+      (markers.get(k)![zone] ??= []).push(p.display_label ?? "photo");
+    }
+  }
+  const out: PlacedByZone = { photos: new Map(), extras: new Map(), markers };
+  for (const [order, zones] of lists) {
+    for (const [zone, images] of Object.entries(zones)) {
+      const [chosen, others] = await pickDesign(images);
+      if (!out.photos.has(order)) out.photos.set(order, {});
+      out.photos.get(order)![zone] = images.find((x) => x.item === chosen)!.buf;
+      if (others.length) {
+        const labels = others.map((o) => o.display_label ?? "photo");
+        out.extras.set(order, [...(out.extras.get(order) ?? []), ...labels]);
+        console.warn(`[laser] ${who} ${order}: ${images.length} photos for ${zone} — engraved ${chosen.display_label}, ${labels.join(", ")} listed in the title.`);
+      }
+    }
+  }
+  return out;
+}
+
+export const titleNote = (extra: string[]) => (extra.length ? `+ ${extra.join(" ")}` : "");
+
+async function items(entries: LaserEntry[], photos: Map<string, Buffer>): Promise<Item[]> {
   const out: Item[] = [];
   for (const e of entries) {
     if (!entryPieces(e).has("wallet")) continue;
@@ -96,25 +141,12 @@ function items(entries: LaserEntry[], photos: Map<string, Buffer>): Item[] {
       if (!zone) { console.warn(`[laser] Wallet (${model}): no writing place for "${label}" — not engraved.`); continue; }
       (texts[zone] ??= []).push(s);
     }
-    const byOrder = new Map<string | null, Record<string, Buffer>>();
-    const markers = new Map<string | null, Record<string, string[]>>();
-    for (const p of partPhotos(e, "wallet")) {
-      const zone = walletZoneFor(p.position_label, model);
-      const k = p.order_name ?? null;
-      if (!zone) { console.warn(`[laser] Wallet ${k} (${model}): no place for ${p.display_label} — not engraved.`); continue; }
-      const buf = p.attachment_url ? photos.get(p.attachment_url) : undefined;
-      if (buf) {
-        if (!byOrder.has(k)) byOrder.set(k, {});
-        byOrder.get(k)![zone] ??= buf;
-      } else {               // a photo that could not be read stays a "photo N" marker in its place
-        if (!markers.has(k)) markers.set(k, {});
-        (markers.get(k)![zone] ??= []).push(p.display_label ?? "photo");
-      }
-    }
+    const placed = await placedByZone(e, photos, "wallet", (label) => walletZoneFor(label, model), `Wallet (${model})`);
     for (const { order, qty } of sourcesOf(e)) {
       for (let i = 0; i < qty; i++) {
         out.push({ color: entryColor(e), model, order, title: e.display_product || "Wallet", texts,
-          photos: byOrder.get(order) ?? {}, markers: markers.get(order) ?? {} });
+          photos: placed.photos.get(order) ?? {}, markers: placed.markers.get(order) ?? {},
+          extra: placed.extras.get(order) ?? [] });
       }
     }
   }
@@ -135,7 +167,7 @@ async function walletOps(it: Item, ox: number, oy: number): Promise<LaserOp[]> {
     if (g) ops.push({ t: "fill", geom: translate(scale(g, MM), ox * MM, oy * MM), color: TAN });
   }
   const [setW, setH] = tpl.size as [number, number];
-  const title = titleGeom(it.title, it.color, setW);
+  const title = titleGeom(it.title, it.color, setW, titleNote(it.extra));
   if (title) {
     const tw = bounds(title)[2] / MM;
     ops.push({ t: "fill", geom: placeAt(title, (ox + (setW - tw) / 2) * MM, (oy + setH + TITLE_GAP_MM) * MM), color: TAN });
@@ -179,7 +211,7 @@ export async function zoneOps(
 /** Wallet files, up to 25 wallets each. photos: attachment_url -> bytes. */
 export async function buildWalletFiles(entries: LaserEntry[], photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
-  const its = items(entries, photos).sort((a, b) => MODEL_ORDER.indexOf(a.model) - MODEL_ORDER.indexOf(b.model));
+  const its = (await items(entries, photos)).sort((a, b) => MODEL_ORDER.indexOf(a.model) - MODEL_ORDER.indexOf(b.model));
   const pages = pagesByColour(its, MAX_COLS, MAX_ROWS, PER_FILE);
   const [setW, setH] = WALLET_TEMPLATE.size as [number, number];
   const rowH = setH + TITLE_GAP_MM + TITLE_H_MM;
