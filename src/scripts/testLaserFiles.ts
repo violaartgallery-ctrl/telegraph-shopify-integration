@@ -10,11 +10,11 @@ import { buildBoxGridBuffers, wordmarkIn } from "../services/aiWriter.js";
 import { buildKeychainFiles } from "../services/laser/keychainFile.js";
 import { BED_H_MM, BED_W_MM, LIMITS } from "../services/laser/laserCore.js";
 import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
-import { pickDesign, prepPhotoRaster } from "../services/laser/laserPhoto.js";
+import { photoSignature, pickDesign, prepPhotoRaster, samePhoto } from "../services/laser/laserPhoto.js";
 import { bundleLeftover, entryPieces, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
 import { buildPieceFiles, pieceCell, pieceLogo, pieceZoneFor } from "../services/laser/pieceFile.js";
 import { PIECE_TEMPLATES } from "../services/laser/laserAssets.js";
-import { buildWalletFiles, templateGeom } from "../services/laser/walletFile.js";
+import { buildWalletFiles, placedByZone, templateGeom, walletZoneFor } from "../services/laser/walletFile.js";
 import { BOX_TEMPLATE } from "../services/boxAssets.js";
 import { WALLET_TEMPLATE } from "../services/laser/laserAssets.js";
 import { bounds } from "../services/laser/laserCore.js";
@@ -93,6 +93,24 @@ await test("several photos for one place: the design is engraved, not the dark m
   ]);
   assert.equal(chosen, "photo 2");
   assert.deepEqual(others, ["photo 1"]);
+});
+
+await test("the same photo in two places of a wallet is flagged in the title", async () => {
+  const logo = new Jimp(400, 240, 0xffffffff);
+  logo.scan(40, 60, 320, 30, (_x, _y, idx) => { logo.bitmap.data.writeUInt32BE(0x000000ff, idx); });
+  logo.scan(180, 90, 30, 110, (_x, _y, idx) => { logo.bitmap.data.writeUInt32BE(0x000000ff, idx); });
+  const other = new Jimp(400, 240, 0xffffffff);
+  other.scan(40, 150, 320, 30, (_x, _y, idx) => { other.bitmap.data.writeUInt32BE(0x000000ff, idx); });
+  const a = await logo.getBufferAsync(Jimp.MIME_PNG);
+  const b = await logo.clone().resize(300, 180).quality(90).getBufferAsync(Jimp.MIME_JPEG);
+  assert.ok(samePhoto(await photoSignature(a), await photoSignature(b)));
+  assert.ok(!samePhoto(await photoSignature(a), await photoSignature(await other.getBufferAsync(Jimp.MIME_PNG))));
+  const e = entry("Lines wallet", [], 1, [
+    { position_label: "برا يمين في الطرف لوجو", display_label: "photo 8", order_name: "#1", attachment_url: "u:a" },
+    { position_label: "برا شمال في الطرف", display_label: "photo 13", order_name: "#1", attachment_url: "u:b" }]);
+  const placed = await placedByZone(e, new Map([["u:a", a], ["u:b", b]]), "wallet", (l) => walletZoneFor(l, "lines"), "Wallet");
+  assert.deepEqual(Object.keys(placed.photos.get("#1")!).sort(), ["برا تحت شمال", "برا تحت يمين"]);
+  assert.deepEqual(placed.extras.get("#1"), ["CHECK photo 8 SAME AS photo 13"]);
 });
 
 await test("a plain box is still cut, with no marker frame; a box photo is engraved", async () => {

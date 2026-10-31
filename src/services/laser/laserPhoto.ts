@@ -208,6 +208,34 @@ export async function pickDesign<T>(images: Array<{ item: T; buf: Buffer }>): Pr
   return [images[best]!.item, images.filter((_x, i) => i !== best).map((x) => x.item)];
 }
 
+const SIG = 24;                  // a photo's signature: how much each of 24 x 24 parts burns
+export interface PhotoSignature { aspect: number; cells: Float64Array }
+
+/** (aspect, 24 x 24 burn shares) of a picture at the probe size, or null - to tell
+ *  the same photo uploaded twice (another file, format or size). */
+export async function photoSignature(buf: Buffer): Promise<PhotoSignature | null> {
+  const r = await prepPhotoRaster(buf, PROBE_PT, PROBE_PT).catch(() => null);
+  if (!r) return null;
+  const total = new Float64Array(SIG * SIG), count = new Float64Array(SIG * SIG);
+  for (let y = 0; y < r.rows; y++) {
+    const gy = Math.floor((y * SIG) / r.rows) * SIG;
+    for (let x = 0; x < r.cols; x++) {
+      const g = gy + Math.floor((x * SIG) / r.cols);
+      count[g]! += 1;
+      if (r.hex.startsWith(BLACK_HEX, (y * r.cols + x) * 8)) total[g]! += 1;
+    }
+  }
+  return { aspect: r.cols / r.rows, cells: total.map((t, i) => t / Math.max(count[i]!, 1)) };
+}
+
+/** Two signatures of one picture: the same shape and the same parts burnt. */
+export function samePhoto(a: PhotoSignature | null, b: PhotoSignature | null): boolean {
+  if (!a || !b) return false;
+  let diff = 0;
+  for (let i = 0; i < a.cells.length; i++) diff += Math.abs(a.cells[i]! - b.cells[i]!);
+  return Math.abs(a.aspect - b.aspect) <= 0.08 * Math.max(a.aspect, b.aspect) && diff / a.cells.length < 0.10;
+}
+
 /** Crop the whitespace, size to 300 DPI at its real placement (zone in points),
  *  finish black/white and encode as the factory's CMYK. null = nothing to engrave. */
 export async function prepPhotoRaster(buf: Buffer, zoneWPt: number, zoneHPt: number): Promise<PreppedRaster | null> {

@@ -16,7 +16,7 @@ import {
   bounds, cappedFiles, contoursGeom, CUT, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE, type RGB, scale, TAN,
   TITLE_GAP_MM, TITLE_H_MM, translate,
 } from "./laserCore.js";
-import { pickDesign, prepPhotoRaster } from "./laserPhoto.js";
+import { type PhotoSignature, photoSignature, pickDesign, prepPhotoRaster, samePhoto } from "./laserPhoto.js";
 import { BOX_STRIP, entryColor, entryPieces, type LaserEntry, type LaserPhoto, partFields, partPhotos, type Piece, sourcesOf } from "./laserRouting.js";
 import { fitBlock, placeBox, titleGeom, type Zone } from "./laserText.js";
 
@@ -115,15 +115,29 @@ export async function placedByZone(e: LaserEntry, photos: Map<string, Buffer>, p
   }
   const out: PlacedByZone = { photos: new Map(), extras: new Map(), markers };
   for (const [order, zones] of lists) {
+    const placed: Array<[string, LaserPhoto, PhotoSignature | null]> = [];
+    const many = Object.keys(zones).length > 1;
     for (const [zone, images] of Object.entries(zones)) {
       const [chosen, others] = await pickDesign(images);
+      const buf = images.find((x) => x.item === chosen)!.buf;
       if (!out.photos.has(order)) out.photos.set(order, {});
-      out.photos.get(order)![zone] = images.find((x) => x.item === chosen)!.buf;
+      out.photos.get(order)![zone] = buf;
+      placed.push([zone, chosen, many ? await photoSignature(buf) : null]);
       if (others.length) {
         const labels = others.map((o) => o.display_label ?? "photo");
         out.extras.set(order, [...(out.extras.get(order) ?? []), ...labels]);
         console.warn(`[laser] ${who} ${order}: ${images.length} photos for ${zone} — engraved ${chosen.display_label}, ${labels.join(", ")} listed in the title.`);
       }
+    }
+    // The same photo in two places of one piece is usually a place the team added
+    // without removing the customer's first one (#13714): engraved as asked, but
+    // the title tells the operator to check.
+    for (let i = 0; i < placed.length; i++) for (let j = i + 1; j < placed.length; j++) {
+      const [za, pa, sa] = placed[i]!, [zb, pb, sb] = placed[j]!;
+      if (!samePhoto(sa, sb)) continue;
+      const la = pa.display_label ?? "photo", lb = pb.display_label ?? "photo";
+      out.extras.set(order, [...(out.extras.get(order) ?? []), `CHECK ${la} SAME AS ${lb}`]);
+      console.warn(`[laser] ${who} ${order}: ${la} on ${za} and ${lb} on ${zb} are the same photo — engraved on both, flagged in the title.`);
     }
   }
   return out;
