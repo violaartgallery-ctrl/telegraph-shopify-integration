@@ -1,7 +1,8 @@
 /**
  * Wallet laser files, laid out like the factory's daily production .rld files
  * (port of wallet_writer.py): the face with its two pockets above it, the model's
- * decoration (lines: the knot band; decorated: the star pattern), the deer logo,
+ * decoration (lines: the knot band; decorated: the star pattern), the boxes' VIOLA
+ * wordmark,
  * a "1 X <PRODUCT> <COLOUR>" title, and every customisation in its writing place:
  *   برا شمال / برا يمين on the upper face (blank wallets only); برا تحت … in the
  *   bottom corners beside the logo (the lines wallet's band covers the upper face);
@@ -10,6 +11,7 @@
  * Each leather colour starts its own row, up to 25 wallets per file.
  */
 import { ensureHB } from "../aiWriter.js";
+import { BOX_TEMPLATE } from "../boxAssets.js";
 import { WALLET_TEMPLATE } from "./laserAssets.js";
 import {
   bounds, contoursGeom, CUT, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE, type RGB, scale, TAN,
@@ -42,10 +44,18 @@ export const WALLET_ZONES: Record<string, Zone> = {
 const HINT_RE = /^\s*(?:ف|في)\s*(النص|الطرف)\s*[(:]?\s*/;
 
 const geoms = new Map<string, MultiPoly | null>();
-function templateGeom(key: "band" | "logo"): MultiPoly | null {
+/** The template's band (mm); "logo" is the gift boxes' VIOLA wordmark (owner,
+ *  2026-11-01) in place of the factory's deer logo: as wide as the deer logo,
+ *  centred where it was, on its baseline. */
+export function templateGeom(key: "band" | "logo"): MultiPoly | null {
   if (!geoms.has(key)) {
-    const t = WALLET_TEMPLATE;
-    geoms.set(key, contoursGeom(key === "band" ? t.lines_band.contours : t.logo_contours));
+    if (key === "band") geoms.set(key, contoursGeom(WALLET_TEMPLATE.lines_band.contours));
+    else {
+      const [x0, y0, x1] = WALLET_TEMPLATE.logo as number[];
+      const w = x1! - x0!, h = w / BOX_TEMPLATE.logo_aspect;
+      const base = contoursGeom(BOX_TEMPLATE.logo_contours as number[][][]);
+      geoms.set(key, base && base.map((poly) => poly.map((ring) => ring.map(([x, y]) => [x0! + x * w, y0! + y * h] as [number, number]))));
+    }
   }
   return geoms.get(key)!;
 }

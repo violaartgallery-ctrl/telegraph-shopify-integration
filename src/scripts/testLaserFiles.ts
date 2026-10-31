@@ -13,7 +13,10 @@ import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
 import { pickDesign, prepPhotoRaster } from "../services/laser/laserPhoto.js";
 import { bundleLeftover, entryPieces, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
 import { buildPieceFiles, pieceCell } from "../services/laser/pieceFile.js";
-import { buildWalletFiles } from "../services/laser/walletFile.js";
+import { buildWalletFiles, templateGeom } from "../services/laser/walletFile.js";
+import { BOX_TEMPLATE } from "../services/boxAssets.js";
+import { WALLET_TEMPLATE } from "../services/laser/laserAssets.js";
+import { bounds } from "../services/laser/laserCore.js";
 
 let passed = 0;
 async function test(name: string, fn: () => Promise<void> | void) {
@@ -106,6 +109,13 @@ await test("wallets: 25 per file, decorated face takes no outside writing", asyn
   const [deco] = await buildWalletFiles([entry("Decorated wallet", [["المحفظة برا يمين", "X"]])]);
   const [blank] = await buildWalletFiles([entry("Decorated wallet")]);
   assert.equal(count(text(deco!), /^f$/gm), count(text(blank!), /^f$/gm));
+});
+
+await test("the wallet logo is the gift boxes' VIOLA wordmark, where the deer logo was", () => {
+  const [x0, y0, x1] = WALLET_TEMPLATE.logo as number[];
+  const [minx, miny, maxx, maxy] = bounds(templateGeom("logo")!);
+  assert.ok(Math.abs(minx - x0!) < 0.05 && Math.abs(miny - y0!) < 0.05 && Math.abs(maxx - x1!) < 0.05);
+  assert.ok(Math.abs((maxx - minx) / (maxy - miny) - BOX_TEMPLATE.logo_aspect) < 0.01);
 });
 
 await test("passport / purse / purse box sets fit the 1400 x 900 bed", async () => {
