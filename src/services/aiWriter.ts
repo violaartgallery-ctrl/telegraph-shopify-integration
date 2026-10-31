@@ -13,7 +13,7 @@ import * as polygonClippingNs from "polygon-clipping";
 // dynamic import() (works for ESM from CJS) and cache the module.
 type HBModule = typeof import("harfbuzzjs");
 let HB: HBModule | null = null;
-async function ensureHB(): Promise<HBModule> {
+export async function ensureHB(): Promise<HBModule> {
   if (!HB) HB = await import("harfbuzzjs");
   return HB;
 }
@@ -30,7 +30,10 @@ export interface AiEntry {
   photo_numbers?: Array<{ position_label?: string | null; display_label?: string }>;
 }
 import { ARABIC_FONT_B64, LATIN_FONT_B64 } from "./fontsData.js";
-import { BOX_TEMPLATE, AI_HEAD, AI_TAIL } from "./boxAssets.js";
+import { BOX_TEMPLATE } from "./boxAssets.js";
+import { type LaserOp, writeLaserAi } from "./laser/laserCore.js";
+import { prepPhotoRaster } from "./laser/laserPhoto.js";
+import { cleanText, entryPieces, type LaserEntry, partFields, partPhotos, sourcesOf } from "./laser/laserRouting.js";
 
 type Ring = [number, number][];
 type Poly = Ring[];
@@ -194,7 +197,7 @@ function shapeRun(fb: FB, text: string): Array<{ g: number; ax: number; xo: numb
   }));
 }
 
-function weldLine(text: string, baseline: number): { geom: MultiPoly | null; width: number } {
+export function weldLine(text: string, baseline: number): { geom: MultiPoly | null; width: number } {
   const [ara, lat] = fonts();
   const geoms: MultiPoly[] = [];
   let penX = 0;
@@ -481,7 +484,6 @@ const MM = 72.0 / (PT_SCALE * 25.4);            // font units per millimetre
 const CELL_W = CELL_W_MM * MM;
 const CELL_H = CELL_H_MM * MM;
 const GRID_MARGIN = 10.0 * MM;
-const FRAME_LINE_MM = 0.2;
 const CELL_LINE_GAP = Math.round(EM * 2.0);
 const COLOR_RED: [number, number, number] = [1, 0, 0];
 const BOX_CUT: [number, number, number] = [0, 0, 0];
@@ -489,7 +491,6 @@ const BOX_TEXT_COLORS: Array<[number, number, number]> = [
   [0.0, 0.50, 0.0], [1.0, 0.50, 0.0], [1.0, 0.45, 0.70], [0.50, 0.10, 0.80],
   [0.50, 0.80, 0.10], [0.0, 0.60, 0.60], [0.85, 0.10, 0.50], [0.30, 0.30, 1.0], [0.60, 0.40, 0.0],
 ];
-const BOX_STRIP = new Set(['"', "'", "«", "»", "“", "”", "‘", "’", "(", ")", "[", "]", "{", "}"]);
 
 function geomBounds(g: MultiPoly): [number, number, number, number] {
   let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
@@ -510,7 +511,7 @@ function boxTextTarget(): [number, number, number, number] {
   return [(z.x0 + z.x1) / 2, (z.y0 + z.y1) / 2, z.x1 - z.x0, z.y1 - z.y0];
 }
 
-function textWidth(text: string): number {
+export function textWidth(text: string): number {
   const [ara, lat] = fonts();
   let w = 0;
   for (const { text: run, kind } of splitRuns(text)) {
@@ -521,7 +522,7 @@ function textWidth(text: string): number {
   }
   return w;
 }
-function wrapToWidth(text: string, targetW: number): string[] {
+export function wrapToWidth(text: string, targetW: number): string[] {
   const words = (text || "").split(/\s+/).filter(Boolean);
   if (!words.length) return [];
   const lines: string[] = [];
@@ -533,7 +534,7 @@ function wrapToWidth(text: string, targetW: number): string[] {
   if (cur) lines.push(cur);
   return lines;
 }
-function weldLinesBlock(lines: string[]): MultiPoly | null {
+export function weldLinesBlock(lines: string[]): MultiPoly | null {
   const placed: Array<{ g: MultiPoly; y: number; w: number }> = [];
   let y = 0;
   for (const ln of lines) {
@@ -586,39 +587,53 @@ function logoGeom(cellX: number, cellY: number): MultiPoly | null {
   return translateXY(g, cellX + z.x0 * CELL_W, cellY + z.y0 * CELL_H);
 }
 
-function isBox(e: AiEntry): boolean {
-  const p = (e.display_product || "").toLowerCase();
-  return p.includes("box") || p.includes("بوكس");
-}
-function boxText(e: AiEntry): string {
-  const vals: string[] = [];
-  for (const [, v] of e.customization_cleaned) {
-    const s = [...String(v)].filter((c) => !BOX_STRIP.has(c)).join("").split(/\s+/).filter(Boolean).join(" ");
-    if (s) vals.push(s);
-  }
-  return vals.join("  ");
+// A box carries only its engraving message. In a bundle it takes the box's own
+// fields; a purse bundle's box is the purse box (its own file, laser/pieceFile.ts).
+function boxText(e: LaserEntry): string {
+  return partFields(e, "box").map(([, v]) => cleanText(v)).filter(Boolean).join("  ");
 }
 
-type BoxCell = { kind: "text"; block: MultiPoly } | { kind: "logozone" };
-function boxCellContents(entries: AiEntry[]): BoxCell[] {
-  const [, , wf] = boxTextTarget();
+/** One cell per physical box: its writing, the customer's photo, or nothing
+ *  (a plain box is still cut: outline + logo). */
+type BoxCell =
+  | { kind: "text"; block: MultiPoly }
+  | { kind: "photo"; cols: number; rows: number; hex: string }
+  | { kind: "plain" };
+async function boxCellContents(entries: LaserEntry[], photos: Map<string, Buffer>): Promise<BoxCell[]> {
+  const [, , wf, hf] = boxTextTarget();
   const targetW = wf * CELL_W;
+  const zoneWPt = wf * CELL_W * PT_SCALE, zoneHPt = hf * CELL_H * PT_SCALE;
   const cells: BoxCell[] = [];
+  const markerCell = (labels: string[]): BoxCell => {
+    const block = weldLinesBlock(labels.length ? labels : ["photo"]);
+    return block ? { kind: "text", block } : { kind: "plain" };
+  };
   for (const e of entries) {
-    if (!isBox(e)) continue;
+    if (!entryPieces(e).has("box")) continue;
     const text = boxText(e);
-    const lines: string[] = text ? wrapToWidth(text, targetW) : [];
-    // Customisation photos -> "photo N" marker on its own line (the box is a
-    // single zone, so the position is implicit). "طباعة الصور" uploads have no
-    // place (position_label null) and are skipped.
-    for (const p of e.photo_numbers ?? []) {
-      if (!((p.position_label ?? "").trim())) continue;
-      lines.push(p.display_label ?? "photo");
+    const placed = partPhotos(e, "box");
+    if (placed.length && !text) {
+      // Each order's boxes get that order's photo (photo-only boxes aggregate into one entry).
+      for (const { order, qty } of sourcesOf(e)) {
+        const mine = placed.filter((p) => (p.order_name ?? null) === order);
+        const prepped: Array<{ cols: number; rows: number; hex: string }> = [];
+        for (const p of mine) {
+          const buf = p.attachment_url ? photos.get(p.attachment_url) : undefined;
+          const r = buf ? await prepPhotoRaster(buf, zoneWPt, zoneHPt).catch(() => null) : null;
+          if (r) prepped.push(r);
+        }
+        for (let i = 0; i < qty; i++) {
+          if (prepped.length) cells.push({ kind: "photo", ...prepped[i % prepped.length]! });
+          else cells.push(markerCell(mine.map((p) => p.display_label ?? "photo")));  // still cut, marker kept
+        }
+      }
+      continue;
     }
-    if (!lines.length) { for (let i = 0; i < qtyOf(e); i++) cells.push({ kind: "logozone" }); continue; }
-    const block = weldLinesBlock(lines);
-    if (!block) continue;
-    for (let i = 0; i < qtyOf(e); i++) cells.push({ kind: "text", block });
+    if (placed.length && text) console.warn("[laser] Box has text AND a photo — photo left as a 'photo N' marker.");
+    const lines: string[] = text ? wrapToWidth(text, targetW) : [];
+    for (const p of placed) lines.push(p.display_label ?? "photo");
+    const block = lines.length ? weldLinesBlock(lines) : null;
+    for (let i = 0; i < qtyOf(e); i++) cells.push(block ? { kind: "text", block } : { kind: "plain" });
   }
   return cells;
 }
@@ -626,82 +641,45 @@ function gridDims(): [number, number] {
   return [2 * GRID_MARGIN + GRID_COLS * CELL_W, 2 * GRID_MARGIN + GRID_ROWS * CELL_H];
 }
 
-type BoxOp =
-  | { t: "stroke"; pts: Ring; color: [number, number, number] }
-  | { t: "fill"; geom: MultiPoly; color: [number, number, number] };
-function boxGridPageOps(cells: BoxCell[]): BoxOp[] {
-  const ops: BoxOp[] = [];
+/** Fit a cols x rows photo into the cell's engrave zone; [tx, tyTop, pw, ph] points. */
+function photoZone(cellX: number, cellY: number, cols: number, rows: number): [number, number, number, number] {
+  const sc = PT_SCALE;
   const [cx, cy, wf, hf] = boxTextTarget();
+  const zcx = (cellX + cx * CELL_W) * sc, zcy = (cellY + cy * CELL_H) * sc;
+  const s = Math.min((wf * CELL_W * sc) / cols, (hf * CELL_H * sc) / rows);
+  const pw = cols * s, ph = rows * s;
+  return [zcx - pw / 2, zcy + ph / 2, pw, ph];
+}
+
+function boxGridPageOps(cells: BoxCell[]): LaserOp[] {
+  const ops: LaserOp[] = [];
   cells.forEach((cell, idx) => {
     const col = idx % GRID_COLS, row = Math.floor(idx / GRID_COLS);
     const cellX = GRID_MARGIN + col * CELL_W;
     const cellY = GRID_MARGIN + (GRID_ROWS - 1 - row) * CELL_H;
     for (const { pts, color } of boxTemplateStrokes(cellX, cellY)) ops.push({ t: "stroke", pts, color });
+    // text + VIOLA logo of this box share one colour, cycled by box position.
     const ecolor = BOX_TEXT_COLORS[idx % BOX_TEXT_COLORS.length]!;
     const lg = logoGeom(cellX, cellY);
     if (lg && lg.length) ops.push({ t: "fill", geom: lg, color: ecolor });
     if (cell.kind === "text") {
       const ft = placeTextBox(cell.block, cellX, cellY);
       if (ft) ops.push({ t: "fill", geom: ft, color: ecolor });
-    } else {
-      // photo-zone marker (uploaded logos are imported separately — embedded
-      // rasters engrave faint in RDWorks).
-      const zx0 = cellX + (cx - wf / 2) * CELL_W, zx1 = cellX + (cx + wf / 2) * CELL_W;
-      const zy0 = cellY + (cy - hf / 2) * CELL_H, zy1 = cellY + (cy + hf / 2) * CELL_H;
-      ops.push({ t: "stroke", pts: [[zx0, zy0], [zx1, zy0], [zx1, zy1], [zx0, zy1], [zx0, zy0]], color: ecolor });
+    } else if (cell.kind === "photo") {
+      ops.push({ t: "raster", cols: cell.cols, rows: cell.rows, hex: cell.hex, zone: photoZone(cellX, cellY, cell.cols, cell.rows) });
     }
   });
   return ops;
 }
 
-function rgbToCmyk(c: [number, number, number]): [number, number, number, number] {
-  const [r, g, b] = c;
-  const k = 1 - Math.max(r, g, b);
-  if (k >= 0.9999) return [0, 0, 0, 1];
-  return [(1 - r - k) / (1 - k), (1 - g - k) / (1 - k), (1 - b - k) / (1 - k), k];
-}
-function aiColorCmds(c: [number, number, number]): string {
-  const [cc, m, y, k] = rgbToCmyk(c);
-  const s = `${cc.toFixed(4)} ${m.toFixed(4)} ${y.toFixed(4)} ${k.toFixed(4)}`;
-  return `${s} k\n${s} K`;
-}
-function writeBoxGrid(ops: BoxOp[], totalW: number, totalH: number): string {
-  const sc = PT_SCALE;
-  const W = Math.floor(totalW * sc) + 1, H = Math.floor(totalH * sc) + 1;
-  const head = AI_HEAD
-    .replace("%%BoundingBox:684 -299 1058 579", `%%BoundingBox:0 0 ${W} ${H}`)
-    .replace("%AI5_ArtSize: 612 792 ", `%AI5_ArtSize: ${W} ${H} `);
-  const out: string[] = [head.replace(/\n+$/, ""), "%AI5_BeginLayer", "1 1 1 1 0 0 -1 55 52 53 Lb", "(Layer 1) Ln"];
-  const lw = FRAME_LINE_MM * MM * sc;
-  let last: string | null = null;
-  for (const op of ops) {
-    if (op.t !== "stroke") continue;
-    const key = op.color.join(",");
-    if (key !== last) { out.push(aiColorCmds(op.color)); last = key; }
-    out.push(`0 J 0 j ${lw.toFixed(3)} w []0 d`);
-    const [x0, y0] = op.pts[0]!;
-    out.push(`${(x0 * sc).toFixed(2)} ${(y0 * sc).toFixed(2)} m`);
-    for (let i = 1; i < op.pts.length; i++) { const [x, y] = op.pts[i]!; out.push(`${(x * sc).toFixed(2)} ${(y * sc).toFixed(2)} L`); }
-    out.push("S");
-  }
-  for (const op of ops) {
-    if (op.t !== "fill") continue;
-    if (!op.geom || !op.geom.length) continue;
-    const key = op.color.join(",");
-    if (key !== last) { out.push(aiColorCmds(op.color)); last = key; }
-    for (const poly of op.geom) polyToAi(poly, out);
-  }
-  out.push(AI_TAIL.replace(/\n+$/, ""));
-  return out.join("\n");
-}
-
-/** Build one or more box-grid .ai files (18 boxes/file). Returns latin1 Buffers. */
-export async function buildBoxGridBuffers(entries: AiEntry[]): Promise<Buffer[]> {
+/** Build one or more box-grid .ai files (18 boxes/file). photos: attachment_url ->
+ *  bytes of the customers' box photos (engraved; a missing one keeps its marker). */
+export async function buildBoxGridBuffers(entries: AiEntry[], photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
-  const contents = boxCellContents(entries);
+  const contents = await boxCellContents(entries as LaserEntry[], photos);
   if (!contents.length) return [];
   const pages: BoxCell[][] = [];
   for (let i = 0; i < contents.length; i += CELLS_PER_FILE) pages.push(contents.slice(i, i + CELLS_PER_FILE));
   const [totalW, totalH] = gridDims();
-  return pages.map((page) => Buffer.from(writeBoxGrid(boxGridPageOps(page), totalW, totalH), "latin1"));
+  return pages.map((page) => writeLaserAi(boxGridPageOps(page), totalW, totalH));
 }
