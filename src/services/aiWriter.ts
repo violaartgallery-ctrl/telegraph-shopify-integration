@@ -31,7 +31,7 @@ export interface AiEntry {
 }
 import { ARABIC_FONT_B64, LATIN_FONT_B64 } from "./fontsData.js";
 import { BOX_TEMPLATE } from "./boxAssets.js";
-import { type LaserOp, writeLaserAi } from "./laser/laserCore.js";
+import { cappedFiles, type LaserOp } from "./laser/laserCore.js";
 import { burnShare, prepPhotoRaster } from "./laser/laserPhoto.js";
 import { cleanText, entryPieces, type LaserEntry, partFields, partPhotos, sourcesOf } from "./laser/laserRouting.js";
 
@@ -579,6 +579,16 @@ function loadLogoVector(): MultiPoly | null {
   }
   return LOGO_GEOM;
 }
+/** The VIOLA wordmark (mm) in place of a factory deer logo with these bounds
+ *  (owner, 2026-11-01: every piece carries the gift boxes' logo): as wide as the
+ *  deer logo, centred on it, on its baseline; turned 180 degrees where the deer
+ *  logo is upside down on its piece (the purse's, read from the far side). */
+export function wordmarkIn([x0, y0, x1, y1]: [number, number, number, number], upright = true): MultiPoly | null {
+  const base = loadLogoVector();
+  if (!base) return null;
+  const w = x1 - x0, h = w / BOX_TEMPLATE.logo_aspect;
+  return upright ? translateXY(scaleXY(base, w, h), x0, y0) : translateXY(scaleXY(base, -w, -h), x1, y1);
+}
 function logoGeom(cellX: number, cellY: number): MultiPoly | null {
   const base = loadLogoVector();
   const z = BOX_TEMPLATE.logo_zone;
@@ -683,8 +693,11 @@ export async function buildBoxGridBuffers(entries: AiEntry[], photos: Map<string
   await ensureHB();
   const contents = await boxCellContents(entries as LaserEntry[], photos);
   if (!contents.length) return [];
-  const pages: BoxCell[][] = [];
-  for (let i = 0; i < contents.length; i += CELLS_PER_FILE) pages.push(contents.slice(i, i + CELLS_PER_FILE));
   const [totalW, totalH] = gridDims();
-  return pages.map((page) => writeLaserAi(boxGridPageOps(page), totalW, totalH));
+  const paginate = (cells: BoxCell[]) => {
+    const pages: BoxCell[][] = [];
+    for (let i = 0; i < cells.length; i += CELLS_PER_FILE) pages.push(cells.slice(i, i + CELLS_PER_FILE));
+    return pages;
+  };
+  return cappedFiles(contents, paginate, (page) => page, async (page) => [boxGridPageOps(page), totalW, totalH]);
 }

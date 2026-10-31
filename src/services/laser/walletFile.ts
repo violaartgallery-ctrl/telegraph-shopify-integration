@@ -10,12 +10,11 @@
  * The decorated wallet's face is all pattern, so it only takes pocket writing.
  * Each leather colour starts its own row, up to 25 wallets per file.
  */
-import { ensureHB } from "../aiWriter.js";
-import { BOX_TEMPLATE } from "../boxAssets.js";
+import { ensureHB, wordmarkIn } from "../aiWriter.js";
 import { WALLET_TEMPLATE } from "./laserAssets.js";
 import {
-  bounds, contoursGeom, CUT, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE, type RGB, scale, TAN,
-  TITLE_GAP_MM, TITLE_H_MM, translate, writeLaserAi,
+  bounds, cappedFiles, contoursGeom, CUT, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE, type RGB, scale, TAN,
+  TITLE_GAP_MM, TITLE_H_MM, translate,
 } from "./laserCore.js";
 import { pickDesign, prepPhotoRaster } from "./laserPhoto.js";
 import { BOX_STRIP, entryColor, entryPieces, type LaserEntry, type LaserPhoto, partFields, partPhotos, type Piece, sourcesOf } from "./laserRouting.js";
@@ -44,18 +43,12 @@ export const WALLET_ZONES: Record<string, Zone> = {
 const HINT_RE = /^\s*(?:ف|في)\s*(النص|الطرف)\s*[(:]?\s*/;
 
 const geoms = new Map<string, MultiPoly | null>();
-/** The template's band (mm); "logo" is the gift boxes' VIOLA wordmark (owner,
- *  2026-11-01) in place of the factory's deer logo: as wide as the deer logo,
- *  centred where it was, on its baseline. */
+/** The template's band (mm); "logo" is the gift boxes' VIOLA wordmark where the
+ *  factory's deer logo was. */
 export function templateGeom(key: "band" | "logo"): MultiPoly | null {
   if (!geoms.has(key)) {
-    if (key === "band") geoms.set(key, contoursGeom(WALLET_TEMPLATE.lines_band.contours));
-    else {
-      const [x0, y0, x1] = WALLET_TEMPLATE.logo as number[];
-      const w = x1! - x0!, h = w / BOX_TEMPLATE.logo_aspect;
-      const base = contoursGeom(BOX_TEMPLATE.logo_contours as number[][][]);
-      geoms.set(key, base && base.map((poly) => poly.map((ring) => ring.map(([x, y]) => [x0! + x * w, y0! + y * h] as [number, number]))));
-    }
+    geoms.set(key, key === "band" ? contoursGeom(WALLET_TEMPLATE.lines_band.contours)
+      : wordmarkIn(WALLET_TEMPLATE.logo as [number, number, number, number]));
   }
   return geoms.get(key)!;
 }
@@ -222,11 +215,9 @@ export async function zoneOps(
 export async function buildWalletFiles(entries: LaserEntry[], photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
   const its = (await items(entries, photos)).sort((a, b) => MODEL_ORDER.indexOf(a.model) - MODEL_ORDER.indexOf(b.model));
-  const pages = pagesByColour(its, MAX_COLS, MAX_ROWS, PER_FILE);
   const [setW, setH] = WALLET_TEMPLATE.size as [number, number];
   const rowH = setH + TITLE_GAP_MM + TITLE_H_MM;
-  const out: Buffer[] = [];
-  for (const rows of pages) {
+  return cappedFiles(its, (part) => pagesByColour(part, MAX_COLS, MAX_ROWS, PER_FILE), (rows) => rows.flat(), async (rows) => {
     const cols = Math.max(...rows.map((r) => r.length));
     const totalW = (2 * MARGIN_MM + cols * setW + (cols - 1) * GAP_MM) * MM;
     const totalH = (2 * MARGIN_MM + rows.length * rowH + (rows.length - 1) * GAP_MM) * MM;
@@ -235,7 +226,6 @@ export async function buildWalletFiles(entries: LaserEntry[], photos: Map<string
       ops.push(...(await walletOps(rows[r]![c]!, MARGIN_MM + c * (setW + GAP_MM),
         MARGIN_MM + (rows.length - 1 - r) * (rowH + GAP_MM))));
     }
-    out.push(writeLaserAi(ops, totalW, totalH));
-  }
-  return out;
+    return [ops, totalW, totalH];
+  });
 }

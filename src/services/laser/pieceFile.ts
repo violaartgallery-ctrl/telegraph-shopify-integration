@@ -2,19 +2,21 @@
  * Passport holder, purse (بورتفيه) and purse box laser files, laid out like the
  * factory's daily production files passport.rld, port sada.rld, port mandila.rld
  * and box port.rld (port of piece_writer.py). Each set is the factory's set (stitch
- * holes, cut lines, decorated pattern; traced deer logo, knot band, mandala) with
- * a "1 X <PRODUCT> <COLOUR>" title and each customisation where the factory puts it:
+ * holes, cut lines, decorated pattern; traced knot band, mandala), the gift boxes'
+ * VIOLA wordmark where its deer logo was, a "1 X <PRODUCT> <COLOUR>" title and each
+ * customisation where the factory puts it:
  *   passport  برا شمال / برا يمين: middle of the cover's left / right half (knot:
  *             bottom corners under the band; decorated: none); جوا شمال / يمين: inside
  *   purse     برا: centred low on the cover (mandala: bottom right corner); جوا: the
  *             inner pocket's bottom right
  *   purse box the writing / photo centred above the logo
  */
-import { ensureHB } from "../aiWriter.js";
+import * as polygonClippingNs from "polygon-clipping";
+import { ensureHB, wordmarkIn } from "../aiWriter.js";
 import { PIECE_TEMPLATES } from "./laserAssets.js";
 import {
-  BED_H_MM, BED_W_MM, bounds, contoursGeom, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, type RGB, scale,
-  TAN, TITLE_GAP_MM, TITLE_H_MM, translate, writeLaserAi,
+  BED_H_MM, BED_W_MM, bounds, cappedFiles, contoursGeom, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, type RGB, scale,
+  TAN, TITLE_GAP_MM, TITLE_H_MM, translate,
 } from "./laserCore.js";
 import { entryColor, entryPieces, type LaserEntry, partFields, sourcesOf } from "./laserRouting.js";
 import { titleGeom, type Zone } from "./laserText.js";
@@ -59,12 +61,37 @@ const MODEL_ORDER: Record<PieceProduct, string[]> = {
 };
 const DEFAULT_TITLE: Record<PieceProduct, string> = { passport: "Cover passport", purse: "Purse", purse_box: "Gift purse box" };
 
+const pc: typeof polygonClippingNs =
+  (polygonClippingNs as unknown as { default?: typeof polygonClippingNs }).default ?? polygonClippingNs;
+
 const fills = new Map<string, MultiPoly | null>();
+/** A traced bitmap of the template (mm), its contours combined even-odd; the deer
+ *  "logo" becomes the VIOLA wordmark in its place. */
 function fillGeom(product: PieceProduct, model: string, key: string): MultiPoly | null {
   const k = `${product}/${model}/${key}`;
-  if (!fills.has(k)) fills.set(k, contoursGeom(PIECE_TEMPLATES[product][model].fills[key] ?? []));
+  if (!fills.has(k)) {
+    const g = contoursGeom(PIECE_TEMPLATES[product][model].fills[key] ?? []);
+    fills.set(k, key === "logo" && g ? wordmarkIn(bounds(g), upright(g)) : g);
+  }
   return fills.get(k)!;
 }
+
+/** The deer logo stands upright when its wide letters are at the bottom and the
+ *  narrow antlers on top (the purse's is upside down). */
+function upright(deer: MultiPoly): boolean {
+  const [x0, y0, x1, y1] = bounds(deer);
+  const band = 0.15 * (y1 - y0);
+  const width = (ya: number, yb: number) => {
+    const part = pc.intersection(deer, [[[[x0, ya], [x1, ya], [x1, yb], [x0, yb], [x0, ya]]]]) as MultiPoly;
+    if (!part.length) return 0;
+    const [a, , b] = bounds(part);
+    return b - a;
+  };
+  return width(y0, y0 + band) > width(y1 - band, y1);
+}
+
+/** The wordmark placed where this set's deer logo was (for the tests). */
+export const pieceLogo = (product: PieceProduct, model: string) => fillGeom(product, model, "logo");
 
 export function pieceModel(product: PieceProduct, e: LaserEntry): string {
   const p = (e.display_product || "").toLowerCase();
@@ -85,7 +112,7 @@ export function pieceZoneFor(product: PieceProduct, model: string, label: unknow
   const s = String(label ?? "");
   const side = s.includes("جوا") || s.includes("جوه") ? "جوا" : s.includes("برا") || s.includes("بره") ? "برا" : null;
   let zone: string | null;
-  if (product === "purse") zone = side === "جوا" ? "inner" : side === "برا" ? "cover" : null;
+  if (product === "purse") zone = side === "جوا" ? "inner" : "cover";   // no side named ("البورتوفيه", "الوش"): the cover
   else {
     const lr = s.includes("يمي") ? "يمين" : s.includes("شمال") ? "شمال" : null;
     zone = side === "جوا" ? (lr === "يمين" ? "inner_right" : "inner_left")
@@ -169,8 +196,7 @@ export async function buildPieceFiles(product: PieceProduct, entries: LaserEntry
   const order = MODEL_ORDER[product];
   const its = (await items(product, entries, photos)).sort((a, b) => order.indexOf(a.model) - order.indexOf(b.model));
   const [cellW, cellH, maxCols, maxRows] = pieceCell(product);
-  const out: Buffer[] = [];
-  for (const rows of pagesByColour(its, maxCols, maxRows)) {
+  return cappedFiles(its, (part) => pagesByColour(part, maxCols, maxRows), (rows) => rows.flat(), async (rows) => {
     const cols = Math.max(...rows.map((r) => r.length));
     const totalW = (2 * MARGIN_MM + cols * cellW + (cols - 1) * GAP_MM) * MM;
     const totalH = (2 * MARGIN_MM + rows.length * cellH + (rows.length - 1) * GAP_MM) * MM;
@@ -178,7 +204,6 @@ export async function buildPieceFiles(product: PieceProduct, entries: LaserEntry
     for (let r = 0; r < rows.length; r++) for (let c = 0; c < rows[r]!.length; c++) {
       ops.push(...(await setOps(rows[r]![c]!, MARGIN_MM + c * (cellW + GAP_MM), MARGIN_MM + (rows.length - 1 - r) * (cellH + GAP_MM))));
     }
-    out.push(writeLaserAi(ops, totalW, totalH));
-  }
-  return out;
+    return [ops, totalW, totalH];
+  });
 }

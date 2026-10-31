@@ -66,7 +66,8 @@ export function isBox(e: LaserEntry): boolean {
 
 export function labelPart(label: unknown): "bag_tag" | "keychain" | "box" | "body" | "" {
   const s = String(label ?? "").trim().toLowerCase();
-  if (s.includes("bag tag") || s.split(/\s+/).includes("tag")) return "bag_tag";
+  const words = s.split(/\s+/);
+  if (s.includes("bag tag") || words.includes("tag") || words.includes("تاج")) return "bag_tag";   // "باج تاج"
   if (s.includes("ميدالي") || s.includes("keychain")) return "keychain";
   if (s.includes("بوكس") || s.includes("box") || s === "message") return "box";
   if (["برا", "بره", "جوا", "جوه", "محفظ"].some((k) => s.includes(k))) return "body";

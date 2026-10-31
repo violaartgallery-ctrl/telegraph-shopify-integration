@@ -11,7 +11,7 @@ import { ensureHB } from "../aiWriter.js";
 import { KEYCHAIN_TEMPLATE } from "./laserAssets.js";
 import {
   CUT, type LaserOp, MM, pagesByColour, PT_SCALE, type RGB, rotate180, TAN, TITLE_GAP_MM, TITLE_H_MM, translate,
-  writeLaserAi, bounds,
+  bounds, cappedFiles,
 } from "./laserCore.js";
 import { prepPhotoRaster } from "./laserPhoto.js";
 import { cleanText, entryColor, entryPieces, type LaserEntry, partFields, partPhotos, sourcesOf } from "./laserRouting.js";
@@ -123,11 +123,6 @@ async function pageOps(rows: Item[][]): Promise<[LaserOp[], number, number]> {
 /** Medallion files, up to 15 medallions each. photos: attachment_url -> bytes. */
 export async function buildKeychainFiles(entries: LaserEntry[], photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
-  const pages = pagesByColour(items(entries, photos), MAX_COLS, MAX_ROWS, PER_FILE);
-  const out: Buffer[] = [];
-  for (const rows of pages) {
-    const [ops, w, h] = await pageOps(rows);
-    out.push(writeLaserAi(ops, w, h));
-  }
-  return out;
+  return cappedFiles(items(entries, photos), (part) => pagesByColour(part, MAX_COLS, MAX_ROWS, PER_FILE),
+    (rows) => rows.flat(), pageOps);
 }

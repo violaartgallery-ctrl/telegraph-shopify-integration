@@ -111,6 +111,28 @@ function emitXiRaster(out: string[], cols: number, rows: number, hex: string, zo
 }
 
 /** The draw ops as a real .ai file: strokes, then fills, then rasters. */
+// Telegram takes documents up to 50 MB and an engraved photo is ~5-8 MB of hex, so a
+// page whose photos pass this is split in two and laid out again.
+export const LIMITS = { maxRasterBytes: 35_000_000 };
+
+/** The .ai files of `items`, paginated by `paginate`, any page heavy with engraved
+ *  photos split in two so every file stays sendable (ai_writer._capped_pages). */
+export async function cappedFiles<T, P>(items: T[], paginate: (items: T[]) => P[], itemsOf: (page: P) => T[],
+  pageOps: (page: P) => Promise<[LaserOp[], number, number]>): Promise<Buffer[]> {
+  const out: Buffer[] = [];
+  for (const page of paginate(items)) {
+    const [ops, totalW, totalH] = await pageOps(page);
+    const its = itemsOf(page);
+    const rasterBytes = ops.reduce((n, op) => n + (op.t === "raster" ? op.hex.length : 0), 0);
+    if (its.length > 1 && rasterBytes > LIMITS.maxRasterBytes) {
+      const half = Math.floor(its.length / 2);
+      out.push(...await cappedFiles(its.slice(0, half), paginate, itemsOf, pageOps));
+      out.push(...await cappedFiles(its.slice(half), paginate, itemsOf, pageOps));
+    } else out.push(writeLaserAi(ops, totalW, totalH));
+  }
+  return out;
+}
+
 export function writeLaserAi(ops: LaserOp[], totalW: number, totalH: number): Buffer {
   const sc = PT_SCALE;
   const W = Math.floor(totalW * sc) + 1, H = Math.floor(totalH * sc) + 1;

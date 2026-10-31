@@ -6,13 +6,14 @@
  */
 import assert from "node:assert/strict";
 import Jimp from "jimp";
-import { buildBoxGridBuffers } from "../services/aiWriter.js";
+import { buildBoxGridBuffers, wordmarkIn } from "../services/aiWriter.js";
 import { buildKeychainFiles } from "../services/laser/keychainFile.js";
-import { BED_H_MM, BED_W_MM } from "../services/laser/laserCore.js";
+import { BED_H_MM, BED_W_MM, LIMITS } from "../services/laser/laserCore.js";
 import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
 import { pickDesign, prepPhotoRaster } from "../services/laser/laserPhoto.js";
 import { bundleLeftover, entryPieces, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
-import { buildPieceFiles, pieceCell } from "../services/laser/pieceFile.js";
+import { buildPieceFiles, pieceCell, pieceLogo, pieceZoneFor } from "../services/laser/pieceFile.js";
+import { PIECE_TEMPLATES } from "../services/laser/laserAssets.js";
 import { buildWalletFiles, templateGeom } from "../services/laser/walletFile.js";
 import { BOX_TEMPLATE } from "../services/boxAssets.js";
 import { WALLET_TEMPLATE } from "../services/laser/laserAssets.js";
@@ -64,6 +65,14 @@ await test("travel set: passport takes its fields, the bag tag goes to the line-
   assert.equal(bundleLeftover(e)?.photo_numbers?.[0]?.position_label, "Bag tag لوجو");
 });
 
+await test("unusual labels still find their place: a purse photo with no side, an Arabic bag tag", () => {
+  assert.equal(pieceZoneFor("purse", "blank", "الوش"), "cover");
+  assert.equal(pieceZoneFor("purse", "mandala", "البورتفيه"), "cover");
+  assert.equal(pieceZoneFor("purse", "blank", "جوا"), "inner");
+  const e = entry("The Leather Travel Set", [], 1, [{ position_label: "باج تاج", display_label: "photo 1", order_name: "#1" }]);
+  assert.equal(bundleLeftover(e)?.photo_numbers?.[0]?.position_label, "باج تاج");
+});
+
 await test("photos engrave solid black/white in UPPERCASE hex", async () => {
   const r = await prepPhotoRaster(await blackSquarePng(), 200, 100);
   assert.ok(r);
@@ -99,6 +108,21 @@ await test("a plain box is still cut, with no marker frame; a box photo is engra
   assert.deepEqual(await buildBoxGridBuffers([entry("Gift purse box", [["كتابة علي المنتج", "Mama"]])] as never), []);
 });
 
+await test("a file heavy with photos is split so Telegram can take it", async () => {
+  const urls = ["https://cdn.example/1.png", "https://cdn.example/2.png", "https://cdn.example/3.png"];
+  const box = entry("Gift box", [], 3, urls.map((u, i) => ({ position_label: "كتابه علي البوكس", display_label: `photo ${i + 1}`,
+    order_name: `#${i + 1}`, attachment_url: u })));
+  box.source_orders = urls.map((_u, i) => ({ order_name: `#${i + 1}`, remaining_quantity: 1 }));
+  const png = await blackSquarePng();
+  const photos = new Map(urls.map((u) => [u, png]));
+  const [whole] = await buildBoxGridBuffers([box] as never, photos);
+  const one = (text(whole!).match(/^%[0-9A-F]+$/gm) ?? []).join("").length / 3;
+  const old = LIMITS.maxRasterBytes;
+  LIMITS.maxRasterBytes = Math.floor(one * 1.5);       // room for one photo per file
+  try { assert.equal((await buildBoxGridBuffers([box] as never, photos)).length, 3); }
+  finally { LIMITS.maxRasterBytes = old; }
+});
+
 await test("medallions: plain ones included, 15 per file", async () => {
   const files = await buildKeychainFiles([entry("Photo keychain", [], 16)]);
   assert.equal(files.length, 2);
@@ -116,6 +140,19 @@ await test("the wallet logo is the gift boxes' VIOLA wordmark, where the deer lo
   const [minx, miny, maxx, maxy] = bounds(templateGeom("logo")!);
   assert.ok(Math.abs(minx - x0!) < 0.05 && Math.abs(miny - y0!) < 0.05 && Math.abs(maxx - x1!) < 0.05);
   assert.ok(Math.abs((maxx - minx) / (maxy - miny) - BOX_TEMPLATE.logo_aspect) < 0.01);
+});
+
+await test("passports, purses and purse boxes carry the VIOLA wordmark; the purse's is turned over", () => {
+  for (const [product, model, upright] of [["passport", "blank", true], ["passport", "knot", true],
+    ["purse", "mandala", false], ["purse_box", "plain", true]] as const) {
+    const pts = (PIECE_TEMPLATES[product][model].fills.logo as number[][][]).flat();
+    const deer: [number, number, number, number] = [Math.min(...pts.map((p) => p[0]!)), Math.min(...pts.map((p) => p[1]!)),
+      Math.max(...pts.map((p) => p[0]!)), Math.max(...pts.map((p) => p[1]!))];
+    const got = bounds(pieceLogo(product, model)!);
+    const want = bounds(wordmarkIn(deer, upright)!);
+    got.forEach((v, i) => assert.ok(Math.abs(v - want[i]!) < 0.05, `${product}/${model}`));
+    assert.ok(upright ? Math.abs(got[1] - deer[1]) < 0.05 : Math.abs(got[3] - deer[3]) < 0.05, `${product}/${model} baseline`);
+  }
 });
 
 await test("passport / purse / purse box sets fit the 1400 x 900 bed", async () => {
