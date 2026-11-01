@@ -131,6 +131,10 @@ model FailedPayload {
   payloadJson String
   headersJson String?
   createdAt   DateTime @default(now())
+
+  // Job state, scheduler lanes and bot control are read by (source, reason)
+  // with ORDER BY id DESC; without this every lookup scans the whole table.
+  @@index([source, reason, id])
 }
 
 model LocationCatalogSnapshot {
