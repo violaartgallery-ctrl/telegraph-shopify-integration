@@ -250,20 +250,33 @@ export async function sendCompleteProductionPreview(options: {
   const boxAlreadyComplete = Boolean(
     savedManifest && indexedArtifactsConfirmedForAll(cursor, 'box', savedManifest.boxFileCount)
   );
-  let laserFiles: Buffer[] | null = null;
+  let laserFiles: Array<{ buffer: Buffer; kind: string; label: string }> | null = null;
   let boxFiles: Buffer[] | null = null;
 
   if (!laserAlreadyComplete || !boxAlreadyComplete) {
-    const { buildAiBuffers, buildBoxGridBuffers } = await import('./aiWriter.js');
+    const { buildBoxGridBuffers } = await import('./aiWriter.js');
+    const { buildLaserArtifacts, laserPhotoUrls } = await import('./laser/laserFiles.js');
+    const { printPhotoSourceUrl } = await import('./printSheet.js');
+    const entries = data.productionEntries as unknown as import('./laser/laserRouting.js').LaserEntry[];
+    // Customer photos placed ON a piece are engraved; one that can't be read keeps
+    // its "photo N" marker on the piece instead of failing the batch.
+    const laserPhotos = new Map<string, Buffer>();
+    for (const url of laserPhotoUrls(entries)) {
+      assertTime(deadline, 'باقي تحميل صور ملفات الليزر');
+      try {
+        laserPhotos.set(url, await fetchBinary(printPhotoSourceUrl(url), deadline));
+      } catch (error) {
+        if (error instanceof SoftDeadlineError) throw error;
+        console.warn(`[laser] photo not placed, marker kept: ${url.slice(0, 120)} (${String(error)})`);
+      }
+    }
     if (!laserAlreadyComplete) {
-      const linearEntries = data.productionEntries.filter((entry) => !isBoxEntry(entry));
-      laserFiles = linearEntries.length
-        ? await buildAiBuffers(linearEntries as never, { maxBytes: 1_500_000 })
-        : [];
+      laserFiles = await buildLaserArtifacts(entries, laserPhotos, { maxBytes: 1_500_000 });
     }
     if (!boxAlreadyComplete) {
-      const boxEntries = data.productionEntries.filter(isBoxEntry);
-      boxFiles = boxEntries.length ? await buildBoxGridBuffers(boxEntries as never) : [];
+      boxFiles = data.productionEntries.some(isBoxEntry)
+        ? await buildBoxGridBuffers(data.productionEntries as never, laserPhotos)
+        : [];
     }
   }
 
@@ -287,13 +300,15 @@ export async function sendCompleteProductionPreview(options: {
 
   if (laserFiles) {
     for (let index = 0; index < laserFiles.length; index += 1) {
-      const buffer = laserFiles[index]!;
+      const { buffer, kind, label } = laserFiles[index]!;
+      const ofKind = laserFiles.filter((f) => f.kind === kind);
+      const n = ofKind.indexOf(laserFiles[index]!) + 1;
       await sendArtifactToAll({
         cursor,
         artifactKey: `laser:${index + 1}:${cursor.sourceFingerprint}`,
         buffer,
-        filename: `laser_${date}_${batchName}_${index + 1}.ai`,
-        caption: `ملف الليزر ${index + 1}/${laserFiles.length} 🔪`,
+        filename: `${kind}_${date}_${batchName}_${n}.ai`,
+        caption: `${label} ${n}/${ofKind.length} 🔪`,
         deadline,
         checkpoint,
       });

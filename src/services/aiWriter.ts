@@ -13,7 +13,7 @@ import * as polygonClippingNs from "polygon-clipping";
 // dynamic import() (works for ESM from CJS) and cache the module.
 type HBModule = typeof import("harfbuzzjs");
 let HB: HBModule | null = null;
-async function ensureHB(): Promise<HBModule> {
+export async function ensureHB(): Promise<HBModule> {
   if (!HB) HB = await import("harfbuzzjs");
   return HB;
 }
@@ -30,7 +30,12 @@ export interface AiEntry {
   photo_numbers?: Array<{ position_label?: string | null; display_label?: string }>;
 }
 import { ARABIC_FONT_B64, LATIN_FONT_B64 } from "./fontsData.js";
-import { BOX_TEMPLATE, AI_HEAD, AI_TAIL } from "./boxAssets.js";
+import { BOX_TEMPLATE } from "./boxAssets.js";
+import { cappedFiles, type LaserOp, TRACED_BYTES_PER_POINT } from "./laser/laserCore.js";
+import { burnShare, type PreppedRaster, prepPhotoRaster, traceRaster } from "./laser/laserPhoto.js";
+import {
+  cleanText, entryPieces, HEARTS, INFINITY, type LaserEntry, partFields, partPhotos, SKIP_CHARS, sourcesOf,
+} from "./laser/laserRouting.js";
 
 type Ring = [number, number][];
 type Poly = Ring[];
@@ -46,12 +51,6 @@ const BEZIER_STEPS = 6;
 
 const COLOR_VALUE: [number, number, number] = [0, 0, 0];
 const COLOR_REF: [number, number, number] = [0, 0, 1];
-
-const HEARTS = new Set([
-  "❤", "♥", "🤍", "💙", "💚", "💛", "🧡", "💜", "🖤", "🤎",
-  "💖", "💗", "💞", "💓", "💕", "💟",
-]);
-const SKIP_CHARS = new Set(["️", "︎", "‍"]);
 
 // ── Fonts ───────────────────────────────────────────────────────────────────
 interface FB { face: Face; font: Font; upem: number; }
@@ -74,11 +73,14 @@ function fonts(): [FB, FB] {
 
 // ── Script segmentation ───────────────────────────────────────────────────────
 function isArabic(ch: string): boolean {
+  // Presentation forms A and B only: U+FE00-FE6F holds the emoji variation
+  // selectors, which made "2026/11/5♥️" a right-to-left line (heart on the left).
   const c = ch.codePointAt(0)!;
-  return (c >= 0x0600 && c <= 0x06ff) || (c >= 0xfb50 && c <= 0xfeff) || (c >= 0x0750 && c <= 0x077f);
+  return (c >= 0x0600 && c <= 0x06ff) || (c >= 0x0750 && c <= 0x077f) || (c >= 0xfb50 && c <= 0xfdff)
+    || (c >= 0xfe70 && c <= 0xfeff);
 }
 
-type Kind = "ar" | "lat" | "num" | "heart";
+type Kind = "ar" | "lat" | "num" | "heart" | "inf";
 function splitRuns(text: string): Array<{ text: string; kind: Kind }> {
   // Digits get their own LTR run so "40" never reverses to "04" inside RTL
   // Arabic; neutral chars (space/punct) stick to the current run.
@@ -92,6 +94,7 @@ function splitRuns(text: string): Array<{ text: string; kind: Kind }> {
   for (const ch of text) {
     if (SKIP_CHARS.has(ch)) continue;
     if (HEARTS.has(ch)) { flush(); runs.push({ text: ch, kind: "heart" }); continue; }
+    if (ch === INFINITY) { flush(); runs.push({ text: ch, kind: "inf" }); continue; }
     let k: Kind;
     if (/\d/.test(ch)) k = "num";
     else if (isArabic(ch)) k = "ar";
@@ -184,6 +187,20 @@ function heartGeom(left: number, baseline: number, height: number): { geom: Mult
   return { geom: [[ring]], width: (maxx - minx) * scale };
 }
 
+/** "∞" (no glyph in either font): two loops joined side by side, centred on the
+ *  heart's height. */
+function infinityGeom(left: number, baseline: number): { geom: MultiPoly; width: number } {
+  const ry = EM * 0.22, rx = EM * 0.26, t = EM * 0.075, cy = baseline + EM * 0.31;
+  const ellipse = (cx: number, ax: number, ay: number): Ring =>
+    Array.from({ length: 48 }, (_, i) => {
+      const a = (2 * Math.PI * i) / 48;
+      return [cx + ax * Math.cos(a), cy + ay * Math.sin(a)] as [number, number];
+    });
+  const loop = (cx: number): Poly => [ellipse(cx, rx, ry), ellipse(cx, rx - t, ry - t)];
+  const c1 = left + rx, c2 = left + 3 * rx - t;
+  return { geom: pc.union(loop(c1), loop(c2)) as MultiPoly, width: 4 * rx - t };
+}
+
 function shapeRun(fb: FB, text: string): Array<{ g: number; ax: number; xo: number; yo: number }> {
   const buf = new HB!.Buffer();
   buf.addText(text);
@@ -194,7 +211,7 @@ function shapeRun(fb: FB, text: string): Array<{ g: number; ax: number; xo: numb
   }));
 }
 
-function weldLine(text: string, baseline: number): { geom: MultiPoly | null; width: number } {
+export function weldLine(text: string, baseline: number): { geom: MultiPoly | null; width: number } {
   const [ara, lat] = fonts();
   const geoms: MultiPoly[] = [];
   let penX = 0;
@@ -207,6 +224,12 @@ function weldLine(text: string, baseline: number): { geom: MultiPoly | null; wid
       const h = heartGeom(penX, baseline, EM * 0.62);
       geoms.push(h.geom);
       penX += h.width + EM * 0.12;
+      continue;
+    }
+    if (kind === "inf") {
+      const g = infinityGeom(penX, baseline);
+      geoms.push(g.geom);
+      penX += g.width + EM * 0.12;
       continue;
     }
     const fb = kind === "ar" || kind === "num" ? ara : lat;
@@ -481,15 +504,14 @@ const MM = 72.0 / (PT_SCALE * 25.4);            // font units per millimetre
 const CELL_W = CELL_W_MM * MM;
 const CELL_H = CELL_H_MM * MM;
 const GRID_MARGIN = 10.0 * MM;
-const FRAME_LINE_MM = 0.2;
-const CELL_LINE_GAP = Math.round(EM * 2.0);
+const LINE_GAP = Math.round(EM * 0.25);         // between one line's lowest point and the next one's highest
+const MIN_PITCH = Math.round(EM * 1.1);         // baseline to baseline, at least
 const COLOR_RED: [number, number, number] = [1, 0, 0];
 const BOX_CUT: [number, number, number] = [0, 0, 0];
 const BOX_TEXT_COLORS: Array<[number, number, number]> = [
   [0.0, 0.50, 0.0], [1.0, 0.50, 0.0], [1.0, 0.45, 0.70], [0.50, 0.10, 0.80],
   [0.50, 0.80, 0.10], [0.0, 0.60, 0.60], [0.85, 0.10, 0.50], [0.30, 0.30, 1.0], [0.60, 0.40, 0.0],
 ];
-const BOX_STRIP = new Set(['"', "'", "«", "»", "“", "”", "‘", "’", "(", ")", "[", "]", "{", "}"]);
 
 function geomBounds(g: MultiPoly): [number, number, number, number] {
   let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
@@ -510,18 +532,57 @@ function boxTextTarget(): [number, number, number, number] {
   return [(z.x0 + z.x1) / 2, (z.y0 + z.y1) / 2, z.x1 - z.x0, z.y1 - z.y0];
 }
 
-function textWidth(text: string): number {
+export function textWidth(text: string): number {
   const [ara, lat] = fonts();
   let w = 0;
   for (const { text: run, kind } of splitRuns(text)) {
     if (kind === "heart") { w += EM * 0.62 + EM * 0.12; continue; }
+    if (kind === "inf") { w += infinityGeom(0, 0).width + EM * 0.12; continue; }
     const fb = kind === "ar" || kind === "num" ? ara : lat;
     const scale = ara.upem / fb.upem;
     for (const gl of shapeRun(fb, run)) { if (gl.g === 0) continue; w += gl.ax * scale; }
   }
   return w;
 }
-function wrapToWidth(text: string, targetW: number): string[] {
+
+/** `text` in exactly n lines (fewer when it has fewer words) of the most even
+ *  width: the widest line as narrow as it can be. With at least 2 words a line,
+ *  no word is ever left alone on a line (owner, 2026-11-01). */
+export function balancedLines(text: string, n: number): string[] {
+  const words = (text || "").split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const k = Math.min(Math.max(1, n), words.length);
+  if (k === 1) return [words.join(" ")];
+  const minWords = words.length >= 2 * k ? 2 : 1;
+  const widths = new Map<string, number>();
+  const w = (i: number, j: number) => {
+    const key = `${i},${j}`;
+    if (!widths.has(key)) widths.set(key, textWidth(words.slice(i, j).join(" ")));
+    return widths.get(key)!;
+  };
+  const W = words.length;
+  // best[l][j]: the narrowest widest-line for the first j words in l lines
+  const best: number[][] = Array.from({ length: k + 1 }, () => new Array(W + 1).fill(Infinity));
+  const cut: number[][] = Array.from({ length: k + 1 }, () => new Array(W + 1).fill(-1));
+  best[0]![0] = 0;
+  for (let l = 1; l <= k; l++) {
+    for (let j = l * minWords; j <= W; j++) {
+      for (let i = (l - 1) * minWords; i <= j - minWords; i++) {
+        if (best[l - 1]![i] === Infinity) continue;
+        const v = Math.max(best[l - 1]![i]!, w(i, j));
+        if (v < best[l]![j]!) { best[l]![j] = v; cut[l]![j] = i; }
+      }
+    }
+  }
+  const lines: string[] = [];
+  for (let l = k, j = W; l > 0; l--) {
+    const i = cut[l]![j]!;
+    lines.unshift(words.slice(i, j).join(" "));
+    j = i;
+  }
+  return lines;
+}
+export function wrapToWidth(text: string, targetW: number): string[] {
   const words = (text || "").split(/\s+/).filter(Boolean);
   if (!words.length) return [];
   const lines: string[] = [];
@@ -533,22 +594,41 @@ function wrapToWidth(text: string, targetW: number): string[] {
   if (cur) lines.push(cur);
   return lines;
 }
-function weldLinesBlock(lines: string[]): MultiPoly | null {
-  const placed: Array<{ g: MultiPoly; y: number; w: number }> = [];
-  let y = 0;
-  for (const ln of lines) {
+/** Lines stacked top to bottom, each centred. The line pitch is the same for every
+ *  line: the deepest pair of neighbours (one's lowest point to the next one's
+ *  highest) plus LINE_GAP, at least MIN_PITCH - close, never touching. */
+export function weldLinesBlock(lines: string[]): MultiPoly | null {
+  const welded = lines.map((ln) => {
     const { geom } = weldLine(ln, 0);
-    if (geom && geom.length) { const b = geomBounds(geom); placed.push({ g: geom, y, w: b[2] - b[0] }); }
-    y += CELL_LINE_GAP;
+    return geom && geom.length ? geom : null;
+  });
+  let pitch = MIN_PITCH;
+  for (let i = 0; i + 1 < welded.length; i++) {
+    const a = welded[i], b = welded[i + 1];
+    if (a && b) pitch = Math.max(pitch, -geomBounds(a)[1] + geomBounds(b)[3] + LINE_GAP);
   }
+  const placed: Array<{ g: MultiPoly; y: number; w: number }> = [];
+  welded.forEach((g, i) => {
+    if (g) { const b = geomBounds(g); placed.push({ g, y: i * pitch, w: b[2] - b[0] }); }
+  });
   if (!placed.length) return null;
   const maxw = Math.max(...placed.map((p) => p.w));
   const geoms = placed.map((p) => translateXY(p.g, (maxw - p.w) / 2 - geomBounds(p.g)[0], -p.y));
   return geoms.length === 1 ? geoms[0]! : (pc.union(geoms[0]!, ...geoms.slice(1)) as MultiPoly);
 }
-function placeTextBox(block: MultiPoly, cellX: number, cellY: number): MultiPoly | null {
-  if (!block || !block.length) return null;
+/** [centre x, centre y, width, height] of a box's engraving area, fractions of the cell. */
+type Area = [number, number, number, number];
+const TEXT_SHARE = 0.30;   // a box with writing AND a photo: the writing takes the area's lower 30%...
+const SPLIT_GAP = 0.04;    // ...the photo the rest above it, this much apart
+function boxAreas(): { photo: Area; text: Area } {
   const [cx, cy, wf, hf] = boxTextTarget();
+  const y0 = cy - hf / 2, th = TEXT_SHARE * hf, gap = SPLIT_GAP * hf;
+  return { text: [cx, y0 + th / 2, wf, th], photo: [cx, (y0 + th + gap + cy + hf / 2) / 2, wf, hf - th - gap] };
+}
+
+function placeTextBox(block: MultiPoly, cellX: number, cellY: number, area: Area = boxTextTarget()): MultiPoly | null {
+  if (!block || !block.length) return null;
+  const [cx, cy, wf, hf] = area;
   const zoneW = wf * CELL_W, zoneH = hf * CELL_H;
   let b = geomBounds(block); let bw = b[2] - b[0], bh = b[3] - b[1];
   if (bw <= 0 || bh <= 0) return null;
@@ -578,6 +658,16 @@ function loadLogoVector(): MultiPoly | null {
   }
   return LOGO_GEOM;
 }
+/** The VIOLA wordmark (mm) in place of a factory deer logo with these bounds
+ *  (owner, 2026-11-01: every piece carries the gift boxes' logo): as wide as the
+ *  deer logo, centred on it, on its baseline; turned 180 degrees where the deer
+ *  logo is upside down on its piece (the purse's, read from the far side). */
+export function wordmarkIn([x0, y0, x1, y1]: [number, number, number, number], upright = true): MultiPoly | null {
+  const base = loadLogoVector();
+  if (!base) return null;
+  const w = x1 - x0, h = w / BOX_TEMPLATE.logo_aspect;
+  return upright ? translateXY(scaleXY(base, w, h), x0, y0) : translateXY(scaleXY(base, -w, -h), x1, y1);
+}
 function logoGeom(cellX: number, cellY: number): MultiPoly | null {
   const base = loadLogoVector();
   const z = BOX_TEMPLATE.logo_zone;
@@ -586,39 +676,65 @@ function logoGeom(cellX: number, cellY: number): MultiPoly | null {
   return translateXY(g, cellX + z.x0 * CELL_W, cellY + z.y0 * CELL_H);
 }
 
-function isBox(e: AiEntry): boolean {
-  const p = (e.display_product || "").toLowerCase();
-  return p.includes("box") || p.includes("بوكس");
-}
-function boxText(e: AiEntry): string {
-  const vals: string[] = [];
-  for (const [, v] of e.customization_cleaned) {
-    const s = [...String(v)].filter((c) => !BOX_STRIP.has(c)).join("").split(/\s+/).filter(Boolean).join(" ");
-    if (s) vals.push(s);
-  }
-  return vals.join("  ");
+// A box carries only its engraving message. In a bundle it takes the box's own
+// fields; a purse bundle's box is the purse box (its own file, laser/pieceFile.ts).
+function boxText(e: LaserEntry): string {
+  return partFields(e, "box").map(([, v]) => cleanText(v)).filter(Boolean).join("  ");
 }
 
-type BoxCell = { kind: "text"; block: MultiPoly } | { kind: "logozone" };
-function boxCellContents(entries: AiEntry[]): BoxCell[] {
+/** A box's photo: the bitmap, and its outlines when it can be filled in the box's
+ *  colour (null: too fine, it stays a bitmap). */
+interface BoxPhoto extends PreppedRaster { rings: Array<Array<[number, number]>> | null }
+/** One cell per physical box: its writing, the customer's photo (with the writing
+ *  under it when there is both), or nothing (a plain box is still cut: outline + logo). */
+type BoxCell =
+  | { kind: "text"; block: MultiPoly }
+  | { kind: "photo"; photo: BoxPhoto; block: MultiPoly | null }
+  | { kind: "plain" };
+
+/** The box writing in as many lines as the zone's width asks for, evened out. */
+function boxTextLines(text: string, targetW: number): string[] {
+  return text ? balancedLines(text, wrapToWidth(text, targetW).length) : [];
+}
+
+async function boxCellContents(entries: LaserEntry[], photos: Map<string, Buffer>): Promise<BoxCell[]> {
   const [, , wf] = boxTextTarget();
   const targetW = wf * CELL_W;
   const cells: BoxCell[] = [];
   for (const e of entries) {
-    if (!isBox(e)) continue;
+    if (!entryPieces(e).has("box")) continue;
     const text = boxText(e);
-    const lines: string[] = text ? wrapToWidth(text, targetW) : [];
-    // Customisation photos -> "photo N" marker on its own line (the box is a
-    // single zone, so the position is implicit). "طباعة الصور" uploads have no
-    // place (position_label null) and are skipped.
-    for (const p of e.photo_numbers ?? []) {
-      if (!((p.position_label ?? "").trim())) continue;
-      lines.push(p.display_label ?? "photo");
+    const lines = boxTextLines(text, targetW);
+    const block = lines.length ? weldLinesBlock(lines) : null;
+    const placed = partPhotos(e, "box");
+    if (placed.length) {
+      // Each order's boxes get that order's photo (photo-only boxes aggregate into one entry).
+      const area = block ? boxAreas().photo : boxTextTarget();
+      const zoneWPt = area[2] * CELL_W * PT_SCALE, zoneHPt = area[3] * CELL_H * PT_SCALE;
+      for (const { order, qty } of sourcesOf(e)) {
+        const mine = placed.filter((p) => (p.order_name ?? null) === order);
+        const prepped: PreppedRaster[] = [];
+        for (const p of mine) {
+          const buf = p.attachment_url ? photos.get(p.attachment_url) : undefined;
+          const r = buf ? await prepPhotoRaster(buf, zoneWPt, zoneHPt).catch(() => null) : null;
+          if (r) prepped.push(r);
+        }
+        // More photos than boxes: engrave the designs, not the mock-ups.
+        if (prepped.length > qty) {
+          const key = (r: PreppedRaster) => { const s = burnShare(r); return [s <= 0.002 ? 1 : 0, s] as const; };
+          prepped.sort((a, b) => { const [a0, a1] = key(a), [b0, b1] = key(b); return a0 - b0 || a1 - b1; });
+        }
+        const traced = prepped.map((r): BoxPhoto => ({ ...r, rings: traceRaster(r) }));
+        for (let i = 0; i < qty; i++) {
+          if (traced.length) { cells.push({ kind: "photo", photo: traced[i % traced.length]!, block }); continue; }
+          // An unreadable photo: still cut, its "photo N" marker under the writing.
+          const marked = weldLinesBlock([...lines, ...(mine.length ? mine.map((p) => p.display_label ?? "photo") : ["photo"])]);
+          cells.push(marked ? { kind: "text", block: marked } : { kind: "plain" });
+        }
+      }
+      continue;
     }
-    if (!lines.length) { for (let i = 0; i < qtyOf(e); i++) cells.push({ kind: "logozone" }); continue; }
-    const block = weldLinesBlock(lines);
-    if (!block) continue;
-    for (let i = 0; i < qtyOf(e); i++) cells.push({ kind: "text", block });
+    for (let i = 0; i < qtyOf(e); i++) cells.push(block ? { kind: "text", block } : { kind: "plain" });
   }
   return cells;
 }
@@ -626,82 +742,61 @@ function gridDims(): [number, number] {
   return [2 * GRID_MARGIN + GRID_COLS * CELL_W, 2 * GRID_MARGIN + GRID_ROWS * CELL_H];
 }
 
-type BoxOp =
-  | { t: "stroke"; pts: Ring; color: [number, number, number] }
-  | { t: "fill"; geom: MultiPoly; color: [number, number, number] };
-function boxGridPageOps(cells: BoxCell[]): BoxOp[] {
-  const ops: BoxOp[] = [];
-  const [cx, cy, wf, hf] = boxTextTarget();
+/** Fit a cols x rows photo into the cell's engrave area; [tx, tyTop, pw, ph] points. */
+function photoZone(cellX: number, cellY: number, cols: number, rows: number,
+  area: Area = boxTextTarget()): [number, number, number, number] {
+  const sc = PT_SCALE;
+  const [cx, cy, wf, hf] = area;
+  const zcx = (cellX + cx * CELL_W) * sc, zcy = (cellY + cy * CELL_H) * sc;
+  const s = Math.min((wf * CELL_W * sc) / cols, (hf * CELL_H * sc) / rows);
+  const pw = cols * s, ph = rows * s;
+  return [zcx - pw / 2, zcy + ph / 2, pw, ph];
+}
+
+function boxGridPageOps(cells: BoxCell[]): LaserOp[] {
+  const ops: LaserOp[] = [];
   cells.forEach((cell, idx) => {
     const col = idx % GRID_COLS, row = Math.floor(idx / GRID_COLS);
     const cellX = GRID_MARGIN + col * CELL_W;
     const cellY = GRID_MARGIN + (GRID_ROWS - 1 - row) * CELL_H;
     for (const { pts, color } of boxTemplateStrokes(cellX, cellY)) ops.push({ t: "stroke", pts, color });
+    // text + VIOLA logo of this box share one colour, cycled by box position.
     const ecolor = BOX_TEXT_COLORS[idx % BOX_TEXT_COLORS.length]!;
     const lg = logoGeom(cellX, cellY);
     if (lg && lg.length) ops.push({ t: "fill", geom: lg, color: ecolor });
     if (cell.kind === "text") {
       const ft = placeTextBox(cell.block, cellX, cellY);
       if (ft) ops.push({ t: "fill", geom: ft, color: ecolor });
-    } else {
-      // photo-zone marker (uploaded logos are imported separately — embedded
-      // rasters engrave faint in RDWorks).
-      const zx0 = cellX + (cx - wf / 2) * CELL_W, zx1 = cellX + (cx + wf / 2) * CELL_W;
-      const zy0 = cellY + (cy - hf / 2) * CELL_H, zy1 = cellY + (cy + hf / 2) * CELL_H;
-      ops.push({ t: "stroke", pts: [[zx0, zy0], [zx1, zy0], [zx1, zy1], [zx0, zy1], [zx0, zy0]], color: ecolor });
+    } else if (cell.kind === "photo") {
+      const { cols, rows, hex, rings } = cell.photo;
+      const zone = photoZone(cellX, cellY, cols, rows, cell.block ? boxAreas().photo : boxTextTarget());
+      if (rings) {
+        // the photo's outlines in the box's colour (pixel corners -> font units)
+        const [tx, ty, pw, ph] = zone;
+        const sx = pw / cols, sy = ph / rows;
+        ops.push({ t: "fill", color: ecolor, weight: rings.reduce((n, r) => n + r.length, 0) * TRACED_BYTES_PER_POINT,
+          geom: [rings.map((ring) => ring.map(([x, y]) => [(tx + x * sx) / PT_SCALE, (ty - y * sy) / PT_SCALE] as [number, number]))] });
+      } else ops.push({ t: "raster", cols, rows, hex, zone });
+      if (cell.block) {
+        const ft = placeTextBox(cell.block, cellX, cellY, boxAreas().text);
+        if (ft) ops.push({ t: "fill", geom: ft, color: ecolor });
+      }
     }
   });
   return ops;
 }
 
-function rgbToCmyk(c: [number, number, number]): [number, number, number, number] {
-  const [r, g, b] = c;
-  const k = 1 - Math.max(r, g, b);
-  if (k >= 0.9999) return [0, 0, 0, 1];
-  return [(1 - r - k) / (1 - k), (1 - g - k) / (1 - k), (1 - b - k) / (1 - k), k];
-}
-function aiColorCmds(c: [number, number, number]): string {
-  const [cc, m, y, k] = rgbToCmyk(c);
-  const s = `${cc.toFixed(4)} ${m.toFixed(4)} ${y.toFixed(4)} ${k.toFixed(4)}`;
-  return `${s} k\n${s} K`;
-}
-function writeBoxGrid(ops: BoxOp[], totalW: number, totalH: number): string {
-  const sc = PT_SCALE;
-  const W = Math.floor(totalW * sc) + 1, H = Math.floor(totalH * sc) + 1;
-  const head = AI_HEAD
-    .replace("%%BoundingBox:684 -299 1058 579", `%%BoundingBox:0 0 ${W} ${H}`)
-    .replace("%AI5_ArtSize: 612 792 ", `%AI5_ArtSize: ${W} ${H} `);
-  const out: string[] = [head.replace(/\n+$/, ""), "%AI5_BeginLayer", "1 1 1 1 0 0 -1 55 52 53 Lb", "(Layer 1) Ln"];
-  const lw = FRAME_LINE_MM * MM * sc;
-  let last: string | null = null;
-  for (const op of ops) {
-    if (op.t !== "stroke") continue;
-    const key = op.color.join(",");
-    if (key !== last) { out.push(aiColorCmds(op.color)); last = key; }
-    out.push(`0 J 0 j ${lw.toFixed(3)} w []0 d`);
-    const [x0, y0] = op.pts[0]!;
-    out.push(`${(x0 * sc).toFixed(2)} ${(y0 * sc).toFixed(2)} m`);
-    for (let i = 1; i < op.pts.length; i++) { const [x, y] = op.pts[i]!; out.push(`${(x * sc).toFixed(2)} ${(y * sc).toFixed(2)} L`); }
-    out.push("S");
-  }
-  for (const op of ops) {
-    if (op.t !== "fill") continue;
-    if (!op.geom || !op.geom.length) continue;
-    const key = op.color.join(",");
-    if (key !== last) { out.push(aiColorCmds(op.color)); last = key; }
-    for (const poly of op.geom) polyToAi(poly, out);
-  }
-  out.push(AI_TAIL.replace(/\n+$/, ""));
-  return out.join("\n");
-}
-
-/** Build one or more box-grid .ai files (18 boxes/file). Returns latin1 Buffers. */
-export async function buildBoxGridBuffers(entries: AiEntry[]): Promise<Buffer[]> {
+/** Build one or more box-grid .ai files (18 boxes/file). photos: attachment_url ->
+ *  bytes of the customers' box photos (engraved; a missing one keeps its marker). */
+export async function buildBoxGridBuffers(entries: AiEntry[], photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
-  const contents = boxCellContents(entries);
+  const contents = await boxCellContents(entries as LaserEntry[], photos);
   if (!contents.length) return [];
-  const pages: BoxCell[][] = [];
-  for (let i = 0; i < contents.length; i += CELLS_PER_FILE) pages.push(contents.slice(i, i + CELLS_PER_FILE));
   const [totalW, totalH] = gridDims();
-  return pages.map((page) => Buffer.from(writeBoxGrid(boxGridPageOps(page), totalW, totalH), "latin1"));
+  const paginate = (cells: BoxCell[]) => {
+    const pages: BoxCell[][] = [];
+    for (let i = 0; i < cells.length; i += CELLS_PER_FILE) pages.push(cells.slice(i, i + CELLS_PER_FILE));
+    return pages;
+  };
+  return cappedFiles(contents, paginate, (page) => page, async (page) => [boxGridPageOps(page), totalW, totalH]);
 }
