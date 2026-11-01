@@ -8,7 +8,9 @@
  * and written as CMYK ink in UPPERCASE hex: RDWorks reads lowercase a–f as almost
  * no ink, which is what made the photos engrave faint.
  */
-const LOGO_TARGET_DPI = 300;                        // the factory's own .rld bitmaps are ~303 DPI
+import { LIMITS } from "./laserCore.js";
+
+const LOGO_TARGET_DPI = 300;                       // the factory's own .rld bitmaps are ~303 DPI
 const RICH_BLACK = [0xbf, 0xad, 0xa7, 0xe6];        // the factory deer's darkest ink, C/M/Y/K
 const ENGRAVE_THRESHOLD = 192;
 const ARTWORK_WHITE_SHARE = 0.3;
@@ -234,6 +236,55 @@ export function samePhoto(a: PhotoSignature | null, b: PhotoSignature | null): b
   let diff = 0;
   for (let i = 0; i < a.cells.length; i++) diff += Math.abs(a.cells[i]! - b.cells[i]!);
   return Math.abs(a.aspect - b.aspect) <= 0.08 * Math.max(a.aspect, b.aspect) && diff / a.cells.length < 0.10;
+}
+
+/** The burnt pixels of a prepared raster as closed outlines (pixel corners, x right,
+ *  y down) - so a box's photo is filled in the box's own colour like its writing:
+ *  RDWorks puts every imported bitmap on its black BMP layer, whatever the file
+ *  says. Each outline keeps the burnt side on its left and only its corners; null
+ *  when the picture is too fine to be drawn as paths. */
+export function traceRaster(r: PreppedRaster): Array<Array<[number, number]>> | null {
+  const { cols, rows } = r;
+  const black = new Uint8Array(cols * rows);
+  for (let i = 0; i < black.length; i++) black[i] = r.hex.startsWith(BLACK_HEX, i * 8) ? 1 : 0;
+  const at = (x: number, y: number) => x >= 0 && y >= 0 && x < cols && y < rows && black[y * cols + x] === 1;
+  // edge (vertex, direction): 0 east, 1 south, 2 west, 3 north
+  const VX = cols + 1;
+  const edge = new Uint8Array(VX * (rows + 1) * 4);    // 1 = exists, 2 = used
+  let edges = 0;
+  const add = (x: number, y: number, d: number) => { edge[(y * VX + x) * 4 + d] = 1; edges++; };
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    if (!at(x, y)) continue;
+    if (!at(x, y - 1)) add(x + 1, y, 2);
+    if (!at(x - 1, y)) add(x, y, 1);
+    if (!at(x, y + 1)) add(x, y + 1, 0);
+    if (!at(x + 1, y)) add(x + 1, y + 1, 3);
+  }
+  if (edges > LIMITS.maxTraceEdges) return null;
+  const DX = [1, 0, -1, 0], DY = [0, 1, 0, -1];
+  const rings: Array<Array<[number, number]>> = [];
+  const trace = (sx: number, sy: number, sd: number) => {
+    const pts: Array<[number, number]> = [], dirs: number[] = [];
+    let x = sx, y = sy, d = sd;
+    for (;;) {
+      edge[(y * VX + x) * 4 + d] = 2;
+      pts.push([x, y]); dirs.push(d);
+      x += DX[d]!; y += DY[d]!;
+      if (x === sx && y === sy) break;
+      const next = [(d + 3) % 4, d, (d + 1) % 4].find((nd) => edge[(y * VX + x) * 4 + nd] === 1);
+      if (next === undefined) break;
+      d = next;
+    }
+    const ring = pts.filter((_p, i) => dirs[i] !== dirs[(i + dirs.length - 1) % dirs.length]);
+    if (ring.length >= 3) rings.push(ring);
+  };
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    if (!at(x, y)) continue;
+    for (const [vx, vy, d] of [[x + 1, y, 2], [x, y, 1], [x, y + 1, 0], [x + 1, y + 1, 3]] as const) {
+      if (edge[(vy * VX + vx) * 4 + d] === 1) trace(vx, vy, d);
+    }
+  }
+  return rings;
 }
 
 /** Crop the whitespace, size to 300 DPI at its real placement (zone in points),

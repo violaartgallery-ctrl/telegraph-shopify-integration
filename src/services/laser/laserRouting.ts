@@ -121,9 +121,61 @@ export function bundleLeftover(e: LaserEntry): LaserEntry | null {
 }
 
 export const BOX_STRIP = new Set(['"', "'", "«", "»", "“", "”", "‘", "’", "(", ")", "[", "]", "{", "}"]);
-/** Writing without quotes / brackets and with single spaces. */
+const APOSTROPHES = new Set(["'", "’", "‘"]);
+const isLetter = (c: string | undefined) => c !== undefined && /\p{L}/u.test(c);
+
+/** Hearts the fonts have no glyph for: drawn as a vector heart (🫶 too). */
+export const HEARTS = new Set([
+  "❤", "♥", "♡", "❣", "🤍", "💙", "💚", "💛", "🧡", "💜", "🖤", "🤎",
+  "💖", "💗", "💞", "💓", "💕", "💟", "💘", "💝", "🫶",
+]);
+/** Drawn as a vector infinity sign. */
+export const INFINITY = "∞";
+/** Variation selectors, joiner and skin tones: never drawn. */
+export const SKIP_CHARS = new Set(["️", "︎", "‍", "🏻", "🏼", "🏽", "🏾", "🏿"]);
+const isSymbol = (c: string) => HEARTS.has(c) || c === INFINITY;
+
+/** Quotes and brackets removed; an apostrophe inside a word ("I’m") kept. */
+export function stripQuotes(v: string): string {
+  const cs = [...v];
+  return cs.filter((c, i) => !BOX_STRIP.has(c) || (APOSTROPHES.has(c) && isLetter(cs[i - 1]) && isLetter(cs[i + 1]))).join("");
+}
+
+/** The heart goes at the END of the writing (owner, 2026-11-01): hearts (and an ∞)
+ *  typed before it move after it; when it already ends with a heart, the opening
+ *  hearts are not repeated. */
+export function heartsLast(text: string): string {
+  const cs = [...text];
+  let i = 0;
+  while (i < cs.length && (isSymbol(cs[i]!) || SKIP_CHARS.has(cs[i]!) || /\s/.test(cs[i]!))) i++;
+  const lead = cs.slice(0, i).filter(isSymbol);
+  if (!lead.some((c) => HEARTS.has(c)) || i === cs.length) return text;
+  const rest = cs.slice(i).join("").trim();
+  const tail = [...rest].filter((c) => !SKIP_CHARS.has(c) && !/\s/.test(c));
+  const endsWithHeart = HEARTS.has(tail[tail.length - 1] ?? "");
+  const moved = lead.filter((c) => !(endsWithHeart && HEARTS.has(c)));
+  return moved.length ? `${rest} ${moved.join(" ")}` : rest;
+}
+
+/** Words with letters in them (a name with a heart is still one word). */
+export function wordCount(text: string): number {
+  return text.split(/\s+/).filter((w) => [...w].some((c) => isLetter(c))).length;
+}
+
+/** A note to the team instead of writing ("نفس لوجو الطيارة اللي في صورة الويبسايت"):
+ *  never engraved as text; the place gets a LOGO marker. */
+export function isInstruction(text: string): boolean {
+  return /لوجو|logo|(?:نفس|زي|زى|مثل)\s+(?:ال)?صور/i.test(text);
+}
+
+/** A note asking for the plane logo (the travel set's website photo). */
+export function isPlaneNote(text: string): boolean {
+  return /طيار|plane|✈/i.test(text);
+}
+
+/** Writing without quotes / brackets, with single spaces and its hearts at the end. */
 export function cleanText(v: unknown): string {
-  return [...String(v ?? "")].filter((c) => !BOX_STRIP.has(c)).join("").split(/\s+/).filter(Boolean).join(" ");
+  return heartsLast(stripQuotes(String(v ?? "")).split(/\s+/).filter(Boolean).join(" "));
 }
 export function qtyOf(e: LaserEntry): number {
   const q = Number(e.total_quantity || 1);

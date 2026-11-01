@@ -20,16 +20,16 @@ import {
 } from "./laserCore.js";
 import { entryColor, entryPieces, type LaserEntry, partFields, sourcesOf } from "./laserRouting.js";
 import { titleGeom, type Zone } from "./laserText.js";
-import { cleanValue, placedByZone, titleNote, zoneOps } from "./walletFile.js";
+import { placedByZone, placeTexts, titleNote, withLogos, withPlanes, zoneOps } from "./walletFile.js";
 
 export type PieceProduct = "passport" | "purse" | "purse_box";
 const GAP_MM = 10.0;
 const MARGIN_MM = 10.0;
 
 type PieceZone = Zone & { piece: string };
-const COVER = { line_h: 22.0, max_h: 40.0, align: "centre", cy: 71.0, photo_h: 90.0 } as const;
+const COVER = { line_h: 22.0, max_h: 40.0, align: "centre", cy: 71.0, photo_h: 90.0, word: 70.0 } as const;
 const CORNER = { line_h: 16.0, max_h: 30.0, bottom: 4.0, photo_h: 55.0 } as const;
-const INSIDE = { line_h: 16.0, bottom: 3.5 } as const;
+const INSIDE = { line_h: 16.0, max_h: 40.0, max_w: 70.0, bottom: 3.5 } as const;   // the wallet's pocket sizes
 // mm from the bottom-left of their piece, measured from the factory files' customer writing.
 const ZONES: Record<PieceProduct, Record<string, Record<string, PieceZone>>> = {
   passport: {
@@ -43,12 +43,14 @@ const ZONES: Record<PieceProduct, Record<string, Record<string, PieceZone>>> = {
     },
     decorated: {},
     "*": {
-      inner_left: { piece: "inner", x: [5.0, 80.0], max_h: 34.0, align: "left", photo_h: 95.0, centre_multi: true, ...INSIDE },
-      inner_right: { piece: "inner", x: [100.0, 161.0], max_h: 26.0, align: "right", photo_h: 60.0, ...INSIDE },
+      inner_left: { piece: "inner", x: [5.0, 80.0], align: "left", photo_h: 95.0, centre_multi: true, ...INSIDE },
+      inner_right: { piece: "inner", x: [100.0, 161.0], align: "right", photo_h: 60.0, ...INSIDE },
     },
   },
   purse: {
-    blank: { cover: { piece: "cover", x: [10.0, 182.0], line_h: 20.0, max_h: 40.0, align: "centre", bottom: 6.0, photo_h: 66.0 } },
+    // a long writing: two lines, centred in the front panel (owner, 2026-11-01)
+    blank: { cover: { piece: "cover", x: [10.0, 182.0], line_h: 20.0, max_h: 40.0, align: "centre", bottom: 6.0, photo_h: 66.0,
+      max_lines: 2, cy_multi: 37.0 } },
     mandala: { cover: { piece: "cover", x: [128.0, 188.0], line_h: 16.0, max_h: 24.0, align: "right", bottom: 5.0, photo_h: 36.0 } },
     "*": { inner: { piece: "inner", x: [108.0, 190.0], line_h: 15.0, max_h: 32.0, align: "right", bottom: 4.5, photo_h: 48.0 } },
   },
@@ -131,21 +133,15 @@ async function items(product: PieceProduct, entries: LaserEntry[], photos: Map<s
   for (const e of entries) {
     if (!entryPieces(e).has(product)) continue;
     const model = pieceModel(product, e);
-    const texts: Record<string, string[]> = {};
-    for (const [label, value] of partFields(e, product)) {
-      const [, s] = cleanValue(value);
-      if (!s) continue;
-      const zone = pieceZoneFor(product, model, label);
-      if (!zone) { console.warn(`[laser] ${product} (${model}): no writing place for "${label}" — not engraved.`); continue; }
-      (texts[zone] ??= []).push(s);
-    }
+    const { texts, logos, planes } = placeTexts(partFields(e, product), (label) => pieceZoneFor(product, model, label),
+      `${product} (${model})`);
     const placed = await placedByZone(e, photos, product, (label) => pieceZoneFor(product, model, label),
       `${product} (${model})`);
     for (const { order, qty } of sourcesOf(e)) {
       for (let i = 0; i < qty; i++) {
         out.push({ product, model, color: entryColor(e), order, title: e.display_product || DEFAULT_TITLE[product],
-          texts, photos: placed.photos.get(order) ?? {}, markers: placed.markers.get(order) ?? {},
-          extra: placed.extras.get(order) ?? [] });
+          texts, photos: withPlanes(placed.photos.get(order) ?? {}, planes), markers: withLogos(placed.markers.get(order) ?? {}, logos),
+          extra: [...(placed.extras.get(order) ?? []), ...(Object.keys(logos).length ? ["CHECK LOGO"] : [])] });
       }
     }
   }
@@ -183,6 +179,7 @@ async function setOps(it: Item, ox: number, oy: number): Promise<LaserOp[]> {
     const [px0, py0] = tpl.pieces[z.piece] as [number, number];
     const zone: Zone = { ...z, x: [px0 + z.x[0], px0 + z.x[1]] };
     if (z.bottom !== undefined) zone.bottom = py0 + z.bottom; else zone.cy = py0 + z.cy!;
+    if (z.cy_multi !== undefined) zone.cy_multi = py0 + z.cy_multi;
     ops.push(...(await zoneOps(`${it.product} ${it.order}`, zname, zone, it.texts[zname] ?? [], it.photos[zname] ?? null,
       it.markers[zname] ?? [], ox, oy)));
   }

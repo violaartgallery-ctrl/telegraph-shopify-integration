@@ -11,13 +11,16 @@
  * Each leather colour starts its own row, up to 25 wallets per file.
  */
 import { ensureHB, wordmarkIn } from "../aiWriter.js";
-import { WALLET_TEMPLATE } from "./laserAssets.js";
+import { PLANE_LOGO_PNG, WALLET_TEMPLATE } from "./laserAssets.js";
 import {
   bounds, cappedFiles, contoursGeom, CUT, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE, type RGB, scale, TAN,
   TITLE_GAP_MM, TITLE_H_MM, translate,
 } from "./laserCore.js";
 import { type PhotoSignature, photoSignature, pickDesign, prepPhotoRaster, samePhoto } from "./laserPhoto.js";
-import { BOX_STRIP, entryColor, entryPieces, type LaserEntry, type LaserPhoto, partFields, partPhotos, type Piece, sourcesOf } from "./laserRouting.js";
+import {
+  entryColor, entryPieces, heartsLast, isInstruction, isPlaneNote, type LaserEntry, type LaserPhoto, partFields, partPhotos, type Piece,
+  sourcesOf, stripQuotes,
+} from "./laserRouting.js";
 import { fitBlock, placeBox, titleGeom, type Zone } from "./laserText.js";
 
 const PER_FILE = 25;
@@ -31,13 +34,15 @@ const DECO: RGB = [0.25, 0.0, 0.51];
 const MODEL_ORDER = ["blank", "lines", "decorated"] as const;
 type Model = (typeof MODEL_ORDER)[number];
 
+// Owner, 2026-11-01: one word on the face grows up to 70 x 70 mm; pocket writing at
+// most 70 mm wide and 40 mm tall.
 export const WALLET_ZONES: Record<string, Zone> = {
-  "برا شمال": { x: [8.0, 97.0], line_h: 20.0, max_h: 36.0, align: "centre", cy: 44.0, photo_h: 60.0 },
-  "برا يمين": { x: [133.0, 222.0], line_h: 20.0, max_h: 36.0, align: "centre", cy: 44.0, photo_h: 60.0 },
+  "برا شمال": { x: [8.0, 97.0], line_h: 20.0, max_h: 36.0, align: "centre", cy: 44.0, photo_h: 60.0, word: 70.0 },
+  "برا يمين": { x: [133.0, 222.0], line_h: 20.0, max_h: 36.0, align: "centre", cy: 44.0, photo_h: 60.0, word: 70.0 },
   "برا تحت شمال": { x: [6.5, 92.0], line_h: 16.0, max_h: 20.0, align: "left", bottom: 6.3, photo_h: 28.0 },
   "برا تحت يمين": { x: [139.0, 223.0], line_h: 16.0, max_h: 20.0, align: "right", bottom: 6.3, photo_h: 28.0 },
-  "جوا شمال": { x: [21.5, 108.5], line_h: 16.0, max_h: 44.0, align: "left", bottom: 94.5, photo_h: 48.0, centre_multi: true },
-  "جوا يمين": { x: [121.5, 208.5], line_h: 16.0, max_h: 44.0, align: "right", bottom: 94.5, photo_h: 48.0, centre_multi: true },
+  "جوا شمال": { x: [21.5, 108.5], line_h: 16.0, max_h: 40.0, max_w: 70.0, align: "left", bottom: 94.5, photo_h: 48.0, centre_multi: true },
+  "جوا يمين": { x: [121.5, 208.5], line_h: 16.0, max_h: 40.0, max_w: 70.0, align: "right", bottom: 94.5, photo_h: 48.0, centre_multi: true },
 };
 // "ف النص (سندس)" / "في الطرف (عمّوري)": an old placement hint before the writing.
 const HINT_RE = /^\s*(?:ف|في)\s*(النص|الطرف)\s*[(:]?\s*/;
@@ -60,14 +65,51 @@ export function walletModel(e: LaserEntry): Model {
   return "blank";
 }
 
-/** [hint, text]: the writing without quotes/brackets, and an old placement hint. */
+/** [hint, text]: the writing without quotes/brackets, its hearts at the end, and
+ *  an old placement hint. */
 export function cleanValue(value: unknown): [string, string] {
   let s = String(value ?? "");
   let hint = "";
   const m = HINT_RE.exec(s);
   if (m) { hint = m[1]!; s = s.slice(m[0].length); }
-  s = [...s].filter((c) => !BOX_STRIP.has(c)).join("");
-  return [hint, s.split(/\s+/).filter(Boolean).join(" ")];
+  return [hint, heartsLast(stripQuotes(s).split(/\s+/).filter(Boolean).join(" "))];
+}
+
+export interface PlacedTexts {
+  texts: Record<string, string[]>;
+  /** places whose field was a note to the team: a LOGO marker there */
+  logos: Record<string, string[]>;
+  /** places whose note asks for the plane logo: the factory's plane goes there */
+  planes: string[];
+}
+
+/** A place's writings; a note to the team is never engraved: the plane logo when it
+ *  asks for it, else a LOGO marker. */
+export function placeTexts<Z extends string>(fields: Array<[string, string]>, zoneFor: (label: string, hint: string) => Z | null,
+  who: string): PlacedTexts {
+  const texts: Record<string, string[]> = {}, logos: Record<string, string[]> = {}, planes: string[] = [];
+  for (const [label, value] of fields) {
+    const [hint, s] = cleanValue(value);
+    if (!s) continue;
+    const zone = zoneFor(label, hint);
+    if (!zone) { console.warn(`[laser] ${who}: no writing place for "${label}" — not engraved.`); continue; }
+    if (isInstruction(s) && isPlaneNote(s)) {
+      console.warn(`[laser] ${who}: "${label}" asks for the plane logo (${s}) — the factory's plane placed there.`);
+      planes.push(zone);
+    } else if (isInstruction(s)) {
+      console.warn(`[laser] ${who}: "${label}" is a note to the team (${s}) — LOGO marker, not engraved.`);
+      (logos[zone] ??= []).push("LOGO");
+    } else (texts[zone] ??= []).push(s);
+  }
+  return { texts, logos, planes };
+}
+
+/** An order's placed photos with the plane logo where a note asked for it (a
+ *  customer's own photo there wins). */
+export function withPlanes(photos: Record<string, Buffer>, planes: string[]): Record<string, Buffer> {
+  const out: Record<string, Buffer> = {};
+  for (const zone of planes) out[zone] = PLANE_LOGO_PNG;
+  return { ...out, ...photos };
 }
 
 export function walletZoneFor(label: unknown, model: Model, hint = ""): string | null {
@@ -145,25 +187,26 @@ export async function placedByZone(e: LaserEntry, photos: Map<string, Buffer>, p
 
 export const titleNote = (extra: string[]) => (extra.length ? `+ ${extra.join(" ")}` : "");
 
+/** A place's markers with its LOGO markers added. */
+export function withLogos(markers: Record<string, string[]>, logos: Record<string, string[]>): Record<string, string[]> {
+  const out = { ...markers };
+  for (const [zone, ls] of Object.entries(logos)) out[zone] = [...(out[zone] ?? []), ...ls];
+  return out;
+}
+
 async function items(entries: LaserEntry[], photos: Map<string, Buffer>): Promise<Item[]> {
   const out: Item[] = [];
   for (const e of entries) {
     if (!entryPieces(e).has("wallet")) continue;
     const model = walletModel(e);
-    const texts: Record<string, string[]> = {};
-    for (const [label, value] of partFields(e, "wallet")) {
-      const [hint, s] = cleanValue(value);
-      if (!s) continue;
-      const zone = walletZoneFor(label, model, hint);
-      if (!zone) { console.warn(`[laser] Wallet (${model}): no writing place for "${label}" — not engraved.`); continue; }
-      (texts[zone] ??= []).push(s);
-    }
+    const { texts, logos, planes } = placeTexts(partFields(e, "wallet"), (label, hint) => walletZoneFor(label, model, hint),
+      `Wallet (${model})`);
     const placed = await placedByZone(e, photos, "wallet", (label) => walletZoneFor(label, model), `Wallet (${model})`);
     for (const { order, qty } of sourcesOf(e)) {
       for (let i = 0; i < qty; i++) {
         out.push({ color: entryColor(e), model, order, title: e.display_product || "Wallet", texts,
-          photos: placed.photos.get(order) ?? {}, markers: placed.markers.get(order) ?? {},
-          extra: placed.extras.get(order) ?? [] });
+          photos: withPlanes(placed.photos.get(order) ?? {}, planes), markers: withLogos(placed.markers.get(order) ?? {}, logos),
+          extra: [...(placed.extras.get(order) ?? []), ...(Object.keys(logos).length ? ["CHECK LOGO"] : [])] });
       }
     }
   }

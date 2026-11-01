@@ -28,7 +28,7 @@ const FRAME_LINE_MM = 0.2;
 /** zone = [tx, tyTop, pw, ph] in POINTS (the raster's top-left corner and size). */
 export type LaserOp =
   | { t: "stroke"; pts: Ring; color: RGB }
-  | { t: "fill"; geom: MultiPoly; color: RGB }
+  | { t: "fill"; geom: MultiPoly; color: RGB; weight?: number }   // weight: bytes of a traced photo
   | { t: "raster"; cols: number; rows: number; hex: string; zone: [number, number, number, number] };
 
 export function bounds(g: MultiPoly): [number, number, number, number] {
@@ -111,9 +111,16 @@ function emitXiRaster(out: string[], cols: number, rows: number, hex: string, zo
 }
 
 /** The draw ops as a real .ai file: strokes, then fills, then rasters. */
-// Telegram takes documents up to 50 MB and an engraved photo is ~5-8 MB of hex, so a
-// page whose photos pass this is split in two and laid out again.
-export const LIMITS = { maxRasterBytes: 35_000_000 };
+// Telegram takes documents up to 50 MB and an engraved photo is ~5-8 MB of hex (a
+// photo drawn as outlines ~16 bytes a corner), so a page whose photos pass this is
+// split in two and laid out again.
+export const LIMITS = {
+  maxRasterBytes: 35_000_000,
+  // A photo with more pixel-edge pieces than this (a shaded picture's dither dots)
+  // stays a bitmap; RDWorks would choke on it as paths.
+  maxTraceEdges: 300_000,
+};
+export const TRACED_BYTES_PER_POINT = 16;
 
 /** The .ai files of `items`, paginated by `paginate`, any page heavy with engraved
  *  photos split in two so every file stays sendable (ai_writer._capped_pages). */
@@ -123,7 +130,7 @@ export async function cappedFiles<T, P>(items: T[], paginate: (items: T[]) => P[
   for (const page of paginate(items)) {
     const [ops, totalW, totalH] = await pageOps(page);
     const its = itemsOf(page);
-    const rasterBytes = ops.reduce((n, op) => n + (op.t === "raster" ? op.hex.length : 0), 0);
+    const rasterBytes = ops.reduce((n, op) => n + (op.t === "raster" ? op.hex.length : op.t === "fill" ? op.weight ?? 0 : 0), 0);
     if (its.length > 1 && rasterBytes > LIMITS.maxRasterBytes) {
       const half = Math.floor(its.length / 2);
       out.push(...await cappedFiles(its.slice(0, half), paginate, itemsOf, pageOps));

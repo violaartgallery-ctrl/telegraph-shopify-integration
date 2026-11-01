@@ -31,9 +31,11 @@ export interface AiEntry {
 }
 import { ARABIC_FONT_B64, LATIN_FONT_B64 } from "./fontsData.js";
 import { BOX_TEMPLATE } from "./boxAssets.js";
-import { cappedFiles, type LaserOp } from "./laser/laserCore.js";
-import { burnShare, prepPhotoRaster } from "./laser/laserPhoto.js";
-import { cleanText, entryPieces, type LaserEntry, partFields, partPhotos, sourcesOf } from "./laser/laserRouting.js";
+import { cappedFiles, type LaserOp, TRACED_BYTES_PER_POINT } from "./laser/laserCore.js";
+import { burnShare, type PreppedRaster, prepPhotoRaster, traceRaster } from "./laser/laserPhoto.js";
+import {
+  cleanText, entryPieces, HEARTS, INFINITY, type LaserEntry, partFields, partPhotos, SKIP_CHARS, sourcesOf,
+} from "./laser/laserRouting.js";
 
 type Ring = [number, number][];
 type Poly = Ring[];
@@ -49,12 +51,6 @@ const BEZIER_STEPS = 6;
 
 const COLOR_VALUE: [number, number, number] = [0, 0, 0];
 const COLOR_REF: [number, number, number] = [0, 0, 1];
-
-const HEARTS = new Set([
-  "❤", "♥", "🤍", "💙", "💚", "💛", "🧡", "💜", "🖤", "🤎",
-  "💖", "💗", "💞", "💓", "💕", "💟",
-]);
-const SKIP_CHARS = new Set(["️", "︎", "‍"]);
 
 // ── Fonts ───────────────────────────────────────────────────────────────────
 interface FB { face: Face; font: Font; upem: number; }
@@ -77,11 +73,14 @@ function fonts(): [FB, FB] {
 
 // ── Script segmentation ───────────────────────────────────────────────────────
 function isArabic(ch: string): boolean {
+  // Presentation forms A and B only: U+FE00-FE6F holds the emoji variation
+  // selectors, which made "2026/11/5♥️" a right-to-left line (heart on the left).
   const c = ch.codePointAt(0)!;
-  return (c >= 0x0600 && c <= 0x06ff) || (c >= 0xfb50 && c <= 0xfeff) || (c >= 0x0750 && c <= 0x077f);
+  return (c >= 0x0600 && c <= 0x06ff) || (c >= 0x0750 && c <= 0x077f) || (c >= 0xfb50 && c <= 0xfdff)
+    || (c >= 0xfe70 && c <= 0xfeff);
 }
 
-type Kind = "ar" | "lat" | "num" | "heart";
+type Kind = "ar" | "lat" | "num" | "heart" | "inf";
 function splitRuns(text: string): Array<{ text: string; kind: Kind }> {
   // Digits get their own LTR run so "40" never reverses to "04" inside RTL
   // Arabic; neutral chars (space/punct) stick to the current run.
@@ -95,6 +94,7 @@ function splitRuns(text: string): Array<{ text: string; kind: Kind }> {
   for (const ch of text) {
     if (SKIP_CHARS.has(ch)) continue;
     if (HEARTS.has(ch)) { flush(); runs.push({ text: ch, kind: "heart" }); continue; }
+    if (ch === INFINITY) { flush(); runs.push({ text: ch, kind: "inf" }); continue; }
     let k: Kind;
     if (/\d/.test(ch)) k = "num";
     else if (isArabic(ch)) k = "ar";
@@ -187,6 +187,20 @@ function heartGeom(left: number, baseline: number, height: number): { geom: Mult
   return { geom: [[ring]], width: (maxx - minx) * scale };
 }
 
+/** "∞" (no glyph in either font): two loops joined side by side, centred on the
+ *  heart's height. */
+function infinityGeom(left: number, baseline: number): { geom: MultiPoly; width: number } {
+  const ry = EM * 0.22, rx = EM * 0.26, t = EM * 0.075, cy = baseline + EM * 0.31;
+  const ellipse = (cx: number, ax: number, ay: number): Ring =>
+    Array.from({ length: 48 }, (_, i) => {
+      const a = (2 * Math.PI * i) / 48;
+      return [cx + ax * Math.cos(a), cy + ay * Math.sin(a)] as [number, number];
+    });
+  const loop = (cx: number): Poly => [ellipse(cx, rx, ry), ellipse(cx, rx - t, ry - t)];
+  const c1 = left + rx, c2 = left + 3 * rx - t;
+  return { geom: pc.union(loop(c1), loop(c2)) as MultiPoly, width: 4 * rx - t };
+}
+
 function shapeRun(fb: FB, text: string): Array<{ g: number; ax: number; xo: number; yo: number }> {
   const buf = new HB!.Buffer();
   buf.addText(text);
@@ -210,6 +224,12 @@ export function weldLine(text: string, baseline: number): { geom: MultiPoly | nu
       const h = heartGeom(penX, baseline, EM * 0.62);
       geoms.push(h.geom);
       penX += h.width + EM * 0.12;
+      continue;
+    }
+    if (kind === "inf") {
+      const g = infinityGeom(penX, baseline);
+      geoms.push(g.geom);
+      penX += g.width + EM * 0.12;
       continue;
     }
     const fb = kind === "ar" || kind === "num" ? ara : lat;
@@ -484,7 +504,8 @@ const MM = 72.0 / (PT_SCALE * 25.4);            // font units per millimetre
 const CELL_W = CELL_W_MM * MM;
 const CELL_H = CELL_H_MM * MM;
 const GRID_MARGIN = 10.0 * MM;
-const CELL_LINE_GAP = Math.round(EM * 2.0);
+const LINE_GAP = Math.round(EM * 0.25);         // between one line's lowest point and the next one's highest
+const MIN_PITCH = Math.round(EM * 1.1);         // baseline to baseline, at least
 const COLOR_RED: [number, number, number] = [1, 0, 0];
 const BOX_CUT: [number, number, number] = [0, 0, 0];
 const BOX_TEXT_COLORS: Array<[number, number, number]> = [
@@ -516,11 +537,50 @@ export function textWidth(text: string): number {
   let w = 0;
   for (const { text: run, kind } of splitRuns(text)) {
     if (kind === "heart") { w += EM * 0.62 + EM * 0.12; continue; }
+    if (kind === "inf") { w += infinityGeom(0, 0).width + EM * 0.12; continue; }
     const fb = kind === "ar" || kind === "num" ? ara : lat;
     const scale = ara.upem / fb.upem;
     for (const gl of shapeRun(fb, run)) { if (gl.g === 0) continue; w += gl.ax * scale; }
   }
   return w;
+}
+
+/** `text` in exactly n lines (fewer when it has fewer words) of the most even
+ *  width: the widest line as narrow as it can be. With at least 2 words a line,
+ *  no word is ever left alone on a line (owner, 2026-11-01). */
+export function balancedLines(text: string, n: number): string[] {
+  const words = (text || "").split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const k = Math.min(Math.max(1, n), words.length);
+  if (k === 1) return [words.join(" ")];
+  const minWords = words.length >= 2 * k ? 2 : 1;
+  const widths = new Map<string, number>();
+  const w = (i: number, j: number) => {
+    const key = `${i},${j}`;
+    if (!widths.has(key)) widths.set(key, textWidth(words.slice(i, j).join(" ")));
+    return widths.get(key)!;
+  };
+  const W = words.length;
+  // best[l][j]: the narrowest widest-line for the first j words in l lines
+  const best: number[][] = Array.from({ length: k + 1 }, () => new Array(W + 1).fill(Infinity));
+  const cut: number[][] = Array.from({ length: k + 1 }, () => new Array(W + 1).fill(-1));
+  best[0]![0] = 0;
+  for (let l = 1; l <= k; l++) {
+    for (let j = l * minWords; j <= W; j++) {
+      for (let i = (l - 1) * minWords; i <= j - minWords; i++) {
+        if (best[l - 1]![i] === Infinity) continue;
+        const v = Math.max(best[l - 1]![i]!, w(i, j));
+        if (v < best[l]![j]!) { best[l]![j] = v; cut[l]![j] = i; }
+      }
+    }
+  }
+  const lines: string[] = [];
+  for (let l = k, j = W; l > 0; l--) {
+    const i = cut[l]![j]!;
+    lines.unshift(words.slice(i, j).join(" "));
+    j = i;
+  }
+  return lines;
 }
 export function wrapToWidth(text: string, targetW: number): string[] {
   const words = (text || "").split(/\s+/).filter(Boolean);
@@ -534,22 +594,41 @@ export function wrapToWidth(text: string, targetW: number): string[] {
   if (cur) lines.push(cur);
   return lines;
 }
+/** Lines stacked top to bottom, each centred. The line pitch is the same for every
+ *  line: the deepest pair of neighbours (one's lowest point to the next one's
+ *  highest) plus LINE_GAP, at least MIN_PITCH - close, never touching. */
 export function weldLinesBlock(lines: string[]): MultiPoly | null {
-  const placed: Array<{ g: MultiPoly; y: number; w: number }> = [];
-  let y = 0;
-  for (const ln of lines) {
+  const welded = lines.map((ln) => {
     const { geom } = weldLine(ln, 0);
-    if (geom && geom.length) { const b = geomBounds(geom); placed.push({ g: geom, y, w: b[2] - b[0] }); }
-    y += CELL_LINE_GAP;
+    return geom && geom.length ? geom : null;
+  });
+  let pitch = MIN_PITCH;
+  for (let i = 0; i + 1 < welded.length; i++) {
+    const a = welded[i], b = welded[i + 1];
+    if (a && b) pitch = Math.max(pitch, -geomBounds(a)[1] + geomBounds(b)[3] + LINE_GAP);
   }
+  const placed: Array<{ g: MultiPoly; y: number; w: number }> = [];
+  welded.forEach((g, i) => {
+    if (g) { const b = geomBounds(g); placed.push({ g, y: i * pitch, w: b[2] - b[0] }); }
+  });
   if (!placed.length) return null;
   const maxw = Math.max(...placed.map((p) => p.w));
   const geoms = placed.map((p) => translateXY(p.g, (maxw - p.w) / 2 - geomBounds(p.g)[0], -p.y));
   return geoms.length === 1 ? geoms[0]! : (pc.union(geoms[0]!, ...geoms.slice(1)) as MultiPoly);
 }
-function placeTextBox(block: MultiPoly, cellX: number, cellY: number): MultiPoly | null {
-  if (!block || !block.length) return null;
+/** [centre x, centre y, width, height] of a box's engraving area, fractions of the cell. */
+type Area = [number, number, number, number];
+const TEXT_SHARE = 0.30;   // a box with writing AND a photo: the writing takes the area's lower 30%...
+const SPLIT_GAP = 0.04;    // ...the photo the rest above it, this much apart
+function boxAreas(): { photo: Area; text: Area } {
   const [cx, cy, wf, hf] = boxTextTarget();
+  const y0 = cy - hf / 2, th = TEXT_SHARE * hf, gap = SPLIT_GAP * hf;
+  return { text: [cx, y0 + th / 2, wf, th], photo: [cx, (y0 + th + gap + cy + hf / 2) / 2, wf, hf - th - gap] };
+}
+
+function placeTextBox(block: MultiPoly, cellX: number, cellY: number, area: Area = boxTextTarget()): MultiPoly | null {
+  if (!block || !block.length) return null;
+  const [cx, cy, wf, hf] = area;
   const zoneW = wf * CELL_W, zoneH = hf * CELL_H;
   let b = geomBounds(block); let bw = b[2] - b[0], bh = b[3] - b[1];
   if (bw <= 0 || bh <= 0) return null;
@@ -603,30 +682,38 @@ function boxText(e: LaserEntry): string {
   return partFields(e, "box").map(([, v]) => cleanText(v)).filter(Boolean).join("  ");
 }
 
-/** One cell per physical box: its writing, the customer's photo, or nothing
- *  (a plain box is still cut: outline + logo). */
+/** A box's photo: the bitmap, and its outlines when it can be filled in the box's
+ *  colour (null: too fine, it stays a bitmap). */
+interface BoxPhoto extends PreppedRaster { rings: Array<Array<[number, number]>> | null }
+/** One cell per physical box: its writing, the customer's photo (with the writing
+ *  under it when there is both), or nothing (a plain box is still cut: outline + logo). */
 type BoxCell =
   | { kind: "text"; block: MultiPoly }
-  | { kind: "photo"; cols: number; rows: number; hex: string }
+  | { kind: "photo"; photo: BoxPhoto; block: MultiPoly | null }
   | { kind: "plain" };
+
+/** The box writing in as many lines as the zone's width asks for, evened out. */
+function boxTextLines(text: string, targetW: number): string[] {
+  return text ? balancedLines(text, wrapToWidth(text, targetW).length) : [];
+}
+
 async function boxCellContents(entries: LaserEntry[], photos: Map<string, Buffer>): Promise<BoxCell[]> {
-  const [, , wf, hf] = boxTextTarget();
+  const [, , wf] = boxTextTarget();
   const targetW = wf * CELL_W;
-  const zoneWPt = wf * CELL_W * PT_SCALE, zoneHPt = hf * CELL_H * PT_SCALE;
   const cells: BoxCell[] = [];
-  const markerCell = (labels: string[]): BoxCell => {
-    const block = weldLinesBlock(labels.length ? labels : ["photo"]);
-    return block ? { kind: "text", block } : { kind: "plain" };
-  };
   for (const e of entries) {
     if (!entryPieces(e).has("box")) continue;
     const text = boxText(e);
+    const lines = boxTextLines(text, targetW);
+    const block = lines.length ? weldLinesBlock(lines) : null;
     const placed = partPhotos(e, "box");
-    if (placed.length && !text) {
+    if (placed.length) {
       // Each order's boxes get that order's photo (photo-only boxes aggregate into one entry).
+      const area = block ? boxAreas().photo : boxTextTarget();
+      const zoneWPt = area[2] * CELL_W * PT_SCALE, zoneHPt = area[3] * CELL_H * PT_SCALE;
       for (const { order, qty } of sourcesOf(e)) {
         const mine = placed.filter((p) => (p.order_name ?? null) === order);
-        const prepped: Array<{ cols: number; rows: number; hex: string }> = [];
+        const prepped: PreppedRaster[] = [];
         for (const p of mine) {
           const buf = p.attachment_url ? photos.get(p.attachment_url) : undefined;
           const r = buf ? await prepPhotoRaster(buf, zoneWPt, zoneHPt).catch(() => null) : null;
@@ -634,20 +721,19 @@ async function boxCellContents(entries: LaserEntry[], photos: Map<string, Buffer
         }
         // More photos than boxes: engrave the designs, not the mock-ups.
         if (prepped.length > qty) {
-          const key = (r: { cols: number; rows: number; hex: string }) => { const s = burnShare(r); return [s <= 0.002 ? 1 : 0, s] as const; };
+          const key = (r: PreppedRaster) => { const s = burnShare(r); return [s <= 0.002 ? 1 : 0, s] as const; };
           prepped.sort((a, b) => { const [a0, a1] = key(a), [b0, b1] = key(b); return a0 - b0 || a1 - b1; });
         }
+        const traced = prepped.map((r): BoxPhoto => ({ ...r, rings: traceRaster(r) }));
         for (let i = 0; i < qty; i++) {
-          if (prepped.length) cells.push({ kind: "photo", ...prepped[i % prepped.length]! });
-          else cells.push(markerCell(mine.map((p) => p.display_label ?? "photo")));  // still cut, marker kept
+          if (traced.length) { cells.push({ kind: "photo", photo: traced[i % traced.length]!, block }); continue; }
+          // An unreadable photo: still cut, its "photo N" marker under the writing.
+          const marked = weldLinesBlock([...lines, ...(mine.length ? mine.map((p) => p.display_label ?? "photo") : ["photo"])]);
+          cells.push(marked ? { kind: "text", block: marked } : { kind: "plain" });
         }
       }
       continue;
     }
-    if (placed.length && text) console.warn("[laser] Box has text AND a photo — photo left as a 'photo N' marker.");
-    const lines: string[] = text ? wrapToWidth(text, targetW) : [];
-    for (const p of placed) lines.push(p.display_label ?? "photo");
-    const block = lines.length ? weldLinesBlock(lines) : null;
     for (let i = 0; i < qtyOf(e); i++) cells.push(block ? { kind: "text", block } : { kind: "plain" });
   }
   return cells;
@@ -656,10 +742,11 @@ function gridDims(): [number, number] {
   return [2 * GRID_MARGIN + GRID_COLS * CELL_W, 2 * GRID_MARGIN + GRID_ROWS * CELL_H];
 }
 
-/** Fit a cols x rows photo into the cell's engrave zone; [tx, tyTop, pw, ph] points. */
-function photoZone(cellX: number, cellY: number, cols: number, rows: number): [number, number, number, number] {
+/** Fit a cols x rows photo into the cell's engrave area; [tx, tyTop, pw, ph] points. */
+function photoZone(cellX: number, cellY: number, cols: number, rows: number,
+  area: Area = boxTextTarget()): [number, number, number, number] {
   const sc = PT_SCALE;
-  const [cx, cy, wf, hf] = boxTextTarget();
+  const [cx, cy, wf, hf] = area;
   const zcx = (cellX + cx * CELL_W) * sc, zcy = (cellY + cy * CELL_H) * sc;
   const s = Math.min((wf * CELL_W * sc) / cols, (hf * CELL_H * sc) / rows);
   const pw = cols * s, ph = rows * s;
@@ -681,7 +768,19 @@ function boxGridPageOps(cells: BoxCell[]): LaserOp[] {
       const ft = placeTextBox(cell.block, cellX, cellY);
       if (ft) ops.push({ t: "fill", geom: ft, color: ecolor });
     } else if (cell.kind === "photo") {
-      ops.push({ t: "raster", cols: cell.cols, rows: cell.rows, hex: cell.hex, zone: photoZone(cellX, cellY, cell.cols, cell.rows) });
+      const { cols, rows, hex, rings } = cell.photo;
+      const zone = photoZone(cellX, cellY, cols, rows, cell.block ? boxAreas().photo : boxTextTarget());
+      if (rings) {
+        // the photo's outlines in the box's colour (pixel corners -> font units)
+        const [tx, ty, pw, ph] = zone;
+        const sx = pw / cols, sy = ph / rows;
+        ops.push({ t: "fill", color: ecolor, weight: rings.reduce((n, r) => n + r.length, 0) * TRACED_BYTES_PER_POINT,
+          geom: [rings.map((ring) => ring.map(([x, y]) => [(tx + x * sx) / PT_SCALE, (ty - y * sy) / PT_SCALE] as [number, number]))] });
+      } else ops.push({ t: "raster", cols, rows, hex, zone });
+      if (cell.block) {
+        const ft = placeTextBox(cell.block, cellX, cellY, boxAreas().text);
+        if (ft) ops.push({ t: "fill", geom: ft, color: ecolor });
+      }
     }
   });
   return ops;
