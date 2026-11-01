@@ -1,0 +1,24 @@
+name: Offline checks
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: offline-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npx prisma generate
+      - name: Type check
+        run: npx tsc --noEmit -p tsconfig.json
+      - name: Offline self-tests (no database, providers or Telegram)
+        run: npm run test:offline

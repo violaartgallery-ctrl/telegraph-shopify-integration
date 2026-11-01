@@ -43,7 +43,8 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
-    "lint": "tsc --noEmit -p tsconfig.json"
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test:offline": "node scripts/run-offline-tests.mjs"
   },
   "dependencies": {
     "@netlify/blobs": "^10.7.6",
