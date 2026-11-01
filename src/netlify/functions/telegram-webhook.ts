@@ -2,6 +2,7 @@ import { waitUntil } from '@vercel/functions';
 import { answerCallbackQuery, sendMessage } from '../../telegram/telegramApi.js';
 import { productionRecipientChatIds } from './run-production-background.js';
 import { scheduleProductionContinuation } from '../../services/productionContinuation.js';
+import { constantTimeTextEqual } from '../../services/shopifyAdminAuth.js';
 import {
   clearJob,
   createPreviewJob,
@@ -321,9 +322,16 @@ async function handleCommand(chatId: number, command: string, fullText: string):
 }
 
 export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
+  // Fail closed: without the secret anyone could post an update with an
+  // allowed chat id and start /run. Telegram retries non-2xx responses, so a
+  // misconfigured deployment queues updates instead of dropping them.
+  const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
+  if (!expectedSecret) {
+    console.error('[webhook] TELEGRAM_WEBHOOK_SECRET is not set; rejecting update.');
+    return { statusCode: 503, body: 'Webhook secret is not configured' };
+  }
   const secret = event.headers['x-telegram-bot-api-secret-token'];
-  const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (expectedSecret && secret !== expectedSecret) {
+  if (!secret || !constantTimeTextEqual(secret, expectedSecret)) {
     return { statusCode: 401, body: 'Unauthorized' };
   }
   if (event.httpMethod !== 'POST' || !event.body) return { statusCode: 200, body: 'ok' };
