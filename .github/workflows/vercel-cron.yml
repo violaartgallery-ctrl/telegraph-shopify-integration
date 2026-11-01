@@ -1,10 +1,10 @@
 name: vercel-scheduled-sync
 
 # GitHub documents that schedules at :00/:30 are the most likely to be delayed
-# or dropped. Keep the 30-minute cadence but move it away from peak minutes.
+# or dropped. Use a 2-hour watchdog; the aligned Vercel queue owns business work.
 on:
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '3 */2 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -31,7 +31,7 @@ jobs:
           test -n "$OPS_SECRET"
           response=$(curl --fail-with-body --silent --show-error --retry 2 \
             --connect-timeout 15 --max-time 60 -H "x-ops-secret: $OPS_SECRET" \
-            "https://viola-telegraph-integration-violaaa.vercel.app/ops/scheduler/ensure")
+            "https://viola-telegraph-integration-eight.vercel.app/ops/scheduler/ensure")
           echo "$response" | jq -c .
           echo "primary_healthy=$(echo "$response" | jq -r '.primaryHealthy // false')" >> "$GITHUB_OUTPUT"
           echo "fallback_allowed=$(echo "$response" | jq -r '.fallbackAllowed // false')" >> "$GITHUB_OUTPUT"
@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      BASE: https://viola-telegraph-integration-violaaa.vercel.app
+      BASE: https://viola-telegraph-integration-eight.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Validate scheduler secret
@@ -145,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      BASE: https://viola-telegraph-integration-violaaa.vercel.app
+      BASE: https://viola-telegraph-integration-eight.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Drain Odoo in short checkpoints
@@ -185,11 +185,11 @@ jobs:
           done
 
   health:
-    if: always() && needs.scheduler.result == 'success' && needs.scheduler.outputs.primary_healthy == 'true'
+    if: always() && needs.scheduler.result == 'success' && needs.scheduler.outputs.primary_healthy == 'true' && needs.scheduler.outputs.fallback_allowed == 'true'
     needs: [scheduler, status-sync, odoo-queue]
     runs-on: ubuntu-latest
     env:
-      BASE: https://viola-telegraph-integration-violaaa.vercel.app
+      BASE: https://viola-telegraph-integration-eight.vercel.app
       OPS_SECRET: ${{ secrets.OPS_SECRET }}
     steps:
       - name: Check production safety layers
