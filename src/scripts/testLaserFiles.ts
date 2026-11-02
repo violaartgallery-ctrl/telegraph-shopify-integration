@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import Jimp from "jimp";
 import { balancedLines, buildBoxGridBuffers, weldLine, wordmarkIn } from "../services/aiWriter.js";
 import { buildKeychainFiles } from "../services/laser/keychainFile.js";
-import { BED_H_MM, BED_W_MM, LIMITS } from "../services/laser/laserCore.js";
+import { BED_H_MM, BED_W_MM, colourSheets, type LaserCell, LIMITS, shelfPages } from "../services/laser/laserCore.js";
 import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
 import { photoSignature, pickDesign, prepPhotoRaster, samePhoto, traceRaster } from "../services/laser/laserPhoto.js";
 import { bundleLeftover, cleanText, entryPieces, heartsLast, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
@@ -185,12 +185,62 @@ await test("passport / purse / purse box sets fit the 1400 x 900 bed", async () 
   assert.equal((await buildPieceFiles("purse", [entry("Mandela purse")])).length, 1);
 });
 
-await test("a batch makes one file per kind, in a fixed order", async () => {
+// ── Owner's corrections of 2026-11-02 ────────────────────────────────────────
+const coloured = (e: LaserEntry, color: string): LaserEntry => ({ ...e, display_color: color });
+
+await test("a batch makes the line-by-line file, then one file per leather colour (A-Z) with all its products", async () => {
   const files = await buildLaserArtifacts([
     entry("Magic Wallet - RFID protection"), entry("Bag Tag – Personalized Leather Luggage Tag", [["Bag tag", "Ali"]]),
-    entry("Photo keychain"), entry("Wallet"), entry("Custom Passport holder"), entry("Purse"), entry("Gift purse box"),
+    coloured(entry("Photo keychain"), "Black"), entry("Wallet"), coloured(entry("Custom Passport holder"), "Dark Navy"),
+    coloured(entry("Purse"), "dark navy"), entry("Gift purse box"), coloured(entry("Wallet"), "Unknown Color"),
   ], new Map());
-  assert.deepEqual(files.map((f) => f.kind), ["laser", "keychains", "wallets", "passports", "purses", "purse_boxes"]);
+  assert.deepEqual(files.map((f) => f.kind), ["laser", "black", "brown", "dark-navy", "no-colour"]);
+  assert.deepEqual(files.map((f) => f.label),
+    ["ملف الليزر", "ملف ليزر BLACK", "ملف ليزر BROWN", "ملف ليزر DARK NAVY", "ملف ليزر - لون مش معروف"]);
+  const navy = text(files[3]!.buffer);
+  assert.equal(count(navy, /^0\.0000 1\.0000 0\.75\d\d 0\.0000 K$/gm), 1);        // the passport's cover holes
+  assert.ok(count(navy, /^S$/gm) > 312 + 37);                                         // + the purse's strokes
+});
+
+await test("a colour sheet keeps each kind on its own rows inside the 1400 x 900 mm bed", async () => {
+  const cell = (kind: string, w: number, h: number): LaserCell => ({ color: "Brown", kind, w, h, ops: async () => [] });
+  const many = (n: number, c: LaserCell) => [...Array(n)].map(() => c);
+  const pages = shelfPages([...many(7, cell("wallet", 230, 160)), ...many(5, cell("passport", 305, 320)), cell("keychain", 135, 188)]);
+  assert.deepEqual(pages.map((rows) => rows.map((r) => `${r[0]!.kind}x${r.length}`)),
+    [["walletx5", "walletx2", "passportx4"], ["passportx1", "keychainx1"]]);
+  for (const rows of pages) {
+    assert.ok(20 + rows.reduce((h, r) => h + Math.max(...r.map((c) => c.h)), 0) + (rows.length - 1) * 10 <= BED_H_MM);
+    for (const r of rows) assert.ok(20 + r.reduce((w, c) => w + c.w, 0) + (r.length - 1) * 10 <= BED_W_MM);
+  }
+  const sheets = await colourSheets([cell("wallet", 230, 160), { ...cell("wallet", 230, 160), color: " brown " }]);
+  assert.equal(sheets.length, 1);
+});
+
+await test("the passport has its whole cut outline in black, and its old outline bits are gone", () => {
+  for (const model of ["blank", "knot", "decorated"]) {
+    const tpl = PIECE_TEMPLATES.passport[model];
+    const cut = tpl.strokes.filter((st: { rgb: number[] }) => st.rgb.join() === "0,0,0");
+    assert.equal(cut.length, 1, model);
+    assert.equal(cut[0].paths.length, 37, model);
+    const pts = cut[0].paths.flat() as number[][];
+    const [x0, y0, x1, y1] = [Math.min(...pts.map((p) => p[0]!)), Math.min(...pts.map((p) => p[1]!)),
+      Math.max(...pts.map((p) => p[0]!)), Math.max(...pts.map((p) => p[1]!))];
+    assert.ok(x0 >= 0 && y0 >= 0 && x1 <= tpl.size[0] && y1 <= tpl.size[1], model);
+    const holes = tpl.strokes.filter((st: { rgb: number[] }) => st.rgb[0] === 255).flatMap((st: { paths: number[][][] }) => st.paths);
+    assert.equal(holes.length, 312, model);
+    for (const h of holes) assert.ok(h[0]![0]! > x0 && h[0]![0]! < x1 && h[0]![1]! > y0 && h[0]![1]! < y1, model);
+  }
+  const cover = PIECE_TEMPLATES.passport.blank.pieces.cover as number[];          // its holes; the outline is 4 mm out
+  assert.ok(Math.abs(cover[2]! - cover[0]! - 191.94) < 0.01 && cover[0]! > 3.9);
+});
+
+await test("the lines band is a layer of its own (blue), apart from the writing", async () => {
+  const band = /^1\.0000 1\.0000 0\.0000 0\.0000 k$/m;
+  const [lines] = await buildWalletFiles([entry("Lines wallet", [["المحفظة برا تحت يمين", "Ali"]])]);
+  const [blank] = await buildWalletFiles([entry("Wallet", [["المحفظة برا يمين", "Ali"]])]);
+  assert.ok(band.test(text(lines!)) && !band.test(text(blank!)));
+  const [knot] = await buildPieceFiles("passport", [entry("Lines passport holder")]);
+  assert.ok(band.test(text(knot!)));
 });
 
 // ── Owner's corrections of 2026-11-01 (preview of 110 orders) ─────────────────

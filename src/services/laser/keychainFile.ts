@@ -6,11 +6,12 @@
  * the other side's text on the top end rotated 180 so it reads upright once
  * folded. The customer's photo takes the bottom end. Up to 15 per file, each
  * colour starting its own row; plain medallions are included so they get cut.
+ * keychainCells feeds the per-colour files.
  */
 import { ensureHB } from "../aiWriter.js";
 import { KEYCHAIN_TEMPLATE } from "./laserAssets.js";
 import {
-  CUT, type LaserOp, MM, pagesByColour, PT_SCALE, type RGB, rotate180, TAN, TITLE_GAP_MM, TITLE_H_MM, translate,
+  CUT, type LaserCell, type LaserOp, MM, pagesByColour, PT_SCALE, type RGB, rotate180, TAN, TITLE_GAP_MM, TITLE_H_MM, translate,
   bounds, cappedFiles,
 } from "./laserCore.js";
 import { prepPhotoRaster } from "./laserPhoto.js";
@@ -66,58 +67,72 @@ function items(entries: LaserEntry[], photos: Map<string, Buffer>): Item[] {
 }
 
 async function pageOps(rows: Item[][]): Promise<[LaserOp[], number, number]> {
-  const tpl = KEYCHAIN_TEMPLATE;
-  const [setW, setH] = tpl.size as [number, number];
-  const [mx0, my0, mx1, my1] = tpl.main as [number, number, number, number];
-  const zt = tpl.zones_rel_main_centre.text_bottom;
-  const textW = Math.max(zt.w, tpl.zones_rel_main_centre.text_top.w) * MM;
+  const [setW, setH] = KEYCHAIN_TEMPLATE.size as [number, number];
   const rowH = setH + TITLE_GAP_MM + TITLE_H_MM;
   const cols = Math.max(...rows.map((r) => r.length));
   const totalW = (2 * MARGIN_MM + cols * setW + (cols - 1) * GAP_MM) * MM;
   const totalH = (2 * MARGIN_MM + rows.length * rowH + (rows.length - 1) * GAP_MM) * MM;
   const ops: LaserOp[] = [];
   for (let r = 0; r < rows.length; r++) for (let c = 0; c < rows[r]!.length; c++) {
-    const it = rows[r]![c]!;
-    const ox = MARGIN_MM + c * (setW + GAP_MM);
-    const oy = MARGIN_MM + (rows.length - 1 - r) * (rowH + GAP_MM);
-    for (const [key, color] of [["cut", CUT], ["stitch", RED]] as const) {
-      for (const path of tpl[key] as number[][][]) {
-        ops.push({ t: "stroke", pts: path.map(([x, y]) => [(ox + x!) * MM, (oy + y!) * MM] as [number, number]), color });
-      }
-    }
-    const title = titleGeom(it.title, it.color, setW);
-    if (title) {
-      const tw = bounds(title)[2] / MM;
-      ops.push({ t: "fill", geom: translate(title, (ox + (setW - tw) / 2) * MM, (oy + setH + TITLE_GAP_MM) * MM), color: TAN });
-    }
-    const cx = (ox + (mx0 + mx1) / 2) * MM, cy = (oy + (my0 + my1) / 2) * MM;
-    let { bottom, top, photo } = it;
-    if (photo && bottom && top) {
-      console.warn(`[laser] Keychain ${it.order}: two texts AND a photo — photo not placed, place it by hand.`);
-      photo = null;
-    } else if (photo && bottom) {
-      [top, bottom] = [bottom, ""];            // the photo takes the bottom face, the text the other
-    }
-    for (const [text, sign] of [[bottom, 1], [top, -1]] as const) {
-      if (!text) continue;
-      let block = keychainTextBlock(text, textW, zt.h * MM, TEXT_MAX_H_MM * MM);
-      if (!block) continue;
-      if (sign < 0) block = rotate180(block);
-      ops.push({ t: "fill", geom: translate(block, cx + sign * zt.cx * MM, cy + sign * zt.cy * MM), color: TAN });
-    }
-    if (photo) {
-      const zw = PHOTO_W_MM * MM * PT_SCALE, zh = PHOTO_H_MM * MM * PT_SCALE;
-      const prepped = await prepPhotoRaster(photo, zw, zh).catch(() => null);
-      if (prepped) {
-        const s = Math.min(zw / prepped.cols, zh / prepped.rows);
-        const pw = prepped.cols * s, ph = prepped.rows * s;
-        const pcyMm = Math.max(PHOTO_CY_MM, PHOTO_BOTTOM_MM + ph / PT_SCALE / MM / 2);
-        const pcx = cx * PT_SCALE, pcy = (cy + pcyMm * MM) * PT_SCALE;
-        ops.push({ t: "raster", cols: prepped.cols, rows: prepped.rows, hex: prepped.hex, zone: [pcx - pw / 2, pcy + ph / 2, pw, ph] });
-      }
-    }
+    ops.push(...(await keychainOps(rows[r]![c]!, MARGIN_MM + c * (setW + GAP_MM), MARGIN_MM + (rows.length - 1 - r) * (rowH + GAP_MM))));
   }
   return [ops, totalW, totalH];
+}
+
+/** Draw ops for one medallion set whose bottom-left is at (ox, oy) mm. */
+async function keychainOps(it: Item, ox: number, oy: number): Promise<LaserOp[]> {
+  const tpl = KEYCHAIN_TEMPLATE;
+  const [setW, setH] = tpl.size as [number, number];
+  const [mx0, my0, mx1, my1] = tpl.main as [number, number, number, number];
+  const zt = tpl.zones_rel_main_centre.text_bottom;
+  const textW = Math.max(zt.w, tpl.zones_rel_main_centre.text_top.w) * MM;
+  const ops: LaserOp[] = [];
+  for (const [key, color] of [["cut", CUT], ["stitch", RED]] as const) {
+    for (const path of tpl[key] as number[][][]) {
+      ops.push({ t: "stroke", pts: path.map(([x, y]) => [(ox + x!) * MM, (oy + y!) * MM] as [number, number]), color });
+    }
+  }
+  const title = titleGeom(it.title, it.color, setW);
+  if (title) {
+    const tw = bounds(title)[2] / MM;
+    ops.push({ t: "fill", geom: translate(title, (ox + (setW - tw) / 2) * MM, (oy + setH + TITLE_GAP_MM) * MM), color: TAN });
+  }
+  const cx = (ox + (mx0 + mx1) / 2) * MM, cy = (oy + (my0 + my1) / 2) * MM;
+  let { bottom, top, photo } = it;
+  if (photo && bottom && top) {
+    console.warn(`[laser] Keychain ${it.order}: two texts AND a photo — photo not placed, place it by hand.`);
+    photo = null;
+  } else if (photo && bottom) {
+    [top, bottom] = [bottom, ""];            // the photo takes the bottom face, the text the other
+  }
+  for (const [text, sign] of [[bottom, 1], [top, -1]] as const) {
+    if (!text) continue;
+    let block = keychainTextBlock(text, textW, zt.h * MM, TEXT_MAX_H_MM * MM);
+    if (!block) continue;
+    if (sign < 0) block = rotate180(block);
+    ops.push({ t: "fill", geom: translate(block, cx + sign * zt.cx * MM, cy + sign * zt.cy * MM), color: TAN });
+  }
+  if (photo) {
+    const zw = PHOTO_W_MM * MM * PT_SCALE, zh = PHOTO_H_MM * MM * PT_SCALE;
+    const prepped = await prepPhotoRaster(photo, zw, zh).catch(() => null);
+    if (prepped) {
+      const s = Math.min(zw / prepped.cols, zh / prepped.rows);
+      const pw = prepped.cols * s, ph = prepped.rows * s;
+      const pcyMm = Math.max(PHOTO_CY_MM, PHOTO_BOTTOM_MM + ph / PT_SCALE / MM / 2);
+      const pcx = cx * PT_SCALE, pcy = (cy + pcyMm * MM) * PT_SCALE;
+      ops.push({ t: "raster", cols: prepped.cols, rows: prepped.rows, hex: prepped.hex, zone: [pcx - pw / 2, pcy + ph / 2, pw, ph] });
+    }
+  }
+  return ops;
+}
+
+/** Every medallion as a set for the per-colour files. */
+export async function keychainCells(entries: LaserEntry[], photos: Map<string, Buffer> = new Map()): Promise<LaserCell[]> {
+  await ensureHB();
+  const [setW, setH] = KEYCHAIN_TEMPLATE.size as [number, number];
+  return items(entries, photos).map((it) => ({
+    color: it.color, kind: "keychain", w: setW, h: setH + TITLE_GAP_MM + TITLE_H_MM, ops: (ox, oy) => keychainOps(it, ox, oy),
+  }));
 }
 
 /** Medallion files, up to 15 medallions each. photos: attachment_url -> bytes. */

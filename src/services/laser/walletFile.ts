@@ -8,13 +8,14 @@
  *   bottom corners beside the logo (the lines wallet's band covers the upper face);
  *   جوا شمال = left pocket, جوا يمين = right pocket.
  * The decorated wallet's face is all pattern, so it only takes pocket writing.
- * Each leather colour starts its own row, up to 25 wallets per file.
+ * The lines band is a layer of its own (BAND). Each leather colour starts its own
+ * row, up to 25 wallets per file; walletCells feeds the per-colour files.
  */
 import { ensureHB, wordmarkIn } from "../aiWriter.js";
 import { PLANE_LOGO_PNG, WALLET_TEMPLATE } from "./laserAssets.js";
 import {
-  bounds, cappedFiles, contoursGeom, CUT, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE, type RGB, scale, TAN,
-  TITLE_GAP_MM, TITLE_H_MM, translate,
+  BAND, bounds, cappedFiles, contoursGeom, CUT, type LaserCell, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, PT_SCALE,
+  type RGB, scale, TAN, TITLE_GAP_MM, TITLE_H_MM, translate,
 } from "./laserCore.js";
 import { type PhotoSignature, photoSignature, pickDesign, prepPhotoRaster, samePhoto } from "./laserPhoto.js";
 import {
@@ -224,7 +225,7 @@ async function walletOps(it: Item, ox: number, oy: number): Promise<LaserOp[]> {
   for (const [key, model] of [["band", "lines"], ["logo", null]] as const) {
     if (model !== null && model !== it.model) continue;
     const g = templateGeom(key);
-    if (g) ops.push({ t: "fill", geom: translate(scale(g, MM), ox * MM, oy * MM), color: TAN });
+    if (g) ops.push({ t: "fill", geom: translate(scale(g, MM), ox * MM, oy * MM), color: key === "band" ? BAND : TAN });
   }
   const [setW, setH] = tpl.size as [number, number];
   const title = titleGeom(it.title, it.color, setW, titleNote(it.extra));
@@ -268,10 +269,22 @@ export async function zoneOps(
   return [{ t: "fill", geom: placeAt(block, bx * MM, by * MM), color: TAN }];
 }
 
+const sortedItems = async (entries: LaserEntry[], photos: Map<string, Buffer>) =>
+  (await items(entries, photos)).sort((a, b) => MODEL_ORDER.indexOf(a.model) - MODEL_ORDER.indexOf(b.model));
+
+/** Every wallet as a set for the per-colour files. */
+export async function walletCells(entries: LaserEntry[], photos: Map<string, Buffer> = new Map()): Promise<LaserCell[]> {
+  await ensureHB();
+  const [setW, setH] = WALLET_TEMPLATE.size as [number, number];
+  return (await sortedItems(entries, photos)).map((it) => ({
+    color: it.color, kind: "wallet", w: setW, h: setH + TITLE_GAP_MM + TITLE_H_MM, ops: (ox, oy) => walletOps(it, ox, oy),
+  }));
+}
+
 /** Wallet files, up to 25 wallets each. photos: attachment_url -> bytes. */
 export async function buildWalletFiles(entries: LaserEntry[], photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
-  const its = (await items(entries, photos)).sort((a, b) => MODEL_ORDER.indexOf(a.model) - MODEL_ORDER.indexOf(b.model));
+  const its = await sortedItems(entries, photos);
   const [setW, setH] = WALLET_TEMPLATE.size as [number, number];
   const rowH = setH + TITLE_GAP_MM + TITLE_H_MM;
   return cappedFiles(its, (part) => pagesByColour(part, MAX_COLS, MAX_ROWS, PER_FILE), (rows) => rows.flat(), async (rows) => {

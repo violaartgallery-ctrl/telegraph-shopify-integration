@@ -23,7 +23,12 @@ export const TITLE_H_MM = 6.0;                      // "1 X PHOTO KEYCHAIN HAVAN
 export const TITLE_GAP_MM = 3.0;
 export const CUT: RGB = [0, 0, 0];
 export const TAN: RGB = [0.702, 0.628, 0.459];      // the factory's engrave layer (179, 160, 117)
+// The lines wallet's / knot passport's band: a layer of its own so the factory gives it
+// its own Scan settings (owner, 2026-11-02).
+export const BAND: RGB = [0, 0, 1];
 const FRAME_LINE_MM = 0.2;
+const SHEET_MARGIN_MM = 10.0;
+const SHEET_GAP_MM = 10.0;
 
 /** zone = [tx, tyTop, pw, ph] in POINTS (the raster's top-left corner and size). */
 export type LaserOp =
@@ -177,6 +182,9 @@ export function writeLaserAi(ops: LaserOp[], totalW: number, totalH: number): Bu
   return Buffer.from(out.join("\n"), "latin1");
 }
 
+/** One leather colour however it is spelt ("Dark Navy" / "dark navy"). */
+export const colourKey = (color: string) => color.trim().toLowerCase().split(/\s+/).join(" ");
+
 /** Split items into pages of rows: each leather colour starts its own row (one
  *  leather per row), up to maxCols per row, maxRows rows and perFile items a page. */
 export function pagesByColour<T extends { color: string }>(
@@ -184,8 +192,9 @@ export function pagesByColour<T extends { color: string }>(
 ): T[][][] {
   const byColor = new Map<string, T[]>();
   for (const it of items) {
-    if (!byColor.has(it.color)) byColor.set(it.color, []);
-    byColor.get(it.color)!.push(it);
+    const k = colourKey(it.color);
+    if (!byColor.has(k)) byColor.set(k, []);
+    byColor.get(k)!.push(it);
   }
   const pages: T[][][] = [];
   let rows: T[][] = [];
@@ -202,4 +211,75 @@ export function pagesByColour<T extends { color: string }>(
   }
   if (rows.length) pages.push(rows);
   return pages;
+}
+
+/** One set on a colour sheet: its kind ("wallet", "passport", ...), its size in mm
+ *  (title included) and its drawing with its bottom-left at (ox, oy) mm. */
+export interface LaserCell {
+  color: string;
+  kind: string;
+  w: number;
+  h: number;
+  ops: (ox: number, oy: number) => Promise<LaserOp[]>;
+}
+
+/** Shelf-pack cells onto 1400 x 900 mm beds: rows of one kind each, as many sets per
+ *  row and rows per page as fit. */
+export function shelfPages(cells: LaserCell[]): LaserCell[][][] {
+  const maxW = BED_W_MM - 2 * SHEET_MARGIN_MM, maxH = BED_H_MM - 2 * SHEET_MARGIN_MM;
+  const pages: LaserCell[][][] = [];
+  let rows: LaserCell[][] = [], used = 0, row: LaserCell[] = [], rowW = 0;
+  const closeRow = () => {
+    if (!row.length) return;
+    const h = Math.max(...row.map((c) => c.h));
+    if (rows.length && used + SHEET_GAP_MM + h > maxH) { pages.push(rows); rows = []; used = 0; }
+    used += (rows.length ? SHEET_GAP_MM : 0) + h;
+    rows.push(row);
+    row = []; rowW = 0;
+  };
+  for (const c of cells) {
+    if (row.length && (row[0]!.kind !== c.kind || rowW + SHEET_GAP_MM + c.w > maxW)) closeRow();
+    rowW += (row.length ? SHEET_GAP_MM : 0) + c.w;
+    row.push(c);
+  }
+  closeRow();
+  if (rows.length) pages.push(rows);
+  return pages;
+}
+
+/** One page's rows, top row first, each set on its row's bottom line. */
+export async function shelfOps(rows: LaserCell[][]): Promise<[LaserOp[], number, number]> {
+  const heights = rows.map((r) => Math.max(...r.map((c) => c.h)));
+  const widths = rows.map((r) => r.reduce((w, c) => w + c.w, 0) + (r.length - 1) * SHEET_GAP_MM);
+  const totalW = 2 * SHEET_MARGIN_MM + Math.max(...widths);
+  const totalH = 2 * SHEET_MARGIN_MM + heights.reduce((a, b) => a + b, 0) + (rows.length - 1) * SHEET_GAP_MM;
+  const ops: LaserOp[] = [];
+  let top = totalH - SHEET_MARGIN_MM;
+  for (let r = 0; r < rows.length; r++) {
+    const y = top - heights[r]!;
+    let x = SHEET_MARGIN_MM;
+    for (const c of rows[r]!) { ops.push(...(await c.ops(x, y))); x += c.w + SHEET_GAP_MM; }
+    top = y - SHEET_GAP_MM;
+  }
+  return [ops, totalW * MM, totalH * MM];
+}
+
+/** One laser file (or more, when a bed is full or heavy with photos) per leather
+ *  colour with every product of that colour (owner, 2026-11-02), colours A-Z with
+ *  the unknown one last. */
+export async function colourSheets(cells: LaserCell[]): Promise<Array<{ color: string; files: Buffer[] }>> {
+  const unknown = (k: string) => !k || k === "unknown color" || k === "unknown colour";
+  const byColour = new Map<string, LaserCell[]>();
+  for (const c of cells) {
+    const k = unknown(colourKey(c.color)) ? "" : colourKey(c.color);
+    if (!byColour.has(k)) byColour.set(k, []);
+    byColour.get(k)!.push(c);
+  }
+  const keys = [...byColour.keys()].sort((a, b) => (unknown(a) ? 1 : 0) - (unknown(b) ? 1 : 0) || a.localeCompare(b));
+  const out: Array<{ color: string; files: Buffer[] }> = [];
+  for (const k of keys) {
+    const cs = byColour.get(k)!;
+    out.push({ color: k ? cs[0]!.color.trim() : "", files: await cappedFiles(cs, shelfPages, (rows) => rows.flat(), shelfOps) });
+  }
+  return out;
 }

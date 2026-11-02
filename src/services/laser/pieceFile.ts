@@ -2,9 +2,10 @@
  * Passport holder, purse (بورتفيه) and purse box laser files, laid out like the
  * factory's daily production files passport.rld, port sada.rld, port mandila.rld
  * and box port.rld (port of piece_writer.py). Each set is the factory's set (stitch
- * holes, cut lines, decorated pattern; traced knot band, mandala), the gift boxes'
- * VIOLA wordmark where its deer logo was, a "1 X <PRODUCT> <COLOUR>" title and each
- * customisation where the factory puts it:
+ * holes, cut lines - the passport's whole outline from the factory's blank passport
+ * cover file -, decorated pattern; traced knot band on its own layer, mandala), the
+ * gift boxes' VIOLA wordmark where its deer logo was, a "1 X <PRODUCT> <COLOUR>"
+ * title and each customisation where the factory puts it:
  *   passport  برا شمال / برا يمين: middle of the cover's left / right half (knot:
  *             bottom corners under the band; decorated: none); جوا شمال / يمين: inside
  *   purse     برا: centred low on the cover (mandala: bottom right corner); جوا: the
@@ -15,8 +16,8 @@ import * as polygonClippingNs from "polygon-clipping";
 import { ensureHB, wordmarkIn } from "../aiWriter.js";
 import { PIECE_TEMPLATES } from "./laserAssets.js";
 import {
-  BED_H_MM, BED_W_MM, bounds, cappedFiles, contoursGeom, type LaserOp, MM, type MultiPoly, pagesByColour, placeAt, type RGB, scale,
-  TAN, TITLE_GAP_MM, TITLE_H_MM, translate,
+  BAND, BED_H_MM, BED_W_MM, bounds, cappedFiles, contoursGeom, type LaserCell, type LaserOp, MM, type MultiPoly, pagesByColour,
+  placeAt, type RGB, scale, TAN, TITLE_GAP_MM, TITLE_H_MM, translate,
 } from "./laserCore.js";
 import { entryColor, entryPieces, type LaserEntry, partFields, sourcesOf } from "./laserRouting.js";
 import { titleGeom, type Zone } from "./laserText.js";
@@ -167,7 +168,7 @@ async function setOps(it: Item, ox: number, oy: number): Promise<LaserOp[]> {
   }
   for (const key of Object.keys(tpl.fills)) {
     const g = fillGeom(it.product, it.model, key);
-    if (g) ops.push({ t: "fill", geom: translate(scale(g, MM), ox * MM, oy * MM), color: TAN });
+    if (g) ops.push({ t: "fill", geom: translate(scale(g, MM), ox * MM, oy * MM), color: key === "band" ? BAND : TAN });
   }
   const [setW, setH] = tpl.size as [number, number];
   const title = titleGeom(it.title, it.color, setW, titleNote(it.extra));
@@ -186,12 +187,26 @@ async function setOps(it: Item, ox: number, oy: number): Promise<LaserOp[]> {
   return ops;
 }
 
+async function sortedItems(product: PieceProduct, entries: LaserEntry[], photos: Map<string, Buffer>): Promise<Item[]> {
+  const order = MODEL_ORDER[product];
+  return (await items(product, entries, photos)).sort((a, b) => order.indexOf(a.model) - order.indexOf(b.model));
+}
+
+/** Every set of one product for the per-colour files. */
+export async function pieceCells(product: PieceProduct, entries: LaserEntry[],
+  photos: Map<string, Buffer> = new Map()): Promise<LaserCell[]> {
+  await ensureHB();
+  const [cellW, cellH] = pieceCell(product);
+  return (await sortedItems(product, entries, photos)).map((it) => ({
+    color: it.color, kind: product, w: cellW, h: cellH, ops: (ox, oy) => setOps(it, ox, oy),
+  }));
+}
+
 /** Laser files for one product, as many sets per file as fit the bed. */
 export async function buildPieceFiles(product: PieceProduct, entries: LaserEntry[],
   photos: Map<string, Buffer> = new Map()): Promise<Buffer[]> {
   await ensureHB();
-  const order = MODEL_ORDER[product];
-  const its = (await items(product, entries, photos)).sort((a, b) => order.indexOf(a.model) - order.indexOf(b.model));
+  const its = await sortedItems(product, entries, photos);
   const [cellW, cellH, maxCols, maxRows] = pieceCell(product);
   return cappedFiles(its, (part) => pagesByColour(part, maxCols, maxRows), (rows) => rows.flat(), async (rows) => {
     const cols = Math.max(...rows.map((r) => r.length));
