@@ -6,9 +6,11 @@
  *   photographed page  -> paper flattened, then thresholded (writing only)
  *   photograph         -> Floyd–Steinberg dots
  * and written as CMYK ink in UPPERCASE hex: RDWorks reads lowercase a–f as almost
- * no ink, which is what made the photos engrave faint.
+ * no ink, which is what made the photos engrave faint. A logo or design in colour
+ * (or light on a dark ground) is first redrawn as black lines (laserLineArt).
  */
 import { LIMITS } from "./laserCore.js";
+import { isGraphic, LINE_ART_GATE, LINE_ART_WORK, lineArt, type Rgb } from "./laserLineArt.js";
 
 const LOGO_TARGET_DPI = 300;                       // the factory's own .rld bitmaps are ~303 DPI
 const RICH_BLACK = [0xbf, 0xad, 0xa7, 0xe6];        // the factory deer's darkest ink, C/M/Y/K
@@ -18,8 +20,10 @@ const PAGE_PAPER_SHARE = 0.65;
 
 interface Gray { w: number; h: number; v: Float32Array }   // luminance 0..255, row-major
 
+interface Decoded { gray: Gray; rgba: Uint8Array | Buffer }
+
 /** Decode (EXIF-oriented) to luminance over white. sharp when installed, else jimp. */
-async function decodeGray(buf: Buffer): Promise<Gray> {
+async function decode(buf: Buffer): Promise<Decoded> {
   let w = 0, h = 0, rgba: Uint8Array | Buffer;
   try {
     const sharp = (await import("sharp")).default;
@@ -36,7 +40,40 @@ async function decodeGray(buf: Buffer): Promise<Gray> {
     const l = (rgba[i * 4]! * 299 + rgba[i * 4 + 1]! * 587 + rgba[i * 4 + 2]! * 114) / 1000;
     v[i] = Math.floor(l * a + 255 * (1 - a));
   }
-  return { w, h, v };
+  return { gray: { w, h, v }, rgba };
+}
+
+/** The picture in colour over white, shrunk to at most `side` px on its long side. */
+function colourAt({ gray: { w, h }, rgba }: Decoded, side: number): Rgb {
+  const scale = Math.min(1, side / Math.max(w, h));
+  const W = Math.max(1, Math.floor(w * scale + 0.5)), H = Math.max(1, Math.floor(h * scale + 0.5));
+  const channel = (c: number) => {
+    let g: Gray = { w, h, v: new Float32Array(w * h) };
+    for (let i = 0; i < w * h; i++) {
+      const a = rgba[i * 4 + 3]! / 255;
+      g.v[i] = Math.round(rgba[i * 4 + c]! * a + 255 * (1 - a));
+    }
+    if (W !== w || H !== h) g = resample(g, W, H, "bicubic");
+    return Float64Array.from(g.v, (x) => Math.min(255, Math.max(0, Math.round(x))));
+  };
+  return { w: W, h: H, r: channel(0), g: channel(1), b: channel(2) };
+}
+
+const lineArtCache = new WeakMap<Buffer, Gray | null>();
+
+/** What gets engraved, before sizing: the luminance - or, for a logo or design in
+ *  colour, its black line art (the same for every place the photo goes). */
+function engraveSource(buf: Buffer, d: Decoded): Gray {
+  if (!lineArtCache.has(buf)) {
+    let art: Gray | null = null;
+    if (isGraphic(colourAt(d, LINE_ART_GATE))) {
+      const im = colourAt(d, LINE_ART_WORK);
+      art = { w: im.w, h: im.h, v: lineArt(im) };
+    }
+    lineArtCache.set(buf, art);
+  }
+  const art = lineArtCache.get(buf);
+  return art ? { w: art.w, h: art.h, v: Float32Array.from(art.v) } : d.gray;
 }
 
 function crop(g: Gray, x0: number, y0: number, x1: number, y1: number): Gray {
@@ -201,7 +238,7 @@ export async function pickDesign<T>(images: Array<{ item: T; buf: Buffer }>): Pr
   if (images.length <= 1) return [images[0]!.item, []];
   const shares: number[] = [];
   for (const { buf } of images) {
-    const r = await prepPhotoRaster(buf, PROBE_PT, PROBE_PT).catch(() => null);
+    const r = await prepPhotoRaster(buf, PROBE_PT, PROBE_PT, { lineArt: false }).catch(() => null);
     shares.push(r ? burnShare(r) : 0);
   }
   let usable = shares.map((s, i) => [s, i] as const).filter(([s]) => s > 0.002).map(([, i]) => i);
@@ -216,7 +253,7 @@ export interface PhotoSignature { aspect: number; cells: Float64Array }
 /** (aspect, 24 x 24 burn shares) of a picture at the probe size, or null - to tell
  *  the same photo uploaded twice (another file, format or size). */
 export async function photoSignature(buf: Buffer): Promise<PhotoSignature | null> {
-  const r = await prepPhotoRaster(buf, PROBE_PT, PROBE_PT).catch(() => null);
+  const r = await prepPhotoRaster(buf, PROBE_PT, PROBE_PT, { lineArt: false }).catch(() => null);
   if (!r) return null;
   const total = new Float64Array(SIG * SIG), count = new Float64Array(SIG * SIG);
   for (let y = 0; y < r.rows; y++) {
@@ -288,9 +325,13 @@ export function traceRaster(r: PreppedRaster): Array<Array<[number, number]>> | 
 }
 
 /** Crop the whitespace, size to 300 DPI at its real placement (zone in points),
- *  finish black/white and encode as the factory's CMYK. null = nothing to engrave. */
-export async function prepPhotoRaster(buf: Buffer, zoneWPt: number, zoneHPt: number): Promise<PreppedRaster | null> {
-  let g = await decodeGray(buf);
+ *  finish black/white and encode as the factory's CMYK. null = nothing to engrave.
+ *  lineArt: false = the plain engraving (the probes that compare photos). */
+export async function prepPhotoRaster(
+  buf: Buffer, zoneWPt: number, zoneHPt: number, opts: { lineArt?: boolean } = {},
+): Promise<PreppedRaster | null> {
+  const d = await decode(buf);
+  let g = opts.lineArt === false ? d.gray : engraveSource(buf, d);
   const { w, h } = g;
   const v = g.v;
   // Light-grey paper around a photographed design would engrave as a faint plate:

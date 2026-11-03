@@ -1,6 +1,6 @@
 /**
  * Laser files: routing to the store's own product families, photos engraved in
- * solid black/white with UPPERCASE hex, plain pieces still cut, and every file
+ * solid black/white with UPPERCASE hex, colour logos redrawn as lines, plain pieces still cut, and every file
  * kind (medallions, wallets, passport holders, purses, purse boxes, box grid).
  * Run: npm run test:laser-files
  */
@@ -11,6 +11,7 @@ import { buildKeychainFiles } from "../services/laser/keychainFile.js";
 import { BED_H_MM, BED_W_MM, colourSheets, type LaserCell, LIMITS, shelfPages } from "../services/laser/laserCore.js";
 import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
 import { photoSignature, pickDesign, prepPhotoRaster, samePhoto, traceRaster } from "../services/laser/laserPhoto.js";
+import { isGraphic, lineArt, type Rgb } from "../services/laser/laserLineArt.js";
 import { bundleLeftover, cleanText, entryPieces, heartsLast, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
 import { buildPieceFiles, pieceCell, pieceLogo, pieceZoneFor } from "../services/laser/pieceFile.js";
 import { PIECE_TEMPLATES } from "../services/laser/laserAssets.js";
@@ -81,6 +82,62 @@ await test("photos engrave solid black/white in UPPERCASE hex", async () => {
   const px = new Set<string>();
   for (let i = 0; i < r!.hex.length; i += 8) px.add(r!.hex.slice(i, i + 8));
   assert.deepEqual([...px].sort(), ["00000000", "BFADA7E6"]);
+});
+
+/** A picture drawn pixel by pixel: [r, g, b] at (x, y). */
+function picture(w: number, h: number, at: (x: number, y: number) => [number, number, number]): Rgb {
+  const im: Rgb = { w, h, r: new Float64Array(w * h), g: new Float64Array(w * h), b: new Float64Array(w * h) };
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const [r, g, b] = at(x, y).map((v) => Math.min(255, Math.max(0, Math.round(v))));
+    im.r[y * w + x] = r!; im.g[y * w + x] = g!; im.b[y * w + x] = b!;
+  }
+  return im;
+}
+async function png(im: Rgb): Promise<Buffer> {
+  const j = new Jimp(im.w, im.h, 0xffffffff);
+  j.scan(0, 0, im.w, im.h, (_x, _y, idx) => {
+    const i = idx / 4;
+    j.bitmap.data[idx] = im.r[i]!; j.bitmap.data[idx + 1] = im.g[i]!; j.bitmap.data[idx + 2] = im.b[i]!;
+  });
+  return j.getBufferAsync(Jimp.MIME_PNG);
+}
+/** A big red badge and a thin blue line on white. */
+const colourLogo = () => picture(400, 300, (x, y) =>
+  (x - 200) ** 2 + (y - 120) ** 2 <= 100 ** 2 ? [200, 30, 40] : y >= 262 && y <= 266 && x >= 50 && x <= 350 ? [30, 60, 200] : [255, 255, 255]);
+
+await test("a colour logo is redrawn as black lines: outline, thin parts solid, white ground", () => {
+  const im = colourLogo();
+  assert.ok(isGraphic(im));
+  const a = lineArt(im), at = (x: number, y: number) => a[y * im.w + x];
+  assert.deepEqual([...new Set(a)].sort(), [0, 255]);
+  assert.equal(at(200, 120), 255);                                     // inside the badge: not burnt
+  let outline = false;
+  for (let y = 16; y < 25; y++) for (let x = 196; x < 205; x++) outline ||= at(x, y) === 0;
+  assert.ok(outline);                                                  // its outline is
+  assert.equal(at(200, 264), 0);                                       // the thin line stays solid
+  assert.equal(at(10, 290), 255);
+});
+
+await test("a light design on a dark ground: the ground turns white", () => {
+  const im = picture(300, 300, (x, y) => (y >= 147 && y < 153 && x >= 40 && x < 260 ? [245, 245, 245] : [10, 10, 10]));
+  assert.ok(isGraphic(im));
+  const a = lineArt(im);
+  assert.equal(a[20 * 300 + 20], 255);
+  assert.equal(a[150 * 300 + 150], 0);
+});
+
+await test("the engraving uses the lines; a black drawing and a photograph are unchanged", async () => {
+  const r = (await prepPhotoRaster(await png(colourLogo()), 216, 144))!;
+  assert.ok(!r.hex.startsWith("BFADA7E6", (Math.floor(r.rows * 0.4) * r.cols + Math.floor(r.cols / 2)) * 8));   // no black plate
+  const drawing = await blackSquarePng();
+  assert.equal((await prepPhotoRaster(drawing, 216, 144))!.hex, (await prepPhotoRaster(drawing, 216, 144, { lineArt: false }))!.hex);
+  let seed = 2;
+  const noise = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return (seed / 2147483648 - 0.5) * 4; };
+  const photo = picture(320, 240, (x, y) => {                          // smooth shading, as a photo has
+    const u = x / 40, v = y / 40;
+    return [120 + 80 * Math.sin(u) * Math.cos(v) + noise(), 110 + 70 * Math.sin(u + v) + noise(), 100 + 60 * Math.cos(u - 0.5 * v) + noise()];
+  });
+  assert.ok(!isGraphic(photo));
 });
 
 await test("several photos for one place: the design is engraved, not the dark mock-up", async () => {
