@@ -31,8 +31,8 @@ export interface AiEntry {
 }
 import { ARABIC_FONT_B64, LATIN_FONT_B64 } from "./fontsData.js";
 import { BOX_TEMPLATE } from "./boxAssets.js";
-import { cappedFiles, type LaserOp, TRACED_BYTES_PER_POINT } from "./laser/laserCore.js";
-import { burnShare, type PreppedRaster, prepPhotoRaster, traceRaster } from "./laser/laserPhoto.js";
+import { cappedFiles, type LaserOp } from "./laser/laserCore.js";
+import { burnShare, type PreppedRaster, prepPhotoRaster } from "./laser/laserPhoto.js";
 import {
   cleanText, entryPieces, HEARTS, INFINITY, type LaserEntry, partFields, partPhotos, SKIP_CHARS, sourcesOf,
 } from "./laser/laserRouting.js";
@@ -684,12 +684,11 @@ function boxText(e: LaserEntry): string {
 
 /** A box's photo: the bitmap, and its outlines when it can be filled in the box's
  *  colour (null: too fine, it stays a bitmap). */
-interface BoxPhoto extends PreppedRaster { rings: Array<Array<[number, number]>> | null }
 /** One cell per physical box: its writing, the customer's photo (with the writing
  *  under it when there is both), or nothing (a plain box is still cut: outline + logo). */
 type BoxCell =
   | { kind: "text"; block: MultiPoly }
-  | { kind: "photo"; photo: BoxPhoto; block: MultiPoly | null }
+  | { kind: "photo"; photo: PreppedRaster; block: MultiPoly | null }
   | { kind: "plain" };
 
 /** The box writing in as many lines as the zone's width asks for, evened out. */
@@ -724,9 +723,8 @@ async function boxCellContents(entries: LaserEntry[], photos: Map<string, Buffer
           const key = (r: PreppedRaster) => { const s = burnShare(r); return [s <= 0.002 ? 1 : 0, s] as const; };
           prepped.sort((a, b) => { const [a0, a1] = key(a), [b0, b1] = key(b); return a0 - b0 || a1 - b1; });
         }
-        const traced = prepped.map((r): BoxPhoto => ({ ...r, rings: traceRaster(r) }));
         for (let i = 0; i < qty; i++) {
-          if (traced.length) { cells.push({ kind: "photo", photo: traced[i % traced.length]!, block }); continue; }
+          if (prepped.length) { cells.push({ kind: "photo", photo: prepped[i % prepped.length]!, block }); continue; }
           // An unreadable photo: still cut, its "photo N" marker under the writing.
           const marked = weldLinesBlock([...lines, ...(mine.length ? mine.map((p) => p.display_label ?? "photo") : ["photo"])]);
           cells.push(marked ? { kind: "text", block: marked } : { kind: "plain" });
@@ -768,15 +766,9 @@ function boxGridPageOps(cells: BoxCell[]): LaserOp[] {
       const ft = placeTextBox(cell.block, cellX, cellY);
       if (ft) ops.push({ t: "fill", geom: ft, color: ecolor });
     } else if (cell.kind === "photo") {
-      const { cols, rows, hex, rings } = cell.photo;
-      const zone = photoZone(cellX, cellY, cols, rows, cell.block ? boxAreas().photo : boxTextTarget());
-      if (rings) {
-        // the photo's outlines in the box's colour (pixel corners -> font units)
-        const [tx, ty, pw, ph] = zone;
-        const sx = pw / cols, sy = ph / rows;
-        ops.push({ t: "fill", color: ecolor, weight: rings.reduce((n, r) => n + r.length, 0) * TRACED_BYTES_PER_POINT,
-          geom: [rings.map((ring) => ring.map(([x, y]) => [(tx + x * sx) / PT_SCALE, (ty - y * sy) / PT_SCALE] as [number, number]))] });
-      } else ops.push({ t: "raster", cols, rows, hex, zone });
+      const { cols, rows, hex } = cell.photo;
+      // Always a bitmap: drawn as paths in the box's colour the factory can't engrave it.
+      ops.push({ t: "raster", cols, rows, hex, zone: photoZone(cellX, cellY, cols, rows, cell.block ? boxAreas().photo : boxTextTarget()) });
       if (cell.block) {
         const ft = placeTextBox(cell.block, cellX, cellY, boxAreas().text);
         if (ft) ops.push({ t: "fill", geom: ft, color: ecolor });

@@ -10,7 +10,7 @@ import { balancedLines, buildBoxGridBuffers, weldLine, wordmarkIn } from "../ser
 import { buildKeychainFiles } from "../services/laser/keychainFile.js";
 import { BED_H_MM, BED_W_MM, colourSheets, type LaserCell, LIMITS, shelfPages } from "../services/laser/laserCore.js";
 import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
-import { photoSignature, pickDesign, prepPhotoRaster, samePhoto, traceRaster } from "../services/laser/laserPhoto.js";
+import { photoSignature, pickDesign, prepPhotoRaster, samePhoto } from "../services/laser/laserPhoto.js";
 import { isGraphic, lineArt, type Rgb } from "../services/laser/laserLineArt.js";
 import { bundleLeftover, cleanText, entryPieces, heartsLast, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
 import { buildPieceFiles, pieceCell, pieceLogo, pieceZoneFor } from "../services/laser/pieceFile.js";
@@ -179,7 +179,7 @@ await test("a plain box is still cut, with no marker frame; a box photo is engra
   const [photo] = await buildBoxGridBuffers([entry("Gift box", [], 1,
     [{ position_label: "كتابه علي البوكس", display_label: "photo 1", order_name: "#1", attachment_url: url }])] as never,
   new Map([[url, await blackSquarePng()]]));
-  assert.equal(count(text(photo!), /^XI$/gm), 0);              // line art: outlines in the box's colour, no bitmap
+  assert.equal(count(text(photo!), /^XI$/gm), 1);              // a box logo is always a bitmap, never paths
   assert.ok(/^1\.0000 0\.0000 1\.0000 0\.5000 k$/m.test(text(photo!)));   // the first box's green
   assert.deepEqual(await buildBoxGridBuffers([entry("Gift purse box", [["كتابة علي المنتج", "Mama"]])] as never), []);
 });
@@ -191,14 +191,13 @@ await test("a file heavy with photos is split so Telegram can take it", async ()
   box.source_orders = urls.map((_u, i) => ({ order_name: `#${i + 1}`, remaining_quantity: 1 }));
   const png = await blackSquarePng();
   const photos = new Map(urls.map((u) => [u, png]));
-  const [oldBytes, oldTrace] = [LIMITS.maxRasterBytes, LIMITS.maxTraceEdges];
-  LIMITS.maxTraceEdges = -1;                            // every photo stays a bitmap
+  const oldBytes = LIMITS.maxRasterBytes;
   try {
     const [whole] = await buildBoxGridBuffers([box] as never, photos);
     const one = (text(whole!).match(/^%[0-9A-F]+$/gm) ?? []).join("").length / 3;
     LIMITS.maxRasterBytes = Math.floor(one * 1.5);     // room for one photo per file
     assert.equal((await buildBoxGridBuffers([box] as never, photos)).length, 3);
-  } finally { [LIMITS.maxRasterBytes, LIMITS.maxTraceEdges] = [oldBytes, oldTrace]; }
+  } finally { LIMITS.maxRasterBytes = oldBytes; }
 });
 
 await test("medallions: plain ones included, 15 per file", async () => {
@@ -326,17 +325,6 @@ await test("no word is left alone on a line", () => {
   assert.deepEqual(balancedLines("وكل الناس يا أمي مياه، ووحدك زمزم يروي فؤادي", 2), ["وكل الناس يا أمي مياه،", "ووحدك زمزم يروي فؤادي"]);
 });
 
-await test("a box photo's outlines keep its holes (even-odd)", () => {
-  const raster = (rows: string[]) => ({ cols: rows[0]!.length, rows: rows.length,
-    hex: rows.join("").split("").map((c) => (c === "#" ? "BFADA7E6" : "00000000")).join("") });
-  const rings = traceRaster(raster(["####", "#..#", "####"]))!;
-  assert.deepEqual(rings.map((r) => r.length).sort(), [4, 4]);
-  assert.deepEqual(new Set(rings[0]!.map(([x, y]) => `${x},${y}`)), new Set(["0,0", "0,3", "4,3", "4,0"]));
-  const [old] = [LIMITS.maxTraceEdges];
-  LIMITS.maxTraceEdges = 10;
-  try { assert.equal(traceRaster(raster(["#.#.#", ".#.#."])), null); } finally { LIMITS.maxTraceEdges = old; }
-});
-
 await test("a box with writing AND a photo engraves both", async () => {
   const url = "https://cdn.example/p.png";
   const [file] = await buildBoxGridBuffers([entry("Gift box", [["كتابه علي المنتج", "Amin ♥️"]], 1,
@@ -344,7 +332,8 @@ await test("a box with writing AND a photo engraves both", async () => {
   new Map([[url, await blackSquarePng()]]));
   const ai = text(file!);
   assert.ok(!ai.includes("photo 1"));
-  assert.ok(count(ai, /^f$/gm) >= 3);                                  // logo, photo outlines, writing
+  assert.equal(count(ai, /^XI$/gm), 1);                                // the photo, a bitmap
+  assert.ok(count(ai, /^f$/gm) >= 2);                                  // logo, writing
 });
 
 await test("wallet: pocket writing at most 70 x 40 mm, one word on the face 70 mm on one line", () => {
