@@ -3,8 +3,10 @@
  * a resumed preview regenerates the same files under the same artifact keys:
  * the line-by-line file (products with no laser template, and bundle fields no
  * piece takes), then one file per leather colour (owner, 2026-11-02: "a laser file
- * by colour, not by product") with that colour's wallets, passport holders, purses,
- * purse boxes and medallions, colours A-Z.
+ * by colour, not by product") with that colour's wallets, passport holders, purses
+ * and medallions, colours A-Z, then the purse boxes in a file of their own, whatever
+ * the purse's colour (owner, 2026-11-04: "بوكسات بورتفيه"; "box port" is the name of
+ * the factory's own file).
  */
 import { buildAiBuffers, ensureHB } from "../aiWriter.js";
 import { keychainCells } from "./keychainFile.js";
@@ -49,12 +51,13 @@ export async function buildLaserArtifacts(
     ...await walletCells(entries, photos),
     ...await pieceCells("passport", entries, photos),
     ...await pieceCells("purse", entries, photos),
-    ...await pieceCells("purse_box", entries, photos),
     ...await keychainCells(entries, photos),
   ];
   for (const { color, files } of await colourSheets(cells)) {
     add(files, colourStem(color), color ? `ملف ليزر ${color.toUpperCase()}` : "ملف ليزر - لون مش معروف");
   }
+  const purseBoxes = (await pieceCells("purse_box", entries, photos)).map((c) => ({ ...c, color: "" }));
+  for (const { files } of await colourSheets(purseBoxes)) add(files, "box-port", "بوكسات بورتفيه");
   return out;
 }
 

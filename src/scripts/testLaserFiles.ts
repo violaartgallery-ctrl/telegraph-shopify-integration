@@ -244,18 +244,26 @@ await test("passport / purse / purse box sets fit the 1400 x 900 bed", async () 
 // ── Owner's corrections of 2026-11-02 ────────────────────────────────────────
 const coloured = (e: LaserEntry, color: string): LaserEntry => ({ ...e, display_color: color });
 
-await test("a batch makes the line-by-line file, then one file per leather colour (A-Z) with all its products", async () => {
+await test("a batch makes the line-by-line file, one file per leather colour (A-Z), then the purse boxes' own", async () => {
   const files = await buildLaserArtifacts([
     entry("Magic Wallet - RFID protection"), entry("Bag Tag – Personalized Leather Luggage Tag", [["Bag tag", "Ali"]]),
     coloured(entry("Photo keychain"), "Black"), entry("Wallet"), coloured(entry("Custom Passport holder"), "Dark Navy"),
     coloured(entry("Purse"), "dark navy"), entry("Gift purse box"), coloured(entry("Wallet"), "Unknown Color"),
   ], new Map());
-  assert.deepEqual(files.map((f) => f.kind), ["laser", "black", "brown", "dark-navy", "no-colour"]);
+  assert.deepEqual(files.map((f) => f.kind), ["laser", "black", "brown", "dark-navy", "no-colour", "box-port"]);
   assert.deepEqual(files.map((f) => f.label),
-    ["ملف الليزر", "ملف ليزر BLACK", "ملف ليزر BROWN", "ملف ليزر DARK NAVY", "ملف ليزر - لون مش معروف"]);
+    ["ملف الليزر", "ملف ليزر BLACK", "ملف ليزر BROWN", "ملف ليزر DARK NAVY", "ملف ليزر - لون مش معروف", "بوكسات بورتفيه"]);
   const navy = text(files[3]!.buffer);
   assert.equal(count(navy, /^0\.0000 1\.0000 0\.75\d\d 0\.0000 K$/gm), 1);        // the passport's cover holes
   assert.ok(count(navy, /^S$/gm) > 312 + 37);                                         // + the purse's strokes
+});
+
+await test("purse boxes of every colour share their one file, none goes in a colour file", async () => {
+  const mama = (color: string) => coloured(entry("Gift purse box", [["كتابة علي المنتج", "Mama"]]), color);
+  const files = await buildLaserArtifacts([mama("Maroon"), mama("Black"), coloured(entry("Purse"), "Black")], new Map());
+  assert.deepEqual(files.map((f) => f.kind), ["black", "box-port"]);
+  const purseOnly = (await buildLaserArtifacts([coloured(entry("Purse"), "Black")], new Map()))[0]!;
+  assert.equal(count(text(files[0]!.buffer), /^S$/gm), count(text(purseOnly.buffer), /^S$/gm));
 });
 
 await test("a colour sheet keeps each kind on its own rows inside the 1400 x 900 mm bed", async () => {
