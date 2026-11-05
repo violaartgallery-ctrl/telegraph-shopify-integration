@@ -6,13 +6,13 @@
  */
 import assert from "node:assert/strict";
 import Jimp from "jimp";
-import { balancedLines, buildBoxGridBuffers, weldLine, wordmarkIn } from "../services/aiWriter.js";
+import { balancedLines, boxTextLines, buildBoxGridBuffers, ensureHB, weldLine, wordmarkIn } from "../services/aiWriter.js";
 import { buildKeychainFiles } from "../services/laser/keychainFile.js";
 import { BED_H_MM, BED_W_MM, colourSheets, type LaserCell, LIMITS, shelfPages } from "../services/laser/laserCore.js";
 import { buildLaserArtifacts } from "../services/laser/laserFiles.js";
 import { photoSignature, pickDesign, prepPhotoRaster, samePhoto } from "../services/laser/laserPhoto.js";
 import { isGraphic, lineArt, type Rgb } from "../services/laser/laserLineArt.js";
-import { bundleLeftover, cleanText, entryPieces, heartsLast, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
+import { bundleLeftover, cleanLines, cleanText, entryPieces, heartsLast, type LaserEntry, partFields } from "../services/laser/laserRouting.js";
 import { buildPieceFiles, pieceCell, pieceLogo, pieceZoneFor } from "../services/laser/pieceFile.js";
 import { PIECE_TEMPLATES } from "../services/laser/laserAssets.js";
 import { buildWalletFiles, placedByZone, placeTexts, templateGeom, WALLET_ZONES, walletZoneFor } from "../services/laser/walletFile.js";
@@ -364,6 +364,24 @@ await test("a note to the team is never engraved: the plane logo where it asks f
   const plane = placeTexts([["المحفظة برا شمال", "نفس  لوجو الطيارة اللي في صورة الويبسايت"], ["المحفظة برا يمين", "Maryam"]],
     zoneFor, "t");
   assert.deepEqual([plane.texts, plane.logos, plane.planes], [{ "برا يمين": ["Maryam"] }, {}, ["برا شمال"]]);
+});
+
+await test("a box keeps the lines the team typed, only one too wide wraps", async () => {
+  await ensureHB();
+  assert.equal(cleanLines(" Feel like  home ❤️\r\n\r\n A ❤️ N \n"), "Feel like home ❤️\nA ❤️ N");
+  assert.deepEqual(boxTextLines("Feel like home\nA N", 1e9), ["Feel like home", "A N"]);
+  assert.deepEqual(boxTextLines("one two\nthree", 1), ["one", "two", "three"]);
+  assert.deepEqual(boxTextLines("", 1e9), []);
+});
+
+await test("a purse box keeps the lines the team typed, other pieces join them", async () => {
+  await ensureHB();
+  const zoneFor = () => "x";
+  assert.deepEqual(placeTexts([["a", "Mama\nLove"]], zoneFor, "t", true).texts, { x: ["Mama\nLove"] });
+  assert.deepEqual(placeTexts([["a", "Mama\nLove"]], zoneFor, "t").texts, { x: ["Mama Love"] });
+  const zone = { x: [0, 200] as [number, number], line_h: 10, max_h: 30, align: "centre" as const, photo_h: 10, cy: 0 };
+  assert.equal(fitBlock("Mama\nLove", [], zone)[1], 2);
+  assert.equal(fitBlock("Mama Love", [], zone)[1], 1);
 });
 
 console.log(`${passed} passed`);

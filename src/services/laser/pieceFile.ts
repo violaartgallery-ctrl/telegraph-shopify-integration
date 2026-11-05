@@ -135,7 +135,7 @@ async function items(product: PieceProduct, entries: LaserEntry[], photos: Map<s
     if (!entryPieces(e).has(product)) continue;
     const model = pieceModel(product, e);
     const { texts, logos, planes } = placeTexts(partFields(e, product), (label) => pieceZoneFor(product, model, label),
-      `${product} (${model})`);
+      `${product} (${model})`, product === "purse_box");
     const placed = await placedByZone(e, photos, product, (label) => pieceZoneFor(product, model, label),
       `${product} (${model})`);
     for (const { order, qty } of sourcesOf(e)) {

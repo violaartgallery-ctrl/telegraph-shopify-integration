@@ -66,7 +66,8 @@ export interface Zone {
 }
 
 /** Weld `text` (+ marker lines) into the zone at the largest size: one line unless
- *  it only fits smaller, then up to 4 evened-out lines. [block centred on (0,0), n lines]. */
+ *  it only fits smaller, then up to 4 evened-out lines. Lines kept in `text` ("\n", a
+ *  purse box) stay as typed, only the size changes. [block centred on (0,0), n lines]. */
 export function fitBlock(text: string, extraLines: string[], zone: Zone): [MultiPoly | null, number] {
   const word = zone.word !== undefined && !extraLines.length && wordCount(text) === 1 ? zone.word : undefined;
   const zoneW = Math.min(zone.x[1] - zone.x[0], word ?? zone.max_w ?? Infinity) * MM;
@@ -74,8 +75,9 @@ export function fitBlock(text: string, extraLines: string[], zone: Zone): [Multi
   let best: MultiPoly | null = null, bestS = 0, bestN = 0;
   const tried = new Set<number>();
   const nWords = text.split(/\s+/).filter(Boolean).length;
+  const typed = text.includes("\n") ? text.split("\n") : null;
   for (let n = 1; n <= (word ? 1 : zone.max_lines ?? 4); n++) {   // one word (with its hearts) stays one line
-    const lines = text ? balancedLines(text, n) : [];
+    const lines = typed ?? (text ? balancedLines(text, n) : []);
     if (tried.has(lines.length)) continue;
     tried.add(lines.length);
     const block = weldLinesBlock([...lines, ...extraLines]);
@@ -85,7 +87,7 @@ export function fitBlock(text: string, extraLines: string[], zone: Zone): [Multi
     const bw = Math.max(maxx - minx, 1e-6), bh = Math.max(maxy - miny, 1e-6);
     const s = Math.min(zoneW / bw, maxH / bh, (lineH * k) / bh);
     if (s > bestS * 1.02) { best = block; bestS = s; bestN = k; }  // more lines only when clearly bigger
-    if (!text || lines.length >= nWords) break;
+    if (!text || typed || lines.length >= nWords) break;
   }
   return best ? [centred(scale(best, bestS)), bestN] : [null, 0];
 }

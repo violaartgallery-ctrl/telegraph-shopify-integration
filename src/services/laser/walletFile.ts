@@ -19,6 +19,7 @@ import {
 } from "./laserCore.js";
 import { type PhotoSignature, photoSignature, pickDesign, prepPhotoRaster, samePhoto } from "./laserPhoto.js";
 import {
+  cleanLines,
   entryColor, entryPieces, heartsLast, isInstruction, isPlaneNote, type LaserEntry, type LaserPhoto, partFields, partPhotos, type Piece,
   sourcesOf, stripQuotes,
 } from "./laserRouting.js";
@@ -68,12 +69,12 @@ export function walletModel(e: LaserEntry): Model {
 
 /** [hint, text]: the writing without quotes/brackets, its hearts at the end, and
  *  an old placement hint. */
-export function cleanValue(value: unknown): [string, string] {
+export function cleanValue(value: unknown, keepLines = false): [string, string] {
   let s = String(value ?? "");
   let hint = "";
   const m = HINT_RE.exec(s);
   if (m) { hint = m[1]!; s = s.slice(m[0].length); }
-  return [hint, heartsLast(stripQuotes(s).split(/\s+/).filter(Boolean).join(" "))];
+  return [hint, keepLines ? cleanLines(s) : heartsLast(stripQuotes(s).split(/\s+/).filter(Boolean).join(" "))];
 }
 
 export interface PlacedTexts {
@@ -87,10 +88,10 @@ export interface PlacedTexts {
 /** A place's writings; a note to the team is never engraved: the plane logo when it
  *  asks for it, else a LOGO marker. */
 export function placeTexts<Z extends string>(fields: Array<[string, string]>, zoneFor: (label: string, hint: string) => Z | null,
-  who: string): PlacedTexts {
+  who: string, keepLines = false): PlacedTexts {
   const texts: Record<string, string[]> = {}, logos: Record<string, string[]> = {}, planes: string[] = [];
   for (const [label, value] of fields) {
-    const [hint, s] = cleanValue(value);
+    const [hint, s] = cleanValue(value, keepLines);
     if (!s) continue;
     const zone = zoneFor(label, hint);
     if (!zone) { console.warn(`[laser] ${who}: no writing place for "${label}" — not engraved.`); continue; }

@@ -177,6 +177,11 @@ export function isPlaneNote(text: string): boolean {
 export function cleanText(v: unknown): string {
   return heartsLast(stripQuotes(String(v ?? "")).split(/\s+/).filter(Boolean).join(" "));
 }
+
+/** The same, line by line: a box keeps the lines the team typed in the editor. */
+export function cleanLines(v: unknown): string {
+  return String(v ?? "").split(/\r?\n/).map(cleanText).filter(Boolean).join("\n");
+}
 export function qtyOf(e: LaserEntry): number {
   const q = Number(e.total_quantity || 1);
   return Number.isFinite(q) && q > 0 ? Math.floor(q) : 1;

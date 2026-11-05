@@ -34,7 +34,7 @@ import { BOX_TEMPLATE } from "./boxAssets.js";
 import { cappedFiles, type LaserOp } from "./laser/laserCore.js";
 import { burnShare, type PreppedRaster, prepPhotoRaster } from "./laser/laserPhoto.js";
 import {
-  cleanText, entryPieces, HEARTS, INFINITY, type LaserEntry, partFields, partPhotos, SKIP_CHARS, sourcesOf,
+  cleanLines, entryPieces, HEARTS, INFINITY, type LaserEntry, partFields, partPhotos, SKIP_CHARS, sourcesOf,
 } from "./laser/laserRouting.js";
 
 type Ring = [number, number][];
@@ -679,7 +679,7 @@ function logoGeom(cellX: number, cellY: number): MultiPoly | null {
 // A box carries only its engraving message. In a bundle it takes the box's own
 // fields; a purse bundle's box is the purse box (its own file, laser/pieceFile.ts).
 function boxText(e: LaserEntry): string {
-  return partFields(e, "box").map(([, v]) => cleanText(v)).filter(Boolean).join("  ");
+  return partFields(e, "box").map(([, v]) => cleanLines(v)).filter(Boolean).join("  ");
 }
 
 /** A box's photo: the bitmap, and its outlines when it can be filled in the box's
@@ -691,9 +691,9 @@ type BoxCell =
   | { kind: "photo"; photo: PreppedRaster; block: MultiPoly | null }
   | { kind: "plain" };
 
-/** The box writing in as many lines as the zone's width asks for, evened out. */
-function boxTextLines(text: string, targetW: number): string[] {
-  return text ? balancedLines(text, wrapToWidth(text, targetW).length) : [];
+/** The box writing, each typed line on its own: one wider than the zone wraps, evened out. */
+export function boxTextLines(text: string, targetW: number): string[] {
+  return text.split("\n").filter(Boolean).flatMap((line) => balancedLines(line, wrapToWidth(line, targetW).length));
 }
 
 async function boxCellContents(entries: LaserEntry[], photos: Map<string, Buffer>): Promise<BoxCell[]> {
