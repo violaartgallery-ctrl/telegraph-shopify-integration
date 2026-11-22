@@ -270,6 +270,7 @@ async function mutate<T>(lane: OpsLane, change: (state: OpsState) => { state: Op
 
 async function runLane(lane: OpsLane): Promise<unknown> {
   if (safeQueueHoldReason()) throw new Error('Automatic work is held');
+  const laneStartedAt = Date.now();
   const { createAppServices } = await import('../app.js');
   const { shipmentStatusSyncService: sync, metaDeliveryService: meta, locationCatalogService } = createAppServices();
   const results: Record<string, unknown> = {};
@@ -279,11 +280,25 @@ async function runLane(lane: OpsLane): Promise<unknown> {
     catch (error) { if (isDatabaseQuotaError(error)) throw error; results[name] = { error: String(error).slice(0, 500) }; if (!diagnosticOnly) errors.push(name); }
   };
   const finish = () => { if (errors.length) throw new Error(`Ops lane stages failed: ${errors.join(', ')}`); return results; };
+  // WhatsApp-only Odoo orders. Off unless WHATSAPP_ODOO_BRIDGE_ENABLED=true; when
+  // off it touches nothing. Diagnostic-only: a bridge failure never fails the
+  // lane, so the control message is never redelivered because of it.
+  const bridgeOn = process.env.WHATSAPP_ODOO_BRIDGE_ENABLED?.trim().toLowerCase() === 'true';
+  // While off: no stage, no import, lane output identical to before.
+  const whatsappOdoo = async (run: (bridge: import('./whatsappOdooBridgeService.js').WhatsappOdooBridgeService) => Promise<unknown>) => {
+    if (!bridgeOn) return;
+    await attempt('whatsappOdoo', async () => {
+      const { createWhatsappOdooBridge } = await import('./whatsappOdooBridgeRuntime.js');
+      const bridge = await createWhatsappOdooBridge();
+      return bridge ? await run(bridge) : { disabled: true };
+    }, true);
+  };
   if (lane === 'status') {
     // This capability authorizes accounting/status only. Never use it to replay
     // Meta deliveries or resume a human Telegram Preview/Run.
     if (!safeQueueReleaseRequested()) await attempt('meta', () => meta.processPending());
     await attempt('status', () => sync.syncOpenShipments({ budgetMs: 70_000, batchSize: 100 }));
+    await whatsappOdoo(bridge => bridge.syncStatuses());
     if (!safeQueueReleaseRequested()) await attempt('productionRecovery', async () => {
       const { prisma } = await import('../lib/prisma.js');
       if (await prisma.failedPayload.findFirst({ where: { source: 'bot_control', reason: 'bot_paused' } })) return { paused: true };
@@ -299,6 +314,7 @@ async function runLane(lane: OpsLane): Promise<unknown> {
     await attempt('locations', () => locationCatalogService.refreshIfStale(), true);
     await attempt('collections', () => sync.discoverCollectedShipmentsFromReports({ historyPages: 2, budgetMs: 70_000, apply: true, durableCursor: true }));
     await attempt('returns', () => sync.discoverReturnedShipmentsResumable({ historyPages: 2, budgetMs: 70_000, apply: true }));
+    await whatsappOdoo(bridge => bridge.discover());
     return finish();
   }
   const { handler } = await import('../netlify/functions/process-odoo-queue-background.js');
@@ -318,6 +334,10 @@ async function runLane(lane: OpsLane): Promise<unknown> {
   await attempt('returns', () => sync.processReturnQueue({ apply: true, limit: 10, budgetMs: 35_000 }));
   await attempt('shopify', () => sync.processShopifyPaymentQueue({ apply: true, limit: 12, budgetMs: 35_000, allowDiscounts: false }));
   await attempt('collections', () => sync.processOdooCollectionQueue({ apply: true, limit: 20, budgetMs: 50_000 }));
+  // Only start bridge writes with time left inside the 300 s function and 330 s lease.
+  const bridgeBudgetMs = Math.min(30_000, 230_000 - (Date.now() - laneStartedAt));
+  if (bridgeBudgetMs >= 10_000) await whatsappOdoo(bridge => bridge.processActions({ limit: 3, budgetMs: bridgeBudgetMs }));
+  else if (bridgeOn) results.whatsappOdoo = { skipped: 'lane-time-budget' };
   return finish();
 }
 

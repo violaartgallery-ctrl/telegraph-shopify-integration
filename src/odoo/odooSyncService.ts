@@ -712,6 +712,43 @@ export class OdooSyncService {
     await this.validatePickingsForSaleOrder(saleOrder, 'customer');
   }
 
+  /**
+   * WhatsApp-only Odoo bridge: create and post ONE customer invoice on an SO
+   * that has no active invoice, sized to the Telegraph merchant net (the same
+   * customerDue rule used for Shopify COD). Never touches ShipmentRecord; the
+   * caller holds a durable bridge claim. An invoice it did not just create is
+   * never reset, edited or duplicated.
+   */
+  async createMerchantNetInvoiceForSaleOrder(saleOrderId: number, target: number): Promise<{
+    id: number; name?: string; state?: string; amount_total?: number; amount_residual?: number; payment_state?: string;
+  }> {
+    this.assertEnabled();
+    if (!Number.isFinite(target) || target <= 0) throw new AutomaticOperationReviewError('Bridge invoice target is not positive');
+    const [saleOrder] = await this.odooClient.searchRead<OdooRecord & { name?: string; invoice_ids?: number[] }>(
+      'sale.order', [['id', '=', saleOrderId]], ['name', 'invoice_ids'], { limit: 1 }
+    );
+    if (!saleOrder) throw new AutomaticOperationReviewError(`Odoo sale order not found: ${saleOrderId}`);
+    if ((await this.findSaleOrderInvoices(saleOrder)).length > 0) {
+      throw new AutomaticOperationReviewError('Sale order already has an invoice; the bridge never creates another');
+    }
+    let invoice = await this.createSaleInvoiceFromWizard(saleOrderId);
+    if (invoice.state === 'posted' && !sameMoney(Number(invoice.amount_total ?? 0), target)) {
+      // Created moments ago inside this same claim; reset only while unpaid.
+      if (invoice.payment_state !== 'not_paid') throw new AutomaticOperationReviewError('New bridge invoice is not unpaid; manual review');
+      await this.odooClient.call('account.move', 'button_draft', [[invoice.id]]);
+      invoice = await this.getInvoice(invoice.id);
+    }
+    if (invoice.state === 'draft') {
+      await this.adjustDraftInvoiceLinesToTotal(invoice.id, target);
+      await this.postDraftMoveWithSequenceRecovery(invoice.id);
+      invoice = await this.getInvoice(invoice.id);
+    }
+    if (invoice.move_type !== 'out_invoice' || invoice.state !== 'posted' || !sameMoney(Number(invoice.amount_total ?? 0), target)) {
+      throw new AutomaticOperationReviewError('Bridge invoice is not an exact posted merchant-net invoice');
+    }
+    return invoice;
+  }
+
   async syncCollectedShipment(recordId: number): Promise<void> {
     this.assertEnabled();
     const record = await shipmentRepository.findById(recordId);

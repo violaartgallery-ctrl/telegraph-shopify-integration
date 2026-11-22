@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { basePrisma } from '../lib/prisma.js';
 import { safeQueueConfig, safeQueueReleaseRequested } from './safeQueuePolicy.js';
+import { whatsappOdooScope } from './whatsappOdooScope.js';
 
 export type AutomaticLane = 'production' | 'return' | 'collection' | 'shopify' | 'status';
 export class AutomaticOperationReviewError extends Error {
@@ -81,6 +82,9 @@ function parseClaim(raw: string): ClaimPayload {
 export function haltAutomaticOperation(reason: string): void {
   const current = scope.getStore();
   if (current) current.halted = reason;
+  // The WhatsApp bridge context is fenced by the same sticky halt.
+  const bridge = whatsappOdooScope.getStore();
+  if (bridge) bridge.halted = reason;
 }
 export function automaticOperationContext(): { recordId: number; shopifyOrderId: string; lane: AutomaticLane } | undefined {
   const c = scope.getStore();
@@ -177,6 +181,7 @@ async function persistReview(c: OperationContext, reason: string): Promise<void>
 export async function withAutomaticOperation<T>(
   input: { recordId: number; lane: AutomaticLane; key: string; fingerprint?: string }, action: () => Promise<T>
 ): Promise<T> {
+  if (whatsappOdooScope.getStore()) throw new AutomaticOperationReviewError('Shopify record operation inside a WhatsApp bridge operation');
   const parent = scope.getStore();
   if (parent) assertOpen(parent);
   if (!enabled()) return await action();
@@ -277,7 +282,20 @@ async function beforeWrite(): Promise<void> {
   await assertOwnedClaim(current);
   assertOpen(current);
 }
-export async function beforeAutomaticOdooWrite(_model: string, _method: string): Promise<void> { await beforeWrite(); }
+export async function beforeAutomaticOdooWrite(model: string, method: string): Promise<void> {
+  // WhatsApp-only Odoo orders carry their own durable claim (no Shopify record).
+  // Both authorities at once would be ambiguous, so that is refused.
+  const bridge = whatsappOdooScope.getStore();
+  if (bridge) {
+    if (scope.getStore()) throw new AutomaticOperationReviewError('Ambiguous Odoo write authority (Shopify record and WhatsApp bridge)');
+    await bridge.beforeWrite(model, method);
+    return;
+  }
+  await beforeWrite();
+}
 /** Unrelated manual shipping remains on its own authorization/lease fences. */
-export async function beforeAutomaticShopifyWrite(): Promise<void> { if (scope.getStore()) await beforeWrite(); }
+export async function beforeAutomaticShopifyWrite(): Promise<void> {
+  if (whatsappOdooScope.getStore()) throw new AutomaticOperationReviewError('The WhatsApp bridge never writes to Shopify');
+  if (scope.getStore()) await beforeWrite();
+}
 export function automaticQueueSafetyActive(): boolean { return safeQueueReleaseRequested(); }
