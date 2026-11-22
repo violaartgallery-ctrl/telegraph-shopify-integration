@@ -48,7 +48,8 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "lint": "tsc --noEmit -p tsconfig.json",
-    "test:whatsapp-odoo-bridge": "tsx src/scripts/testWhatsappOdooBridge.ts"
+    "test:whatsapp-odoo-bridge": "tsx src/scripts/testWhatsappOdooBridge.ts",
+    "test:carrier-review-rearm": "tsx src/scripts/testCarrierReviewRearm.ts"
   },
   "dependencies": {
     "@netlify/blobs": "^10.7.6",

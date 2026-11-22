@@ -332,6 +332,12 @@ async function runLane(lane: OpsLane): Promise<unknown> {
     return JSON.parse(queue.body);
   });
   await attempt('returns', () => sync.processReturnQueue({ apply: true, limit: 10, budgetMs: 35_000 }));
+  // Bounded re-arm of zero-effect "carrier facts changed" reviews once Telegraph
+  // has settled. Explicit opt-in; queue metadata + receipt only (no business
+  // write); diagnostic-only so it can never fail or redeliver the lane.
+  if (safeQueueReleaseRequested() && process.env.OPS_CARRIER_REVIEW_REARM_ENABLED?.trim().toLowerCase() === 'true') {
+    await attempt('carrierReviewRearm', async () => (await import('./carrierReviewRearmRuntime.js')).runNativeCarrierReviewRearm({ limit: 5 }), true);
+  }
   await attempt('shopify', () => sync.processShopifyPaymentQueue({ apply: true, limit: 12, budgetMs: 35_000, allowDiscounts: false }));
   await attempt('collections', () => sync.processOdooCollectionQueue({ apply: true, limit: 20, budgetMs: 50_000 }));
   // Only start bridge writes with time left inside the 300 s function and 330 s lease.
