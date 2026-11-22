@@ -20,6 +20,10 @@ import { MetaDeliveryService } from './meta/metaDeliveryService.js';
 import { verifyResumeRequest } from './services/productionContinuation.js';
 import { resumeProductionInvocation } from './netlify/functions/run-production-background.js';
 import { LocationCatalogService } from './services/locationCatalogService.js';
+import { automationHoldReason } from './services/automationSafety.js';
+import { heldAdminDisplayRequest, heldAdminManualShippingRequest, heldAdminLocationSuggestionRequest, heldAdminOperationsReviewRequest, adminManualShippingEnabled } from './services/adminReadOnlyPolicy.js';
+import { previewOnlyConfig, previewOnlyRequested, manualRunConfig } from './services/productionPreviewOnly.js';
+import { safeQueueConfig, safeQueueHoldReason } from './services/safeQueuePolicy.js';
 
 export const createAppServices = () => {
   const accurateClient = new AccurateClient();
@@ -66,7 +70,32 @@ export const createApp = () => {
   });
 
   app.get('/health', (_request, response) => {
-    response.status(200).json({ ok: true });
+    response.status(200).json({ ok: true, manualPreviewOnly: previewOnlyRequested(),
+      automaticWorkHeld: Boolean(automationHoldReason()), runEnabled: !automationHoldReason() && !previewOnlyRequested(),
+      ...(manualRunConfig() ? { manualRunEnabled: true, financialWorkersHeld: Boolean(safeQueueHoldReason()) } : {}),
+      automaticQueuesEnabled: (() => { try { return Boolean(safeQueueConfig()); } catch { return false; } })(),
+      shopifyManualShippingEnabled: adminManualShippingEnabled() });
+  });
+
+  // Do not acknowledge webhook writes or permit manual shipment routes during
+  // emergency reconciliation. Public GET location catalogs remain available.
+  // Scheduler diagnostics are handled separately and do not query Neon on hold.
+  app.use((request, response, next) => {
+    if (!automationHoldReason() || request.path.startsWith('/ops/')) { next(); return; }
+    // The Telegram handler still authenticates the secret, owner, message date,
+    // update watermark and allowed command. No other route bypasses this hold.
+    if (request.method === 'POST' && request.path === '/telegram-webhook' && previewOnlyConfig()) {
+      next(); return;
+    }
+    // The existing adminAuth gates STILL run below. This permits only exact
+    // display routes and authenticated inert notices, never legacy execution.
+    if (heldAdminDisplayRequest(request.method, request.path) || heldAdminManualShippingRequest(request.method, request.path) || heldAdminLocationSuggestionRequest(request.method, request.path) || heldAdminOperationsReviewRequest(request.method,request.path)) { next(); return; }
+    const publicLocations = ['/storefront/locations', '/api/accurate/locations'].includes(request.path);
+    const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
+    const admin = request.path.startsWith('/orders') || (request.path.startsWith('/api/') && !publicLocations);
+    if (!mutation && !admin) { next(); return; }
+    response.setHeader('Retry-After', '3600');
+    response.status(503).json({ ok: false, reason: automationHoldReason() });
   });
 
   // Shopify's documented fallback for an embedded document request that lost

@@ -15,11 +15,28 @@ import { calculateTelegraphReturnCharge, OdooSyncService } from '../odoo/odooSyn
 import { OdooSaleReturnReviewError } from '../odoo/odooSaleReturnService.js';
 import type { AccurateSnapshotData } from './shipmentRepository.js';
 import type { MetaDeliveryService, MetaDeliverySource } from '../meta/metaDeliveryService.js';
+import {automaticQueueSafetyActive,automaticRecordBlocked,withAutomaticOperation,AutomaticOperationReviewError} from './automaticOperationSafety.js';
+import {readOwnerFinancialApproval,releaseOwnerShopifyAfterAccounting} from './ownerFinancialApproval.js';
+import {loadExactCarrierShipment,assertExactCarrierIdentity} from './verifiedCarrierShipment.js';
+import {isDatabaseQuotaError} from './automationSafety.js';
+import {shopifyOrdersClient} from '../shopify/shopifyOrdersClient.js';
+import {OdooClient} from '../odoo/odooClient.js';
+import {isOdooOnlyRecovery,assertRecoveryNotExcluded} from './cancellationRecoveryPolicy.js';
+import {deferReturnDuringGrace,recordNativeReturnProof,repairDocumentedFalseReturn,recoveryAuthority,assertRecoverySource} from './cancellationRecoveryService.js';
 
 const RETURNED_STATUS_CODES = new Set(['RTRN', 'RTS', 'RJCT']);
 const RETURN_DISCOVERY_CURSOR = 'ops-return-discovery-page-v1';
 const COLLECTION_DISCOVERY_CURSOR = 'ops-collection-discovery-page-v1';
 const FIRST_HISTORICAL_PAGE = 2;
+
+/** Validate fee configuration before status/cancellation/stock writes, not after
+ * a partial return has already completed. */
+export function assertAutomaticReturnFeeConfiguration(charge:number):void {
+  if(automaticQueueSafetyActive()&&(typeof charge!=='number'||!Number.isFinite(charge)||charge<0||charge>0&&(!Number.isSafeInteger(env.odoo.returnChargeAccountId)||Number(env.odoo.returnChargeAccountId)<=0)))throw new AutomaticOperationReviewError('Return charge expense account/amount is not configured; no return source action permitted');
+}
+export function assertAutomaticUnpaidReturn(collectedAmount:number|null|undefined):void {
+  if(automaticQueueSafetyActive()&&(typeof collectedAmount!=='number'||collectedAmount!==0))throw new AutomaticOperationReviewError('Collected/unknown return money requires an explicit settlement decision before cancellation or stock action');
+}
 
 export const isLegacyNonShopifyShipmentCode = (code?: string | null): boolean =>
   /^VI0{5}\d+$/i.test(code?.trim() ?? '');
@@ -379,6 +396,12 @@ export class ShipmentStatusSyncService {
           if (!apply) return;
           const record = matches[0]!;
           try {
+            if(automaticQueueSafetyActive()){
+              if(await automaticRecordBlocked(record.id,'status'))return;
+              const primary=await shipmentRepository.findById(record.id);if(!primary)throw new AutomaticOperationReviewError('Primary collection identity missing');assertExactCarrierIdentity(primary,shipment);
+              assertRecoveryNotExcluded(primary);
+              await repairDocumentedFalseReturn(primary,shipment);
+            }
             const projection = projectAccurateStatusToShopify({
               statusCode: shipment.status?.code,
               statusName: shipment.status?.name,
@@ -430,7 +453,9 @@ export class ShipmentStatusSyncService {
               record.id,
               'Superseded because Telegraph currently reports a collected delivery'
             );
-            const shopifyQueued = await shipmentRepository.queueShopifyPaymentSync(
+            const latest=await shipmentRepository.findById(record.id);
+            const odooOnly=Boolean(latest&&isOdooOnlyRecovery(latest));
+            const shopifyQueued = !odooOnly&&await shipmentRepository.queueShopifyPaymentSync(
               record.id,
               shopifyFingerprint
             );
@@ -438,11 +463,12 @@ export class ShipmentStatusSyncService {
               record.id,
               odooFingerprint
             );
-            await shipmentRepository.ensureCollectedProductionQueued(record.id);
+            if(!odooOnly)await shipmentRepository.ensureCollectedProductionQueued(record.id);
             if (shopifyQueued) summary.shopifyQueued++;
             if (odooQueued) summary.odooQueued++;
             if (!shopifyQueued && !odooQueued) summary.alreadyQueued++;
           } catch (error) {
+            if(isDatabaseQuotaError(error))throw error;
             summary.failed++;
             await failedPayloadService.save({
               source: 'accurate-collection-discovery',
@@ -496,6 +522,7 @@ export class ShipmentStatusSyncService {
       }
       summary.recentSweepComplete = allRecentSweepsComplete;
     } catch (error) {
+      if(isDatabaseQuotaError(error))throw error;
       summary.failed++;
       await failedPayloadService.save({
         source: 'accurate-recent-collection-discovery',
@@ -674,6 +701,12 @@ export class ShipmentStatusSyncService {
   }
 
   async syncRecord(record: StatusPollingRecordRef): Promise<StatusPollingOutcome> {
+    if(automaticQueueSafetyActive()){
+      if(await automaticRecordBlocked(record.id,'status'))return 'synced';
+      const primary=await shipmentRepository.findById(record.id);if(!primary)return 'skipped-no-reference';
+      try{return await this.syncResolvedShipment(record,await loadExactCarrierShipment(this.accurateClient,primary));}
+      catch(error){if(!(error instanceof AutomaticOperationReviewError))throw error;await shipmentRepository.markStatusPollingMiss(record.id,error.message);return 'not-found';}
+    }
     if (!record.accurateShipmentId && !record.accurateShipmentCode) {
       return 'skipped-no-reference';
     }
@@ -729,6 +762,12 @@ export class ShipmentStatusSyncService {
     record: StatusPollingRecordRef,
     shipment: AccurateShipmentSummary
   ): Promise<StatusPollingOutcome> {
+    if(automaticQueueSafetyActive()){
+      if(await automaticRecordBlocked(record.id,'status'))return 'synced';
+      const exact=await shipmentRepository.findById(record.id);if(!exact)throw new AutomaticOperationReviewError('Primary status identity missing');assertExactCarrierIdentity(exact,shipment);
+      assertRecoveryNotExcluded(exact);
+      await repairDocumentedFalseReturn(exact,shipment);
+    }
     if (isLegacyNonShopifyShipmentCode(shipment.code)) {
       logger.info('Skipping legacy non-Shopify Telegraph shipment', {
         recordId: record.id,
@@ -816,7 +855,9 @@ export class ShipmentStatusSyncService {
       }
     }
 
-    await shopifyStatusSyncClient.syncShipmentState({
+    const primaryAfterSnapshot=await shipmentRepository.findById(record.id);
+    const odooOnly=Boolean(primaryAfterSnapshot&&isOdooOnlyRecovery(primaryAfterSnapshot));
+    if(!odooOnly)await shopifyStatusSyncClient.syncShipmentState({
       orderId: record.shopifyOrderId,
       shipmentStatus: effectiveProjection.shipmentStatus,
       collectionStatus: effectiveProjection.collectionStatus,
@@ -861,7 +902,7 @@ export class ShipmentStatusSyncService {
     }
 
     if (effectiveProjection.collectionStatus === 'collected') {
-      await shipmentRepository.queueShopifyPaymentSync(
+      if(!odooOnly)await shipmentRepository.queueShopifyPaymentSync(
         record.id,
         buildShopifyPaymentFingerprint(Number(effectiveCollectedAmount ?? 0))
       );
@@ -874,14 +915,14 @@ export class ShipmentStatusSyncService {
           customerDue: effectiveCustomerDue
         })
       );
-      await shipmentRepository.ensureCollectedProductionQueued(record.id);
+      if(!odooOnly)await shipmentRepository.ensureCollectedProductionQueued(record.id);
     }
 
     if (isReturn) {
       await shipmentRepository.queueReturnSync(record.id, buildReturnSyncFingerprint(shipment));
     }
 
-    if (effectiveProjection.collectionStatus === 'delivered-not-collected') {
+    if (!odooOnly&&effectiveProjection.collectionStatus === 'delivered-not-collected') {
       await this.flagShopifyOrderNotCollected(record);
     }
     return 'synced';
@@ -893,6 +934,16 @@ export class ShipmentStatusSyncService {
     collectedAmount: number,
     allowDiscounts: boolean
   ): Promise<{ transactionId?: string; reason?: string; manualReview?: boolean }> {
+    if(automaticQueueSafetyActive()){
+      const saved=await shipmentRepository.findById(record.id);
+      const fresh=await shopifyOrdersClient.getOrderByLegacyId(record.shopifyOrderId);
+      if(saved){assertRecoveryNotExcluded(saved,fresh);if(isOdooOnlyRecovery(saved))throw new AutomaticOperationReviewError('Odoo-only recovery forbids Shopify payment');}
+      const approval=saved?await readOwnerFinancialApproval(saved,fresh):null;
+      if(approval){
+        if(!approval.releaseShopify||saved?.odooCollectionSyncStatus!=='completed'||!saved.odooInvoiceId||!['paid','paid-existing'].includes(saved.odooSyncStatus??''))throw new AutomaticOperationReviewError('Owner settlement accounting has not completed; no Shopify payment');
+        collectedAmount=approval.shopifyAmount;allowDiscounts=approval.shopifyMode==='discount';
+      }
+    }
     const first = await shopifyStatusSyncClient.recordCustomerPayment({
       orderId: record.shopifyOrderId,
       amount: collectedAmount
@@ -968,7 +1019,7 @@ export class ShipmentStatusSyncService {
         record.id,
         'Superseded because an approved Telegraph collection was received'
       );
-      await shipmentRepository.queueShopifyPaymentSync(
+      if(!isOdooOnlyRecovery(dbRec))await shipmentRepository.queueShopifyPaymentSync(
         record.id,
         buildShopifyPaymentFingerprint(collectedAmount)
       );
@@ -981,7 +1032,7 @@ export class ShipmentStatusSyncService {
           customerDue: dbRec.customerDue
         })
       );
-      await shipmentRepository.ensureCollectedProductionQueued(record.id);
+      if(!isOdooOnlyRecovery(dbRec))await shipmentRepository.ensureCollectedProductionQueued(record.id);
       return;
     }
     logger.info('Shopify payment queue skipped from financials path (no collectedAmount)', {
@@ -1111,6 +1162,10 @@ export class ShipmentStatusSyncService {
         if (!apply) continue;
 
         try {
+          if(automaticQueueSafetyActive()){
+            if(await automaticRecordBlocked(record.id,'status'))continue;
+            const primary=await shipmentRepository.findById(record.id);if(!primary)throw new AutomaticOperationReviewError('Primary return identity missing');assertExactCarrierIdentity(primary,shipment);
+          }
           await this.persistAccurateSnapshot(record.id, {
             accurateStatus: projection.shipmentStatus,
             accurateStatusCode: shipment.status?.code ?? null,
@@ -1140,6 +1195,7 @@ export class ShipmentStatusSyncService {
             summary.queued++;
           }
         } catch (error) {
+          if(isDatabaseQuotaError(error))throw error;
           summary.failed++;
           await failedPayloadService.save({
             source: 'accurate-return-discovery',
@@ -1251,6 +1307,7 @@ export class ShipmentStatusSyncService {
       }
       summary.recentSweepComplete = summary.recentPages.length === recentLastPage;
     } catch (error) {
+      if(isDatabaseQuotaError(error))throw error;
       summary.failed++;
       await failedPayloadService.save({
         source: 'accurate-recent-return-discovery',
@@ -1356,10 +1413,41 @@ export class ShipmentStatusSyncService {
       };
       actions.push(action);
       if (!apply) continue;
+      if(await automaticRecordBlocked(candidate.id,'return')){skipped++;action.status='needs-review';continue;}
+      if(automaticQueueSafetyActive()){
+        try{
+        assertAutomaticReturnFeeConfiguration(charge);
+        assertRecoveryNotExcluded(candidate);
+        const live=await loadExactCarrierShipment(this.accurateClient,candidate);
+        const source=await shopifyOrdersClient.getOrderByLegacyId(candidate.shopifyOrderId);assertRecoveryNotExcluded(candidate,source);
+        const p=projectAccurateStatusToShopify({statusCode:live.status?.code,returnStatusCode:live.returnStatus?.code,collected:live.collected,paidToCustomer:live.paidToCustomer,cancelled:live.cancelled,customerDue:live.customerDue});
+        if(['returned','returned-settled'].includes(p.collectionStatus)&&buildReturnSyncFingerprint(live)===candidate.returnSyncFingerprint&&await deferReturnDuringGrace(candidate,candidate.returnSyncFingerprint!)){skipped++;action.status='return-stability-grace';continue;}
+        }catch(error){if(isDatabaseQuotaError(error))throw error;await shipmentRepository.reviewReturnSync(candidate.id,error instanceof Error?error.message:String(error));skipped++;action.status='needs-review';continue;}
+      }
+      try { await withAutomaticOperation({recordId:candidate.id,lane:'return',key:'return',fingerprint:candidate.returnSyncFingerprint??undefined},async()=>{
+      assertAutomaticReturnFeeConfiguration(charge);
+      if(automaticQueueSafetyActive()){
+        const live=await loadExactCarrierShipment(this.accurateClient,candidate);
+        const projection=projectAccurateStatusToShopify({statusCode:live.status?.code,returnStatusCode:live.returnStatus?.code,collected:live.collected,paidToCustomer:live.paidToCustomer,cancelled:live.cancelled,customerDue:live.customerDue});
+        if(!['returned','returned-settled'].includes(projection.collectionStatus)||buildReturnSyncFingerprint(live)!==candidate.returnSyncFingerprint)throw new AutomaticOperationReviewError('Current carrier return facts changed; do not cancel or return stock');
+        assertAutomaticUnpaidReturn(live.collectedAmount);
+        // Complete the read-only stock/accounting decision BEFORE paying a fee
+        // or cancelling Shopify. Paid invoices and ambiguous stock need a human.
+        if(!this.odooSyncService||!candidate.odooSaleOrderId)throw new AutomaticOperationReviewError('Return Sales Order link/service needs review before any source action');
+        const source=await shopifyOrdersClient.getOrderByLegacyId(candidate.shopifyOrderId);
+        assertRecoveryNotExcluded(candidate,source);
+        const authority=isOdooOnlyRecovery(candidate)?await recoveryAuthority(candidate,source):null;
+        if(authority)await assertRecoverySource(candidate,source,authority);
+        if(source.test||String(source.id)!==candidate.shopifyOrderId||!authority&&(source.financial_status==='paid'||/refund|partial/i.test(source.financial_status??'')))throw new AutomaticOperationReviewError('Paid/refunded Shopify return requires an explicit decision before fee, cancellation, or stock writes');
+        const matches=await new OdooClient().searchRead('sale.order',[['id','=',candidate.odooSaleOrderId]],['name','origin','client_order_ref'],{limit:2});
+        if(matches.length!==1||matches[0]!.origin!==source.name||matches[0]!.client_order_ref!==source.name+' / Viola-'+source.order_number)throw new AutomaticOperationReviewError('Return Sales Order reference is not exact');
+        const preview=await this.odooSyncService.previewReturnedSaleOrder(candidate.odooSaleOrderId);
+        if(preview.status==='needs-review'||preview.activeInvoiceCount>0)throw new AutomaticOperationReviewError('Return stock/invoice decision needs independent review before any source action');
+      }
       if (!await shipmentRepository.claimReturnSync(candidate.id)) {
         skipped++;
         action.status = 'claimed-by-other';
-        continue;
+        return;
       }
 
       const record = await shipmentRepository.findById(candidate.id);
@@ -1370,7 +1458,7 @@ export class ShipmentStatusSyncService {
         );
         skipped++;
         action.status = 'superseded';
-        continue;
+        return;
       }
       if (isLegacyNonShopifyShipmentCode(record.accurateShipmentCode)) {
         await shipmentRepository.supersedeReturnSync(
@@ -1379,7 +1467,7 @@ export class ShipmentStatusSyncService {
         );
         skipped++;
         action.status = 'legacy-excluded';
-        continue;
+        return;
       }
 
       const errors: string[] = [];
@@ -1394,7 +1482,7 @@ export class ShipmentStatusSyncService {
       });
 
       try {
-        await shopifyStatusSyncClient.syncShipmentState({
+        if(!isOdooOnlyRecovery(record))await shopifyStatusSyncClient.syncShipmentState({
           orderId: record.shopifyOrderId,
           shipmentStatus: projection.shipmentStatus,
           collectionStatus: record.collectionStatus!,
@@ -1441,6 +1529,7 @@ export class ShipmentStatusSyncService {
         staffNote: `Telegraph returned shipment (${record.collectionStatus})`
       });
       try {
+        if(!isOdooOnlyRecovery(record)){
         try {
           await cancelShopifyOrder();
         } catch (error) {
@@ -1471,6 +1560,7 @@ export class ShipmentStatusSyncService {
           state = await shopifyStatusSyncClient.fetchOrderPaymentState(record.shopifyOrderId);
         }
         if (!state?.cancelledAt) errors.push('Shopify cancellation was not confirmed');
+        }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         if (reason.startsWith('MANUAL_REVIEW:')) {
@@ -1492,7 +1582,7 @@ export class ShipmentStatusSyncService {
         } else if (!record.odooSaleOrderId) {
           throw new OdooSaleReturnReviewError('Exact Odoo Sales Order link is missing');
         } else {
-          const liveShipment = await this.accurateClient.getShipment({ code: record.accurateShipmentCode });
+          const liveShipment = await loadExactCarrierShipment(this.accurateClient,record);
           if (
             !liveShipment ||
             liveShipment.code !== record.accurateShipmentCode ||
@@ -1560,6 +1650,7 @@ export class ShipmentStatusSyncService {
         });
         failed++;
         action.status = 'retry-scheduled';
+        if(automaticQueueSafetyActive())throw new Error(reason);
       } else if (manualReviewReason) {
         await shipmentRepository.reviewReturnSync(record.id, manualReviewReason);
         await failedPayloadService.save({
@@ -1572,9 +1663,11 @@ export class ShipmentStatusSyncService {
         action.status = 'needs-review';
       } else {
         await shipmentRepository.completeReturnSync(record.id);
+        if(automaticQueueSafetyActive())await recordNativeReturnProof(record);
         processed++;
         action.status = 'completed';
       }
+      }); }catch(error){if(isDatabaseQuotaError(error))throw error;const reason=error instanceof Error?error.message:String(error);await shipmentRepository.reviewReturnSync(candidate.id,reason);skipped++;action.status='needs-review';}
     }
 
     const remaining = await shipmentRepository.countDueReturnSync();
@@ -1629,7 +1722,7 @@ export class ShipmentStatusSyncService {
       status: string;
     }> = [];
 
-    const odooCollectionConcurrency = 5;
+    const odooCollectionConcurrency = automaticQueueSafetyActive()?1:5;
     for (let index = 0; index < records.length; index += odooCollectionConcurrency) {
       if (Date.now() - startedAt >= budgetMs) break;
       const chunk = records.slice(index, index + odooCollectionConcurrency);
@@ -1642,6 +1735,13 @@ export class ShipmentStatusSyncService {
         };
         actions.push(action);
         if (!apply) return;
+        if(await automaticRecordBlocked(candidate.id,'collection')){skipped++;action.status='needs-review';return;}
+        try { await withAutomaticOperation({recordId:candidate.id,lane:'collection',key:'collection',fingerprint:candidate.odooCollectionFingerprint??undefined},async()=>{
+        if(automaticQueueSafetyActive()){
+          const live=await loadExactCarrierShipment(this.accurateClient,candidate);
+          const projection=projectAccurateStatusToShopify({statusCode:live.status?.code,returnStatusCode:live.returnStatus?.code,collected:live.collected,paidToCustomer:live.paidToCustomer,cancelled:live.cancelled,customerDue:live.customerDue});
+          if(projection.collectionStatus!=='collected'||buildOdooCollectionFingerprint(live)!==candidate.odooCollectionFingerprint)throw new AutomaticOperationReviewError('Current carrier collection facts changed; no accounting write');
+        }
         if (isLegacyNonShopifyShipmentCode(candidate.accurateShipmentCode)) {
           await shipmentRepository.supersedeOdooCollectionSync(
             candidate.id,
@@ -1723,6 +1823,10 @@ export class ShipmentStatusSyncService {
             throw new Error(reason);
           }
           await shipmentRepository.completeOdooCollectionSync(current.id);
+          if(automaticQueueSafetyActive()){
+            const completed=await shipmentRepository.findById(current.id);
+            if(completed&&!isOdooOnlyRecovery(completed))await releaseOwnerShopifyAfterAccounting(completed,await shopifyOrdersClient.getOrderByLegacyId(completed.shopifyOrderId));
+          }
           processed++;
           action.amount = currentAmount;
           action.status = 'completed';
@@ -1741,7 +1845,9 @@ export class ShipmentStatusSyncService {
           });
           failed++;
           action.status = 'retry-scheduled';
+          if(automaticQueueSafetyActive())throw error;
         }
+        });}catch(error){if(isDatabaseQuotaError(error))throw error;const reason=error instanceof Error?error.message:String(error);await shipmentRepository.reviewOdooCollectionSync(candidate.id,reason);skipped++;action.status='needs-review';}
       }));
     }
 
@@ -1805,6 +1911,14 @@ export class ShipmentStatusSyncService {
         };
         actions.push(action);
         if (!apply) return;
+        if(await automaticRecordBlocked(candidate.id,'shopify')){skipped++;action.status='needs-review';return;}
+        if(isOdooOnlyRecovery(candidate)){await shipmentRepository.supersedeShopifyPaymentSync(candidate.id,'Owner Odoo-only cancelled-order recovery: no Shopify write');skipped++;action.status='odoo-only';return;}
+        try {await withAutomaticOperation({recordId:candidate.id,lane:'shopify',key:'shopify',fingerprint:candidate.shopifyPaymentFingerprint??undefined},async()=>{
+        if(automaticQueueSafetyActive()){
+          const live=await loadExactCarrierShipment(this.accurateClient,candidate);
+          const projection=projectAccurateStatusToShopify({statusCode:live.status?.code,returnStatusCode:live.returnStatus?.code,collected:live.collected,paidToCustomer:live.paidToCustomer,cancelled:live.cancelled,customerDue:live.customerDue});
+          if(projection.collectionStatus!=='collected'||buildShopifyPaymentFingerprint(Number(live.collectedAmount))!==candidate.shopifyPaymentFingerprint)throw new AutomaticOperationReviewError('Current carrier payment facts changed; no Shopify payment write');
+        }
         if (isLegacyNonShopifyShipmentCode(candidate.accurateShipmentCode)) {
           await shipmentRepository.supersedeShopifyPaymentSync(
             candidate.id,
@@ -1890,7 +2004,9 @@ export class ShipmentStatusSyncService {
           });
           failed++;
           action.status = 'retry-scheduled';
+          if(automaticQueueSafetyActive())throw error;
         }
+        });}catch(error){if(isDatabaseQuotaError(error))throw error;const reason=error instanceof Error?error.message:String(error);await shipmentRepository.reviewShopifyPaymentSync(candidate.id,reason);skipped++;action.status='needs-review';}
       }));
     }
 
@@ -1939,6 +2055,12 @@ export class ShipmentStatusSyncService {
       return 'skipped';
     }
 
+    if(automaticQueueSafetyActive()){
+      if(await automaticRecordBlocked(record.id,'status'))return 'skipped';
+      const primary=await shipmentRepository.findById(record.id);if(!primary)return 'skipped';assertExactCarrierIdentity(primary,shipment);
+      assertRecoveryNotExcluded(primary);await repairDocumentedFalseReturn(primary,shipment);
+    }
+
     const projection = projectAccurateStatusToShopify({
       statusCode: shipment.status?.code,
       statusName: shipment.status?.name,
@@ -1969,7 +2091,8 @@ export class ShipmentStatusSyncService {
     }, 'accurate-payment');
 
     try {
-      await shopifyStatusSyncClient.syncShipmentState({
+      const primary=await shipmentRepository.findById(record.id);
+      if(!primary||!isOdooOnlyRecovery(primary))await shopifyStatusSyncClient.syncShipmentState({
         orderId: record.shopifyOrderId,
         shipmentStatus: projection.shipmentStatus,
         collectionStatus: 'collected',
@@ -2145,10 +2268,11 @@ export class ShipmentStatusSyncService {
           else if (result.value === 'not-found') notFound += 1;
           else skipped += 1;
         } else {
+          if(isDatabaseQuotaError(result.reason))throw result.reason;
           failed += 1;
           const reason = result.reason instanceof Error ? result.reason.message : 'Unknown sync error';
           logger.error('Failed to sync shipment record', { recordId: record.id, reason });
-          if (/shipment not found/i.test(reason)) {
+          if (!automaticQueueSafetyActive()&&/shipment not found/i.test(reason)) {
             await shipmentRepository.clearDeletedShipment(record.shopifyOrderId, reason);
           }
           await failedPayloadService.save({

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import Jimp from 'jimp';
 import { PDFDocument, rgb } from 'pdf-lib';
 import sharp from 'sharp';
+import { PermanentProductionError, PrintPhotoDecodeError } from '../services/productionPipelineErrors.js';
 import {
   buildPrintSheetPdf,
   decodePrintPhoto,
@@ -52,8 +53,9 @@ const pdf = await PDFDocument.load(bytes);
 assert.equal(pdf.getPageCount(), 1);
 
 await assert.rejects(
-  () => decodePrintPhoto(Buffer.from('not-an-image')),
-  /Print photo could not be decoded/
+  () => decodePrintPhoto(Buffer.from('not-an-image'), { orderName: '#SYNTHETIC-1', photoNumber: 3 }),
+  error => error instanceof PrintPhotoDecodeError && error instanceof PermanentProductionError &&
+    error.message.includes('#SYNTHETIC-1') && error.message.includes('رقم 3')
 );
 
 console.log(JSON.stringify({

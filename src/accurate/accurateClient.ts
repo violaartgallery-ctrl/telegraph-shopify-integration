@@ -250,7 +250,7 @@ export class AccurateClient {
     await this.loginPromise;
   }
 
-  private async requestWithAuth<T>(document: string, variables?: Record<string, unknown>): Promise<T> {
+  private async requestWithAuth<T>(document: string, variables?: Record<string, unknown>, retryReads = true): Promise<T> {
     await this.ensureAuthenticated();
 
     const run = async (): Promise<T> => {
@@ -269,6 +269,10 @@ export class AccurateClient {
       }
     };
 
+    // A lost mutation response is an unknown outcome, not a retry instruction.
+    // Authentication happens before the single write; never replay that write
+    // automatically after a transient error or token refresh.
+    if (!retryReads) return await run();
     try {
       return await retry(run, isTransientError, 3, 500);
     } catch (error) {
@@ -315,7 +319,7 @@ export class AccurateClient {
   }
 
   async saveShipment(input: AccurateShipmentInput): Promise<SaveShipmentResponse['saveShipment']> {
-    const response = await this.requestWithAuth<SaveShipmentResponse>(SAVE_SHIPMENT_MUTATION, { input });
+    const response = await this.requestWithAuth<SaveShipmentResponse>(SAVE_SHIPMENT_MUTATION, { input }, false);
     return response.saveShipment;
   }
 

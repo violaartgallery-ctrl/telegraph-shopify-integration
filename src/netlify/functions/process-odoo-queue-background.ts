@@ -22,6 +22,14 @@ import { logger } from '../../lib/logger.js';
 import { shopifyOrdersClient } from '../../shopify/shopifyOrdersClient.js';
 import { shopifyStatusSyncClient } from '../../shopify/shopifyStatusSyncClient.js';
 import type { ShopifyOrder } from '../../types/shopify.js';
+import {withAutomaticOperation,automaticQueueSafetyActive,AutomaticOperationReviewError} from '../../services/automaticOperationSafety.js';
+import {OdooClient} from '../../odoo/odooClient.js';
+import {safeQueueHoldReason} from '../../services/safeQueuePolicy.js';
+import {isDatabaseQuotaError} from '../../services/automationSafety.js';
+import {loadExactCarrierShipment} from '../../services/verifiedCarrierShipment.js';
+import {assertOdooShipmentSourceUnchanged} from '../../services/odooShipmentBinding.js';
+import {assertRecoveryNotExcluded,isOdooOnlyRecovery} from '../../services/cancellationRecoveryPolicy.js';
+import type {AccurateClient} from '../../accurate/accurateClient.js';
 
 const DEFAULT_BATCH_SIZE = 5;
 const DEFAULT_BUDGET_MS = 75_000;
@@ -52,7 +60,8 @@ export interface OdooQueueDrainOptions {
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
 export const handler = async (options: OdooQueueDrainOptions = {}): Promise<LambdaResult> => {
-  const { odooSyncService } = createAppServices();
+  if(safeQueueHoldReason())return {statusCode:503,body:JSON.stringify({ok:false,reason:'financial-workers-held'})};
+  const { odooSyncService,accurateClient } = createAppServices();
   if (!odooSyncService) {
     logger.warn('process-odoo-queue-background: Odoo not configured, skipping');
     return { statusCode: 503, body: JSON.stringify({ ok: false, message: 'Odoo not configured' }) };
@@ -98,7 +107,7 @@ export const handler = async (options: OdooQueueDrainOptions = {}): Promise<Lamb
           budgetHit = true;
           break;
         }
-        results.push(await processOne(record, odooSyncService));
+        results.push(await processOne(record, odooSyncService,accurateClient));
       }
       if (budgetHit) break;
     }
@@ -126,7 +135,7 @@ export const handler = async (options: OdooQueueDrainOptions = {}): Promise<Lamb
 
 // ─── processOne ───────────────────────────────────────────────────────────────
 
-async function processOne(record: QueueRecord, odooSyncService: OdooSvc): Promise<StageResult> {
+async function processOne(record: QueueRecord, odooSyncService: OdooSvc,accurateClient:AccurateClient): Promise<StageResult> {
   const currentDbStatus = record.odooSyncStatus ?? 'odoo-so-pending';
 
   // ── Determine which stage to run and what DB status to claim from ──────────
@@ -173,9 +182,26 @@ async function processOne(record: QueueRecord, odooSyncService: OdooSvc): Promis
 
   // ── Run the stage ─────────────────────────────────────────────────────────
   try {
-    return await runStage(record, stageToRun, odooSyncService);
+    return await withAutomaticOperation({recordId:record.id,lane:'production',key:stageToRun},async()=>{
+      if(automaticQueueSafetyActive()){
+        await loadExactCarrierShipment(accurateClient,record);
+        const fresh=await shopifyOrdersClient.getOrderByLegacyId(record.shopifyOrderId);
+        assertRecoveryNotExcluded(record,fresh);
+        if(isOdooOnlyRecovery(record))throw new Error('AUTOMATION_REVIEW_REQUIRED: Odoo-only recovery cannot create SO or replay production');
+        if(fresh.test||fresh.cancelled_at||String(fresh.id)!==record.shopifyOrderId)throw new Error('AUTOMATION_REVIEW_REQUIRED: Shopify source is cancelled, test, or mismatched');
+        if(record.odooSaleOrderId){
+          const rows=await new OdooClient().searchRead('sale.order',[['id','=',record.odooSaleOrderId]],['name','state','origin','client_order_ref'],{limit:2});const so=rows[0];
+          if(rows.length!==1||so.state!=='sale'||so.origin!==fresh.name||so.client_order_ref!==fresh.name+' / Viola-'+fresh.order_number)throw new Error('AUTOMATION_REVIEW_REQUIRED: linked Sales Order is cancelled, foreign, or mismatched');
+        }
+        if(stageToRun==='odoo-so-pending')assertOdooShipmentSourceUnchanged(JSON.parse(record.rawOrderJson!),fresh);
+      }
+      return await runStage(record, stageToRun, odooSyncService);
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    if(isDatabaseQuotaError(error))throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    const message = error instanceof AutomaticOperationReviewError
+      ? `AUTOMATION_REVIEW_REQUIRED: ${reason}` : reason;
     logger.error('process-odoo-queue-background: stage failed', { id: record.id, stageToRun, error: message });
     await shipmentRepository.markOdooStageFailure(record.id, stageToRun, message);
     return { id: record.id, status: 'stage-failed', error: message };

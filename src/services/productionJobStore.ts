@@ -14,6 +14,8 @@ import { randomUUID } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import type { ProductionAgentResponse } from './productionAgentClient.js';
 import type { ShipResult } from './productionJobTypes.js';
+import { previewOnlyConfig, manualRunConfig, isFreshOwnerPreviewMessage, isPreviewOperator, previewRecipientsMatch, assertPreviewCursorInMode, assertProductionRunAllowed } from './productionPreviewOnly.js';
+import { assertManualShipmentBindings, type ManualShipmentBinding } from './manualShipmentBinding.js';
 
 type JobTransaction = Pick<Prisma.TransactionClient, '$queryRawUnsafe' | 'failedPayload'>;
 
@@ -39,6 +41,12 @@ interface JobCommon {
   lastError?: string;
   executionToken?: string;
   updatedAt: number;
+  /** Explicit owner-only release epoch; never inferred for an old cursor. */
+  previewOnlyEpoch?: string;
+  sourceFingerprint?: string;
+  previewReadyAt?: number;
+  manualShipmentBindings?: ManualShipmentBinding[];
+  manualShipmentBindingHash?: string;
 }
 
 export interface RunCursor extends JobCommon {
@@ -50,6 +58,14 @@ export interface RunCursor extends JobCommon {
   needsReviewOrderNames: string[];
   /** waybill/report/recovery messages confirmed by Telegram. */
   sentFinalArtifactKeys: string[];
+  manualRunEpoch?: string;
+  manualRunApprovedBy?: number;
+  manualRunApprovedUpdateId?: number;
+  manualRunMessageDate?: number;
+  manualRunApprovedAt?: number;
+  manualRunApprovedBatchId?: string;
+  manualRunApprovalBindingHash?: string;
+  manualRunApprovalSourceFingerprint?: string;
 }
 
 export interface PreviewCursor extends JobCommon {
@@ -83,6 +99,62 @@ export type QueueRunAction =
 const SOURCE = 'prod_job';
 const HISTORY_SOURCE = 'prod_job_history';
 const PREVIEW_SNAPSHOT_SOURCE = 'prod_preview_snapshot';
+const TELEGRAM_UPDATE_SOURCE = 'prod_telegram_update';
+const TELEGRAM_UPDATE_HISTORY_LIMIT = 64;
+
+export class ProductionTelegramUpdateReplayError extends Error {
+  constructor() {
+    super('Production Telegram update was already accepted or predates the cancellation barrier');
+    this.name = 'ProductionTelegramUpdateReplayError';
+  }
+}
+
+/** Called under the chat lock, in the SAME transaction as the command's state change.
+ * A single watermark and at most 64 audit entries per chat bound storage without
+ * making evicted update IDs executable again. Older/out-of-order commands fail
+ * closed. LIMITATION: Telegram may choose a new random update_id after a week
+ * without updates. A legitimate lower ID will also be rejected until an explicit,
+ * audited operator epoch reset/migration preserves the old cancellation barrier.
+ * No reset procedure is provided here; NEVER expire/reset this watermark based
+ * only on elapsed wall-clock time (that would make old cancelled updates valid).
+ */
+async function acceptTelegramUpdate(
+  transaction: JobTransaction,
+  chatId: number,
+  updateId: number | undefined,
+  action: 'preview' | 'run' | 'cancel',
+  readOnly = false
+): Promise<void> {
+  // Internal/support callers have no Telegram envelope. Webhook callers must
+  // supply a validated update_id; this is not a replacement for authorization.
+  if (updateId === undefined) return;
+  if (!Number.isSafeInteger(updateId) || updateId < 0) throw new Error('Invalid Telegram update_id');
+  const row = await transaction.failedPayload.findFirst({
+    where: { source: TELEGRAM_UPDATE_SOURCE, reason: chatKey(chatId) },
+    orderBy: { id: 'desc' },
+  });
+  let recent: Array<{ updateId: number; action: string; acceptedAt: number }> = [];
+  if (row) {
+    const saved = JSON.parse(row.payloadJson);
+    if (saved.version !== 1 || !Number.isSafeInteger(saved.highWaterUpdateId) ||
+        saved.highWaterUpdateId < 0 || !Array.isArray(saved.recent)) {
+      throw new Error('Invalid production Telegram update watermark; operator review required');
+    }
+    if (updateId <= saved.highWaterUpdateId) throw new ProductionTelegramUpdateReplayError();
+    recent = saved.recent.slice(-(TELEGRAM_UPDATE_HISTORY_LIMIT - 1));
+  }
+  if (readOnly) return;
+  recent.push({ updateId, action, acceptedAt: Date.now() });
+  await transaction.failedPayload.deleteMany({
+    where: { source: TELEGRAM_UPDATE_SOURCE, reason: chatKey(chatId) },
+  });
+  await transaction.failedPayload.create({ data: {
+    source: TELEGRAM_UPDATE_SOURCE,
+    reason: chatKey(chatId),
+    externalId: String(updateId),
+    payloadJson: JSON.stringify({ version: 1, highWaterUpdateId: updateId, recent }),
+  } });
+}
 
 // A running lease older than this is recoverable after an invocation crash.
 export const JOB_STALE_MS = 330_000;
@@ -131,8 +203,10 @@ export function createPreviewCursor(options: {
   recipientChatIds: Array<string | number>;
 }): PreviewCursor {
   const orderId = normalizeOrderId(options.orderId);
+  const previewMode = previewOnlyConfig();
   return {
     version: 2,
+    ...(previewMode ? { previewOnlyEpoch: previewMode.epoch } : {}),
     batchId: makeBatchId(),
     kind: 'preview',
     status: 'queued',
@@ -148,8 +222,10 @@ export function createPreviewCursor(options: {
   };
 }
 
-export function runCursorFromPreview(preview: PreviewCursor): RunCursor {
-  return {
+export function runCursorFromPreview(preview: PreviewCursor, approval?: Pick<RunCursor,
+  'manualRunEpoch' | 'manualRunApprovedBy' | 'manualRunApprovedUpdateId' | 'manualRunMessageDate' | 'manualRunApprovedAt'>): RunCursor {
+  if (!approval) assertProductionRunAllowed();
+  const run: RunCursor = {
     version: 2,
     batchId: preview.batchId,
     kind: 'run',
@@ -158,6 +234,13 @@ export function runCursorFromPreview(preview: PreviewCursor): RunCursor {
     orderNumbers: [...preview.orderNumbers],
     pendingRun: false,
     recipientChatIds: [...preview.recipientChatIds],
+    ...(approval ? { ...approval, previewOnlyEpoch: preview.previewOnlyEpoch,
+      sourceFingerprint: preview.sourceFingerprint, previewReadyAt: preview.previewReadyAt,
+      manualShipmentBindings: preview.manualShipmentBindings?.map(binding => ({ ...binding })),
+      manualShipmentBindingHash: preview.manualShipmentBindingHash,
+      manualRunApprovedBatchId: preview.batchId,
+      manualRunApprovalBindingHash: preview.manualShipmentBindingHash,
+      manualRunApprovalSourceFingerprint: preview.sourceFingerprint } : {}),
     attemptCount: 0,
     phase: 'shipping',
     processedOrderNames: [],
@@ -167,6 +250,8 @@ export function runCursorFromPreview(preview: PreviewCursor): RunCursor {
     sentFinalArtifactKeys: [],
     updatedAt: Date.now(),
   };
+  if (approval) assertProductionRunAllowed({ chatId: Number(approval.manualRunApprovedBy), cursor: run });
+  return run;
 }
 
 function parseCursor(payloadJson: string): JobCursor | null {
@@ -198,6 +283,7 @@ async function readLocked(
   if (!row) return null;
   const cursor = parseCursor(row.payloadJson);
   if (!cursor) {
+    if (previewOnlyConfig()) throw new Error('Legacy production cursor requires operator review; it was preserved');
     // A pre-v2 cursor cannot safely prove which Telegram sends succeeded. Remove
     // it instead of silently skipping artifacts based on ambiguous old state.
     await transaction.failedPayload.deleteMany({
@@ -234,6 +320,25 @@ export async function loadJob(chatId: number): Promise<JobCursor | null> {
     orderBy: { id: 'desc' },
   });
   return row ? parseCursor(row.payloadJson) : null;
+}
+
+/** Fence each next operation, including after slow reads/backoff. This cannot
+ * revoke a provider request already in flight or atomically fence that provider.
+ * A failed/missing read must propagate; it must never grant permission to work.
+ */
+export async function assertJobLease(
+  chatId: number,
+  batchId: string,
+  executionToken: string | undefined
+): Promise<void> {
+  if (!executionToken) throw new ProductionJobLeaseLostError();
+  const current = await loadJob(chatId);
+  if (!current || current.batchId !== batchId || current.executionToken !== executionToken ||
+      current.status !== 'running' || !Number.isFinite(current.updatedAt) ||
+      Date.now() - current.updatedAt >= JOB_STALE_MS) {
+    throw new ProductionJobLeaseLostError();
+  }
+  assertPreviewCursorInMode(chatId, current);
 }
 
 function parsePreviewSnapshot(payloadJson: string): ProductionAgentResponse | null {
@@ -333,17 +438,26 @@ export async function listRecoverableJobs(): Promise<Array<{ chatId: number; job
 
 export async function createPreviewJob(
   chatId: number,
-  options: { orderId?: string; pendingRun?: boolean; recipientChatIds: Array<string | number> }
+  options: { orderId?: string; pendingRun?: boolean; recipientChatIds: Array<string | number>; telegramUpdateId?: number }
 ): Promise<{ created: boolean; job: JobCursor }> {
+  const mode = previewOnlyConfig();
+  if (mode && (!isPreviewOperator(chatId, mode) || options.pendingRun ||
+      !Number.isSafeInteger(options.telegramUpdateId) || Number(options.telegramUpdateId) <= mode.minUpdateId ||
+      !previewRecipientsMatch(options.recipientChatIds.map(String), mode))) {
+    throw new Error('Only a fresh owner Preview is authorized');
+  }
   const prisma = await db();
   return await prisma.$transaction(async (transaction) => {
     await lockChat(transaction, chatId);
+    await acceptTelegramUpdate(transaction, chatId, options.telegramUpdateId, 'preview');
     const existing = await readLocked(transaction, chatId);
-    if (existing) return { created: false, job: existing.cursor };
+    if (existing) {
+      assertPreviewCursorInMode(chatId, existing.cursor);
+      if (mode && existing.cursor.kind !== 'preview') throw new Error('An approved Run is already active; Preview cannot replace or restart it');
+      return { created: false, job: existing.cursor };
+    }
 
-    await transaction.failedPayload.deleteMany({
-      where: { source: PREVIEW_SNAPSHOT_SOURCE, externalId: chatKey(chatId) },
-    });
+    // Cancelled batches' source snapshots are immutable recovery evidence.
     const job = createPreviewCursor(options);
     await writeLocked(transaction, chatId, job);
     return { created: true, job };
@@ -352,13 +466,46 @@ export async function createPreviewJob(
 
 export async function queueRun(
   chatId: number,
-  options: { orderId?: string; recipientChatIds: Array<string | number> }
+  options: { orderId?: string; recipientChatIds: Array<string | number>; telegramUpdateId?: number;
+    telegramFromId?: number; telegramMessageDate?: number }
 ): Promise<{ action: QueueRunAction; job: JobCursor }> {
+  const mode = previewOnlyConfig(), manual = manualRunConfig();
+  if (mode) {
+    if (!manual) assertProductionRunAllowed();
+    if (!manual || !isFreshOwnerPreviewMessage({ chatId, fromId: options.telegramFromId,
+      date: options.telegramMessageDate, updateId: Number(options.telegramUpdateId) }, mode) ||
+      Number(options.telegramUpdateId) <= manual.minUpdateId || Number(options.telegramMessageDate) < manual.notBefore ||
+      !previewRecipientsMatch(options.recipientChatIds.map(String), mode)) {
+      throw new Error('Only a fresh private authorized manual /run is permitted');
+    }
+  } else assertProductionRunAllowed();
   const prisma = await db();
   return await prisma.$transaction(async (transaction) => {
     await lockChat(transaction, chatId);
     const existing = await readLocked(transaction, chatId);
     const requestedOrderId = normalizeOrderId(options.orderId);
+    if (mode && manual) {
+      await acceptTelegramUpdate(transaction, chatId, options.telegramUpdateId, 'run', true);
+      if (!existing || existing.cursor.kind !== 'preview' || existing.cursor.status !== 'preview_ready') {
+        throw new Error('A NEW completed Preview is required before manual /run; no Run was queued');
+      }
+      const preview = existing.cursor;
+      assertPreviewCursorInMode(chatId, preview);
+      assertManualShipmentBindings(preview);
+      if (preview.pendingRun || !Number.isSafeInteger(preview.previewReadyAt) ||
+          Number(options.telegramMessageDate) < Number(preview.previewReadyAt) ||
+          !/^[a-f0-9]{64}$/.test(preview.sourceFingerprint ?? '') ||
+          (requestedOrderId && requestedOrderId !== normalizeOrderId(preview.orderId))) {
+        throw new Error('Manual /run must follow completion of the exact NEW Preview');
+      }
+      await acceptTelegramUpdate(transaction, chatId, options.telegramUpdateId, 'run');
+      const run = runCursorFromPreview(preview, { manualRunEpoch: manual.epoch, manualRunApprovedBy: chatId,
+        manualRunApprovedUpdateId: options.telegramUpdateId, manualRunMessageDate: options.telegramMessageDate,
+        manualRunApprovedAt: Date.now() });
+      await writeLocked(transaction, chatId, run);
+      return { action: 'started_run' as const, job: run };
+    }
+    await acceptTelegramUpdate(transaction, chatId, options.telegramUpdateId, 'run');
 
     if (!existing) {
       const job = createPreviewCursor({
@@ -405,6 +552,7 @@ export async function claimJob(chatId: number, expectedBatchId?: string): Promis
 
     const job = existing.cursor;
     if (expectedBatchId && job.batchId !== expectedBatchId) return null;
+    assertPreviewCursorInMode(chatId, job);
 
     const runningAndFresh =
       job.status === 'running' && Date.now() - job.updatedAt < JOB_STALE_MS;
@@ -442,6 +590,8 @@ export async function checkpointJob(
 
     // A concurrent /run may have set this flag while the invocation was doing
     // network work. Never overwrite that request with an older in-memory value.
+    assertPreviewCursorInMode(chatId, existing.cursor);
+    assertPreviewCursorInMode(chatId, cursor);
     cursor.pendingRun = cursor.pendingRun || existing.cursor.pendingRun;
     cursor.executionToken = executionToken;
     cursor.status = 'running';
@@ -555,6 +705,8 @@ export async function finishPreview(
       throw new ProductionJobLeaseLostError();
     }
 
+    assertPreviewCursorInMode(chatId, existing.cursor);
+    assertPreviewCursorInMode(chatId, cursor);
     cursor.pendingRun = cursor.pendingRun || existing.cursor.pendingRun;
     if (cursor.pendingRun) {
       const run = runCursorFromPreview(cursor);
@@ -566,11 +718,15 @@ export async function finishPreview(
     }
 
     cursor.status = 'preview_ready';
+    if (manualRunConfig()) {
+      assertManualShipmentBindings(cursor);
+      cursor.previewReadyAt = Math.ceil(Date.now() / 1000);
+    }
     cursor.executionToken = undefined;
     cursor.attemptCount = 0;
     cursor.lastError = undefined;
     await writeLocked(transaction, chatId, cursor);
-    await transaction.failedPayload.deleteMany({
+    if (!manualRunConfig()) await transaction.failedPayload.deleteMany({
       where: { source: PREVIEW_SNAPSHOT_SOURCE, reason: cursor.batchId },
     });
     return cursor;
@@ -630,21 +786,62 @@ export async function completeRun(
     await transaction.failedPayload.deleteMany({
       where: { source: SOURCE, reason: chatKey(chatId) },
     });
-    await transaction.failedPayload.deleteMany({
-      where: { source: PREVIEW_SNAPSHOT_SOURCE, externalId: chatKey(chatId) },
+    if (!manualRunConfig()) await transaction.failedPayload.deleteMany({
+      where: { source: PREVIEW_SNAPSHOT_SOURCE, reason: cursor.batchId },
     });
   });
 }
 
-export async function clearJob(chatId: number): Promise<void> {
+export async function clearJob(chatId: number, telegramUpdateId?: number): Promise<void> {
   const prisma = await db();
   await prisma.$transaction(async (transaction) => {
     await lockChat(transaction, chatId);
+    const rows = await transaction.failedPayload.findMany({
+      where: { source: SOURCE, reason: chatKey(chatId) },
+      orderBy: { id: 'asc' },
+    });
+    const mode = previewOnlyConfig();
+    if (mode && (!isPreviewOperator(chatId, mode) || rows.some(row => {
+      const cursor = parseCursor(row.payloadJson);
+      if (!cursor) return true;
+      if (cursor.kind === 'preview') return false; // Old valid v2 Preview may be cancelled after an epoch change.
+      try { assertProductionRunAllowed({ chatId, cursor }); return false; }
+      catch { return true; }
+    }))) {
+      throw new Error('Preview-only cancellation cannot modify a held Run or unknown legacy job');
+    }
+    await acceptTelegramUpdate(transaction, chatId, telegramUpdateId, 'cancel');
+    if (!rows.length && telegramUpdateId !== undefined) {
+      await transaction.failedPayload.create({ data: {
+        source: HISTORY_SOURCE,
+        reason: `cancelled-update:${telegramUpdateId}`,
+        externalId: chatKey(chatId),
+        payloadJson: JSON.stringify({
+          status: 'cancelled',
+          noActiveJob: true,
+          cancelledAt: Date.now(),
+          cancelledByTelegramUpdateId: telegramUpdateId,
+        }),
+      } });
+    }
+    for (const row of rows) {
+      const cursor = parseCursor(row.payloadJson);
+      await transaction.failedPayload.create({ data: {
+        source: HISTORY_SOURCE,
+        reason: cursor?.batchId ?? row.externalId ?? `cancelled-row-${row.id}`,
+        externalId: chatKey(chatId),
+        payloadJson: JSON.stringify({
+          ...(cursor ?? { originalPayloadJson: row.payloadJson }),
+          status: 'cancelled',
+          executionToken: undefined,
+          cancelledAt: Date.now(),
+          ...(telegramUpdateId === undefined ? {} : { cancelledByTelegramUpdateId: telegramUpdateId }),
+        }),
+      } });
+    }
     await transaction.failedPayload.deleteMany({
       where: { source: SOURCE, reason: chatKey(chatId) },
     });
-    await transaction.failedPayload.deleteMany({
-      where: { source: PREVIEW_SNAPSHOT_SOURCE, externalId: chatKey(chatId) },
-    });
+    // Keep history, snapshots, dedup barriers and all shipment/accounting records.
   });
 }

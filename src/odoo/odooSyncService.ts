@@ -2,6 +2,7 @@ import { env } from '../config/env.js';
 import { logger } from '../lib/logger.js';
 import { shipmentRepository } from '../services/shipmentRepository.js';
 import { requestShopifyAdmin } from '../shopify/shopifyAdminGraphql.js';
+import { shopifyOrdersClient } from '../shopify/shopifyOrdersClient.js';
 import type { ShopifyLineItem, ShopifyOrder } from '../types/shopify.js';
 import {
   OdooSaleReturnService,
@@ -9,6 +10,12 @@ import {
   type OdooSaleReturnResult
 } from './odooSaleReturnService.js';
 import { OdooClient, type OdooRecord } from './odooClient.js';
+import {automaticQueueSafetyActive,AutomaticOperationReviewError,haltAutomaticOperation} from '../services/automaticOperationSafety.js';
+import {readOwnerFinancialApproval,assertOwnerFinancialOdooPreflight,readOwnerPayments,exactOwnerPayment} from '../services/ownerFinancialApproval.js';
+import {isOdooOnlyRecovery,assertRecoveryNotExcluded} from '../services/cancellationRecoveryPolicy.js';
+import {recoveryCollectionPreflight} from '../services/cancellationRecoveryService.js';
+import {AccurateClient} from '../accurate/accurateClient.js';
+import {loadExactCarrierShipment} from '../services/verifiedCarrierShipment.js';
 
 interface PartnerRecord extends OdooRecord {
   name?: string;
@@ -373,6 +380,10 @@ export class OdooSyncService {
 
     const record = await shipmentRepository.findByShopifyOrderId(String(order.id));
     if (record?.odooSaleOrderId && record.odooSaleOrderName) {
+      if(automaticQueueSafetyActive()){
+        const rows=await this.odooClient.searchRead<OdooRecord>('sale.order',[['id','=',record.odooSaleOrderId]],['name','state','origin','client_order_ref'],{limit:2});
+        if(rows.length!==1||rows[0]!.state!=='sale'||rows[0]!.name!==record.odooSaleOrderName||rows[0]!.origin!==order.name||rows[0]!.client_order_ref!==orderReference(order))throw new AutomaticOperationReviewError('Stored Sales Order is cancelled, foreign, or mismatched; no invoice or payment permitted');
+      }
       if (shouldPrepareStock) {
         await this.prepareSalesOrderStock(record.odooSaleOrderId);
       }
@@ -707,12 +718,27 @@ export class OdooSyncService {
     if (!record?.rawOrderJson) {
       throw new Error(`Shipment record ${recordId} has no raw Shopify order JSON`);
     }
+    if(isOdooOnlyRecovery(record)){
+      await this.syncCancelledRecoveryCollection(record);
+      return;
+    }
     const existingSalePaymentId = record.odooSalePaymentId ?? (record.odooSyncStatus === 'paid' ? record.odooPaymentId : null);
     if (existingSalePaymentId) {
       return;
     }
 
-    const order = JSON.parse(record.rawOrderJson) as ShopifyOrder;
+    let order = JSON.parse(record.rawOrderJson) as ShopifyOrder;
+    let ownerApproval:Record<string,any>|null=null;
+    if(automaticQueueSafetyActive()){
+      order=await shopifyOrdersClient.getOrderByLegacyId(record.shopifyOrderId);
+      assertRecoveryNotExcluded(record,order);
+      ownerApproval=await readOwnerFinancialApproval(record,order);
+      const total=Number(order.current_total_price??order.total_price),gross=Number(record.collectedAmount);
+      const gateway=(order.payment_gateway_names??[order.gateway]).filter(Boolean).join(' ').toLowerCase();
+      if(String(order.id)!==record.shopifyOrderId||order.name!==record.shopifyOrderName||order.test||order.cancelled_at||!ownerApproval&&!sameMoney(total,gross)||
+        /refund|void|partial/i.test(order.financial_status??'')||/kashier|visa|card|instapay/i.test(gateway))throw new AutomaticOperationReviewError('Current Shopify payment/collection differs; explicit decision required before accounting');
+      if(ownerApproval){if(ownerApproval.paymentJournalId!==env.odoo.paymentJournalId)throw new AutomaticOperationReviewError('Approved payment journal changed');await assertOwnerFinancialOdooPreflight(this.odooClient,ownerApproval);}
+    }
     // prepareStock: false — delivery is already confirmed by the time a shipment is collected.
     // Skips manufacturing + picking validation (already done) saving ~5-8 s of Odoo calls.
     // skipDbStatusUpdate: true — the caller (sync-open-shipments cron) owns the post-paid
@@ -780,7 +806,8 @@ export class OdooSyncService {
       return;
     }
 
-    const payment = await this.registerPayment(invoice.id, amount, env.odoo.paymentJournalId, orderReference(order));
+    if(ownerApproval)await assertOwnerFinancialOdooPreflight(this.odooClient,ownerApproval,invoice.id);
+    const payment = await this.registerPayment(invoice.id, amount, env.odoo.paymentJournalId, orderReference(order),ownerApproval??undefined);
     await shipmentRepository.updateOdooPayment(String(order.id), {
       paymentId: payment.id,
       status: 'paid'
@@ -795,6 +822,33 @@ export class OdooSyncService {
       customerDue: record.customerDue,
       registeredAmount: amount
     });
+  }
+
+  /** Scoped cancelled-order accounting. Uses the existing native invoice and
+   * payment paths, but can NEVER fall back to SO creation or Shopify writes. */
+  private async syncCancelledRecoveryCollection(record:Record<string,any>):Promise<void>{
+    if(!automaticQueueSafetyActive())throw new AutomaticOperationReviewError('Odoo-only recovery requires durable native safety');
+    const carrier=new AccurateClient();
+    const preflight=async()=>{
+      const order=await shopifyOrdersClient.getOrderByLegacyId(record.shopifyOrderId);
+      const live=await loadExactCarrierShipment(carrier,record);
+      const proof=await recoveryCollectionPreflight(record,order,this.odooClient,live);
+      if(!proof)throw new AutomaticOperationReviewError('Cancelled-order recovery authority is absent');
+      return proof;
+    };
+    let p=await preflight();
+    if(p.payment){
+      await shipmentRepository.markOdooInvoicePaid(record.shopifyOrderId,{invoiceId:p.invoice.id,invoiceName:p.invoice.name??String(p.invoice.id),paymentId:p.payment.id,status:'paid-existing'});
+      return;
+    }
+    const invoice=await this.findOrCreatePostedSaleInvoice(record.shopifyOrderId,p.sale.id,{targetInvoiceTotal:p.target,strictRecovery:true});
+    const before=p;p=await preflight();
+    if(p.target!==before.target||p.saleHash!==before.saleHash||p.invoice?.id!==invoice.id||p.payment)throw new AutomaticOperationReviewError('Recovery invoice/settlement changed before payment; do not retry');
+    // p is native verified payment identity, NOT an invented human decision.
+    const payment=await this.registerPayment(invoice.id,p.target,7,p.orderName+' / Viola-'+p.orderNumber,p);
+    const verified=await preflight();
+    if(verified.invoice?.id!==invoice.id||verified.payment?.id!==payment.id)throw new AutomaticOperationReviewError('Recovery payment readback is not exact');
+    await shipmentRepository.markOdooInvoicePaid(record.shopifyOrderId,{invoiceId:invoice.id,invoiceName:invoice.name??String(invoice.id),paymentId:payment.id,status:'paid'});
   }
 
   async verifyCollectedShipmentAccounting(recordId: number): Promise<{
@@ -861,12 +915,14 @@ export class OdooSyncService {
 
     const order = JSON.parse(record.rawOrderJson) as ShopifyOrder;
     const reference = `Return shipping charge ${orderReference(order)}`;
-    const [existingBill] = await this.odooClient.searchRead<InvoiceRecord>(
+    const existingBills = await this.odooClient.searchRead<InvoiceRecord>(
       'account.move',
       [['move_type', '=', 'in_invoice'], ['ref', '=', reference]],
       ['name', 'state', 'payment_state', 'amount_total', 'amount_residual'],
-      { limit: 1, order: 'id desc' }
+      { limit: automaticQueueSafetyActive()?3:1, order: 'id desc' }
     );
+    if(automaticQueueSafetyActive()&&(existingBills.length>1||existingBills.some(b=>!['draft','posted'].includes(String(b.state)))))throw new AutomaticOperationReviewError('Return bill already exists in an ambiguous/cancelled state; no duplicate bill permitted');
+    const existingBill=existingBills[0];
     if (existingBill && Math.abs(Number(existingBill.amount_total ?? 0) - returnCharge) > 0.01) {
       throw new Error(
         `Existing Odoo return bill ${existingBill.name ?? existingBill.id} amount ` +
@@ -1202,6 +1258,13 @@ export class OdooSyncService {
   }
 
   private async findExistingSaleOrder(order: ShopifyOrder): Promise<(OdooRecord & { name?: string }) | undefined> {
+    if(automaticQueueSafetyActive()){
+      const matches=await this.odooClient.searchRead<OdooRecord&{name?:string;state?:string;client_order_ref?:string;origin?:string}>('sale.order',
+        ['|',['client_order_ref','=',orderReference(order)],['origin','=',order.name]],['name','state','client_order_ref','origin'],{limit:10,order:'id desc'});
+      const exact=matches.filter(s=>s.client_order_ref===orderReference(order)&&s.origin===order.name&&s.state!=='cancel');
+      if(matches.length>=10||exact.length>1||matches.length>exact.length)throw new AutomaticOperationReviewError('Ambiguous/foreign/cancelled Sales Order already uses this reference; never create or adopt a guessed order');
+      return exact[0];
+    }
     const [saleOrder] = await this.odooClient.searchRead<OdooRecord & { name?: string }>(
       'sale.order',
       ['&', ['state', '!=', 'cancel'], '|', ['client_order_ref', '=', orderReference(order)], ['origin', '=', order.name]],
@@ -1293,7 +1356,7 @@ export class OdooSyncService {
   private async findOrCreatePostedSaleInvoice(
     shopifyOrderId: string,
     saleOrderId: number,
-    options?: { targetInvoiceTotal?: number | null; preserveQueueStatus?: boolean }
+    options?: { targetInvoiceTotal?: number | null; preserveQueueStatus?: boolean; strictRecovery?:boolean }
   ): Promise<InvoiceRecord> {
     const [saleOrder] = await this.odooClient.searchRead<OdooRecord & {
       name?: string;
@@ -1309,7 +1372,9 @@ export class OdooSyncService {
     }
 
     const existingInvoices = await this.findSaleOrderInvoices(saleOrder);
+    if(automaticQueueSafetyActive()&&existingInvoices.length>1)throw new AutomaticOperationReviewError('Multiple sale invoices already exist; do not create or pay another automatically');
     let invoice = existingInvoices[0];
+    if(options?.strictRecovery&&invoice&&(invoice.state!=='posted'||!sameMoney(Number(invoice.amount_total),Number(options.targetInvoiceTotal))||!['paid','not_paid'].includes(invoice.payment_state??'')))throw new AutomaticOperationReviewError('Existing recovery invoice changed during preflight; never reset, edit or duplicate it');
 
     if (!invoice) {
       invoice = await this.createSaleInvoiceFromWizard(saleOrderId);
@@ -1626,6 +1691,7 @@ export class OdooSyncService {
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      if(/outcome unknown|independent review|AUTOMATION_/i.test(reason)||error instanceof AutomaticOperationReviewError)throw error;
       logger.warn('Odoo invoice wizard failed; falling back to sale order lines', {
         saleOrderId,
         reason
@@ -1770,14 +1836,30 @@ export class OdooSyncService {
     invoiceId: number,
     amount: number,
     journalId: number,
-    reference: string
+    reference: string,
+    ownerApproval?:Record<string,any>
   ): Promise<{ id: number }> {
+    if(automaticQueueSafetyActive()){
+      const invoice=await this.getInvoice(invoiceId);
+      if(Number(invoice.amount_residual??0)<=0.01||invoice.payment_state==='paid'){
+        if(ownerApproval){const existing=await readOwnerPayments(this.odooClient,{reference,invoiceIds:[invoiceId],partnerId:ownerApproval.partnerId,companyId:ownerApproval.companyId});const exact=existing.filter(p=>exactOwnerPayment(p,{invoiceId,amount,journalId,partnerId:ownerApproval.partnerId,companyId:ownerApproval.companyId,currencyId:ownerApproval.currencyId}));if(existing.length!==1||exact.length!==1)throw new AutomaticOperationReviewError('Settled owner invoice has no unique exact payment; never pay again');return{id:exact[0]!.id};}
+        const existing=await this.odooClient.searchRead<OdooRecord>('account.payment',['&',['state','=','posted'],'|',['reconciled_invoice_ids','in',[invoiceId]],['reconciled_bill_ids','in',[invoiceId]]],['name','amount','journal_id'],{limit:3});
+        const exact=existing.filter(p=>Array.isArray(p.journal_id)&&p.journal_id[0]===journalId&&sameMoney(Number(p.amount),amount));
+        if(existing.length!==1||exact.length!==1)throw new AutomaticOperationReviewError('Invoice is already settled; exact existing payment needs review, never create another');return {id:exact[0]!.id};
+      }
+      if(!sameMoney(Number(invoice.amount_residual),amount))throw new AutomaticOperationReviewError('Invoice residual changed before payment; no extra or partial payment authorized');
+    }
     const context = { active_model: 'account.move', active_ids: [invoiceId], active_id: invoiceId };
     const wizardId = await this.odooClient.create('account.payment.register', {
       amount,
       journal_id: journalId,
       communication: reference
     }, context);
+    if(automaticQueueSafetyActive()){
+      const fresh=await this.getInvoice(invoiceId);
+      if(!sameMoney(Number(fresh.amount_residual),amount))throw new AutomaticOperationReviewError('Invoice residual changed while payment wizard was prepared; do not post a second payment');
+      if(ownerApproval){const existing=await readOwnerPayments(this.odooClient,{reference,invoiceIds:[invoiceId],partnerId:ownerApproval.partnerId,companyId:ownerApproval.companyId});if(existing.some(p=>p.state!=='cancel'))throw new AutomaticOperationReviewError('Owner payment appeared while wizard was prepared; do not post again');}
+    }
     const result = await this.odooClient.call<Record<string, unknown>>(
       'account.payment.register',
       'action_create_payments',
@@ -1786,7 +1868,16 @@ export class OdooSyncService {
     );
     const paymentId = typeof result?.res_id === 'number' ? result.res_id : undefined;
     if (paymentId) {
-      return { id: paymentId };
+      if(!automaticQueueSafetyActive())return { id: paymentId };
+    }
+
+    if(automaticQueueSafetyActive()){
+      if(ownerApproval){const related=await readOwnerPayments(this.odooClient,{reference,invoiceIds:[invoiceId],paymentIds:paymentId?[paymentId]:[],partnerId:ownerApproval.partnerId,companyId:ownerApproval.companyId});const exact=related.filter(p=>exactOwnerPayment(p,{invoiceId,amount,journalId,partnerId:ownerApproval.partnerId,companyId:ownerApproval.companyId,currencyId:ownerApproval.currencyId})&&(!paymentId||p.id===paymentId));if(related.length!==1||exact.length!==1){haltAutomaticOperation('OWNER_PAYMENT_IDENTITY_UNVERIFIED');throw new AutomaticOperationReviewError('Posted owner payment requires exact invoice/journal/partner/company/currency/amount proof; never retry');}return{id:exact[0]!.id};}
+      const related=await this.odooClient.searchRead<OdooRecord&{journal_id?:[number,string];amount?:number}>('account.payment',
+        ['&',['state','=','posted'],'|',['reconciled_invoice_ids','in',[invoiceId]],['reconciled_bill_ids','in',[invoiceId]]],['name','amount','journal_id'],{limit:10,order:'id desc'});
+      const exact=related.filter(p=>p.journal_id?.[0]===journalId&&sameMoney(Number(p.amount),amount)&&(!paymentId||p.id===paymentId));
+      if(exact.length!==1){haltAutomaticOperation('PAYMENT_IDENTITY_UNVERIFIED');throw new AutomaticOperationReviewError('Posted payment requires exact invoice/journal/amount verification; never retry creation');}
+      return {id:exact[0]!.id};
     }
 
     const payments = await this.odooClient.searchRead<PaymentRecord>(

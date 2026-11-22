@@ -25,7 +25,9 @@ import type { ShopifyOrder } from '../types/shopify.js';
 // ── Font ──────────────────────────────────────────────────────────────────────
 
 const _waybillDir = path.dirname(fileURLToPath(import.meta.url));
-const FONT_PATH = path.join(_waybillDir, '../assets/fonts/Cairo-Regular.ttf');
+const FONT_PATH = process.env.RECOVERY_PUBLIC_URL
+  ? path.join(process.cwd(), 'src/assets/fonts/Cairo-Regular.ttf')
+  : path.join(_waybillDir, '../assets/fonts/Cairo-Regular.ttf');
 
 // ── Page constants (A4 in points: 1pt = 1/72 inch) ───────────────────────────
 

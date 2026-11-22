@@ -145,6 +145,7 @@ export const env = {
     returnChargeAccountId: optionalInt('ODOO_RETURN_CHARGE_ACCOUNT_ID')
   },
   metaDelivered: {
+    transportPaused: optionalBool('META_DELIVERED_TRANSPORT_PAUSED'),
     // A deliberate kill switch. A deploy is inert unless this is explicitly true.
     enabled: optionalBool('META_DELIVERED_ENABLED'),
     mode: optionalChoice('META_DELIVERED_MODE', ['test', 'live'] as const, 'test'),

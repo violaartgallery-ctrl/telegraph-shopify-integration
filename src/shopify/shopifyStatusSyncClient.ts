@@ -1,5 +1,10 @@
 import { env } from '../config/env.js';
 import { requestShopifyAdmin, requestShopifyAdminRest } from './shopifyAdminGraphql.js';
+import {cancellationRecoveryData} from '../services/cancellationRecoveryData.js';
+const recoveryOrderIds=new Set<string>(cancellationRecoveryData.exceptions.map(x=>x.orderId));
+function assertShopifyRecoveryWriteAllowed(orderId:string|number):void {
+  if(recoveryOrderIds.has(String(orderId).split('/').pop()!))throw Error('ODOO_ONLY_RECOVERY: Shopify writes are forbidden for this exact cancelled order');
+}
 
 const orderRestId = (orderGid: string): string => orderGid.split('/').pop() ?? orderGid;
 
@@ -269,6 +274,7 @@ export interface ShopifyStatusUpdateInput {
 
 export const shopifyStatusSyncClient = {
   syncShipmentState: async (input: ShopifyStatusUpdateInput): Promise<void> => {
+    assertShopifyRecoveryWriteAllowed(input.orderId);
     const ownerId = toOrderGid(input.orderId);
     const metafields = [
       {
@@ -348,6 +354,7 @@ export const shopifyStatusSyncClient = {
    * for COD orders too. New callers should not use this.
    */
   markOrderAsPaid: async (orderId: string | number): Promise<MarkOrderAsPaidResult> => {
+    assertShopifyRecoveryWriteAllowed(orderId);
     const ownerId = toOrderGid(orderId);
 
     const response = await requestShopifyAdmin<{
@@ -438,6 +445,7 @@ export const shopifyStatusSyncClient = {
     total?: number;
     currencyCode?: string;
   }> => {
+    assertShopifyRecoveryWriteAllowed(params.orderId);
     const ownerId = toOrderGid(params.orderId);
     const state = await shopifyStatusSyncClient.fetchOrderPaymentState(params.orderId);
     if (!state) return { skipped: true, reason: 'order-not-found' };
@@ -514,6 +522,7 @@ export const shopifyStatusSyncClient = {
     discountDescription?: string;
     gateway?: string;
   }): Promise<{ transactionId?: string; calculatedOrderId?: string }> => {
+    assertShopifyRecoveryWriteAllowed(params.orderId);
     const ownerId = toOrderGid(params.orderId);
 
     // 1. Begin edit — also returns the calculatedOrder with line item ids.
@@ -719,6 +728,7 @@ export const shopifyStatusSyncClient = {
 
   /** Add tags to an order (standalone helper, used by legacy reconciliation). */
   addOrderTags: async (orderId: string | number, tags: string[]): Promise<void> => {
+    assertShopifyRecoveryWriteAllowed(orderId);
     const ownerId = toOrderGid(orderId);
     const resp = await requestShopifyAdmin<{ tagsAdd: { userErrors: Array<{ message: string }> } }>(
       TAGS_ADD_MUTATION, { id: ownerId, tags }
@@ -743,6 +753,7 @@ export const shopifyStatusSyncClient = {
     reason?: string;
     cancelledFulfillmentIds: string[];
   }> => {
+    assertShopifyRecoveryWriteAllowed(params.orderId);
     const ownerId = toOrderGid(params.orderId);
     const expectedCode = params.shipmentCode.trim().toUpperCase();
     const readState = async () => await requestShopifyAdmin<{
@@ -836,6 +847,7 @@ export const shopifyStatusSyncClient = {
     notifyCustomer?: boolean;
     staffNote?: string;
   }): Promise<{ skipped: boolean; reason?: string }> => {
+    assertShopifyRecoveryWriteAllowed(params.orderId);
     const ownerId = toOrderGid(params.orderId);
     const state = await shopifyStatusSyncClient.fetchOrderPaymentState(params.orderId);
     if (!state) return { skipped: true, reason: 'order-not-found' };
@@ -864,15 +876,15 @@ export const shopifyStatusSyncClient = {
   },
 
   /**
-   * Phase 2: flag an order without cancelling it. Used for delivered-not-collected
-   * (customer already has the product, so we can't cancel — but we must surface it
-   * for human follow-up).
+   * Flag only: the existing collection-status metafields and this tag surface
+   * the warning. Never overwrite the owner's/customer's original note with it.
    */
   flagOrderForFollowUp: async (params: {
     orderId: string | number;
     note: string;
     tag?: string;
   }): Promise<{ skipped: boolean; reason?: string }> => {
+    assertShopifyRecoveryWriteAllowed(params.orderId);
     const ownerId = toOrderGid(params.orderId);
     const tagsToAdd = params.tag ? [params.tag] : ['needs-collection-followup'];
     // Add the tag.
@@ -882,13 +894,8 @@ export const shopifyStatusSyncClient = {
     if (tagsResp.tagsAdd.userErrors.length > 0) {
       throw new Error('flagOrderForFollowUp tagsAdd: ' + tagsResp.tagsAdd.userErrors.map((e) => e.message).join('; '));
     }
-    // Append the note.
-    const updResp = await requestShopifyAdmin<{
-      orderUpdate: { order: { id: string; note: string | null; tags: string[] } | null; userErrors: Array<{ message: string }> };
-    }>(ORDER_UPDATE_MUTATION, { input: { id: ownerId, note: params.note } });
-    if (updResp.orderUpdate.userErrors.length > 0) {
-      throw new Error('flagOrderForFollowUp orderUpdate: ' + updResp.orderUpdate.userErrors.map((e) => e.message).join('; '));
-    }
+    // params.note remains API-compatible but is deliberately not written to
+    // Shopify. Customer instructions must survive automatic follow-up flags.
     return { skipped: false };
   }
 };

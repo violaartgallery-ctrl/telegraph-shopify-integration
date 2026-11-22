@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { assertProductionInvocationAllowed, previewOnlyConfig, PREVIEW_ONLY_TOPIC } from './productionPreviewOnly.js';
 
 export const PRODUCTION_CONTINUATION_TOPIC = 'viola-production-continuations';
 
@@ -89,12 +90,28 @@ export function setProductionQueuePublisherForTests(
   testQueuePublisher = publisher;
 }
 
+/** Supply a host-specific queue without changing the durable Neon job cursor. */
+export const setProductionQueuePublisher = setProductionQueuePublisherForTests;
+
 async function publishToProductionQueue(
   topic: string,
   payload: ProductionResumePayload,
   options: ProductionQueuePublishOptions
 ): Promise<{ messageId: string | null }> {
   if (testQueuePublisher) return await testQueuePublisher(topic, payload, options);
+  if (process.env.PRODUCTION_CONTINUATION_TRANSPORT === 'netlify') {
+    const origin = new URL(process.env.RECOVERY_PUBLIC_URL ?? '');
+    if (origin.protocol !== 'https:' || !origin.hostname.endsWith('.netlify.app')) {
+      throw new Error('Invalid Netlify continuation origin');
+    }
+    const body = JSON.stringify({ ...payload, delayMs: options.delaySeconds * 1000 });
+    const response = await fetch(new URL('/.netlify/functions/production-resume-background', origin), {
+      method: 'POST', headers: signedResumeHeaders(body), body,
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (response.status !== 202) throw new Error(`Netlify continuation HTTP ${response.status}`);
+    return { messageId: options.idempotencyKey };
+  }
   const { send } = await import('@vercel/queue');
   return await send(topic, payload, options);
 }
@@ -107,6 +124,9 @@ async function publishToProductionQueue(
 export async function scheduleProductionContinuation(payload: ProductionResumePayload): Promise<void> {
   const parsed = parseProductionResumePayload(payload);
   if (!parsed) throw new Error('Invalid production continuation payload');
+  // The dedicated transport can resume a Run only after the durable job store
+  // contains a fresh human approval. It never manufactures that approval.
+  await assertProductionInvocationAllowed(parsed.chatId, parsed.batchId);
 
   const delayMs = Math.min(30_000, Math.max(0, Number(payload.delayMs) || 0));
   const dispatchKey = String(payload.dispatchKey ?? randomUUID());
@@ -122,7 +142,7 @@ export async function scheduleProductionContinuation(payload: ProductionResumePa
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      await publishToProductionQueue(PRODUCTION_CONTINUATION_TOPIC, parsed, options);
+      await publishToProductionQueue(previewOnlyConfig() ? PREVIEW_ONLY_TOPIC : PRODUCTION_CONTINUATION_TOPIC, parsed, options);
       return;
     } catch (error) {
       lastError = error;

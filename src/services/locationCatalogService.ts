@@ -1,6 +1,7 @@
 import type { AccurateClient } from '../accurate/accurateClient.js';
 import { logger } from '../lib/logger.js';
 import { prisma } from '../lib/prisma.js';
+import { automationHoldReason, AutomationPausedError } from './automationSafety.js';
 
 export interface LocationCatalogArea {
   id: number;
@@ -102,11 +103,12 @@ export class LocationCatalogService {
   constructor(
     private readonly accurateClient: AccurateClient,
     private readonly repository: LocationCatalogRepository = prismaRepository,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly holdReason: () => string | undefined = automationHoldReason
   ) {}
 
   async getCatalog(): Promise<LocationCatalogResult> {
-    if (this.memorySnapshot && this.memorySnapshot.expiresAt > this.now()) {
+    if (this.memorySnapshot && (this.memorySnapshot.expiresAt > this.now() || this.holdReason())) {
       return { ...this.memorySnapshot.value, source: 'memory' };
     }
 
@@ -119,6 +121,9 @@ export class LocationCatalogService {
       });
     }
 
+    // Public GET routes are intentionally available during the operator hold,
+    // but a cache miss must never turn that read into a carrier refresh/write.
+    if (this.holdReason()) throw new AutomationPausedError();
     try {
       return await this.refreshCatalog();
     } catch (error) {
@@ -130,6 +135,7 @@ export class LocationCatalogService {
   }
 
   async refreshIfStale(maxAgeMs = LOCATION_REFRESH_INTERVAL_MS): Promise<LocationCatalogResult> {
+    if (this.holdReason()) return this.getCatalog();
     try {
       const stored = await this.repository.find();
       if (stored && this.now() - stored.sourceFetchedAt.getTime() < maxAgeMs) {
@@ -144,6 +150,7 @@ export class LocationCatalogService {
   }
 
   async refreshCatalog(): Promise<LocationCatalogResult> {
+    if (this.holdReason()) return this.getCatalog();
     if (this.refreshInFlight) return this.refreshInFlight;
 
     this.refreshInFlight = this.fetchAndStore();
@@ -166,7 +173,9 @@ export class LocationCatalogService {
   }
 
   private async fetchAndStore(): Promise<LocationCatalogResult> {
+    if (this.holdReason()) throw new AutomationPausedError();
     const zones = await this.accurateClient.listZones({ active: true, parentId: null });
+    if (this.holdReason()) throw new AutomationPausedError();
     const fresh = await Promise.all(zones.map(async (zone) => ({
       id: zone.id,
       name: zone.name,
@@ -178,6 +187,8 @@ export class LocationCatalogService {
     const checked = validateLocationCatalog(fresh);
     const sourceFetchedAt = new Date(this.now());
 
+    // A hold can be raised while the carrier request is in flight.
+    if (this.holdReason()) throw new AutomationPausedError();
     try {
       await this.repository.save({
         payloadJson: JSON.stringify(checked.locations),

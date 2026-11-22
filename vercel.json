@@ -1,8 +1,13 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "npm run build && npm run prisma:deploy",
+  "buildCommand": "npm run build",
+  "outputDirectory": "public",
   "functions": {
     "api/index.ts": { "maxDuration": 300 },
+    "api/owner-preview-queue.ts": {
+      "maxDuration": 300,
+      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "viola-owner-preview-20261101", "retryAfterSeconds": 300, "initialDelaySeconds": 0 }]
+    },
     "api/ops-scheduler-queue.ts": {
       "maxDuration": 300,
       "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "viola-ops-scheduler", "retryAfterSeconds": 60, "initialDelaySeconds": 0 }]
@@ -20,6 +25,14 @@
     }
   },
   "crons": [{ "path": "/ops/scheduler/ensure", "schedule": "13 0 * * *" }],
+  "headers": [{
+    "source": "/",
+    "headers": [
+      { "key": "Cache-Control", "value": "private, no-store" },
+      { "key": "Referrer-Policy", "value": "no-referrer" },
+      { "key": "Content-Security-Policy", "value": "frame-ancestors https://admin.shopify.com https://violaleather.myshopify.com" }
+    ]
+  }],
   "rewrites": [
     { "source": "/(.*)", "destination": "/api" }
   ]

@@ -1,4 +1,6 @@
 import { waitUntil } from '@vercel/functions';
+import { timingSafeEqual } from 'node:crypto';
+import { previewOnlyConfig, manualRunConfig, isPreviewOperator, isFreshOwnerPreviewMessage, assertPreviewCursorInMode, assertProductionRunAllowed, type PreviewOnlyConfig } from '../../services/productionPreviewOnly.js';
 import { answerCallbackQuery, sendMessage } from '../../telegram/telegramApi.js';
 import { productionRecipientChatIds } from './run-production-background.js';
 import { scheduleProductionContinuation } from '../../services/productionContinuation.js';
@@ -7,6 +9,7 @@ import {
   createPreviewJob,
   loadJob,
   queueRun,
+  ProductionTelegramUpdateReplayError,
   type JobCursor,
 } from '../../services/productionJobStore.js';
 import {
@@ -29,6 +32,7 @@ interface TelegramChat {
 
 interface TelegramMessage {
   message_id: number;
+  date?: number;
   from?: TelegramUser;
   chat: TelegramChat;
   text?: string;
@@ -74,7 +78,7 @@ function isTelegraphEnabled(): boolean {
   return process.env.TELEGRAPH_ENABLED?.trim().toLowerCase() === 'true';
 }
 
-function triggerBackground(chatId: number, job: JobCursor): void {
+async function triggerBackground(chatId: number, job: JobCursor): Promise<void> {
   const dispatch = scheduleProductionContinuation({
     chatId,
     batchId: job.batchId,
@@ -83,16 +87,24 @@ function triggerBackground(chatId: number, job: JobCursor): void {
     console.error('[webhook] Failed to enqueue production pipeline:', error);
     await sendMessage(
       chatId,
-      `🚨 تعذر وضع Batch ${job.batchId} في طابور التشغيل. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
+      previewOnlyConfig()
+        ? `🚨 تعذر إرسال استكمال Batch ${job.batchId}. الحالة محفوظة؛ استخدم /status ثم الدعم. الـwatchdog العام مقفول؛ لا تكرر الشحن.`
+        : `🚨 تعذر وضع Batch ${job.batchId} في طابور التشغيل. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
     );
   });
+  if (process.env.PRODUCTION_CONTINUATION_TRANSPORT === 'netlify') {
+    await dispatch;
+    return;
+  }
   try {
     waitUntil(dispatch);
   } catch (error) {
     console.error('[webhook] Failed to retain production queue publish:', error);
     void sendMessage(
       chatId,
-      `🚨 تعذر وضع Batch ${job.batchId} في طابور التشغيل. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
+      previewOnlyConfig()
+        ? `🚨 تعذر إرسال استكمال Batch ${job.batchId}. الحالة محفوظة؛ استخدم /status ثم الدعم. الـwatchdog العام مقفول؛ لا تكرر الشحن.`
+        : `🚨 تعذر وضع Batch ${job.batchId} في طابور التشغيل. الحالة محفوظة والـwatchdog هيحاول تلقائيًا.`
     );
   }
 }
@@ -111,17 +123,20 @@ function parseOrderArgument(fullText: string): string | undefined {
 }
 
 async function ensureBotRunning(chatId: number): Promise<boolean> {
+  const mode = previewOnlyConfig();
+  if (mode) return isPreviewOperator(chatId, mode); // Does NOT clear the global /stop row.
   if (!(await isBotPaused())) return true;
   await sendMessage(chatId, '🛑 البوت متوقف (/stop). ابعت /resume الأول.');
   return false;
 }
 
-async function startPreview(chatId: number, orderId?: string): Promise<void> {
+async function startPreview(chatId: number, orderId?: string, telegramUpdateId?: number): Promise<void> {
   if (!(await ensureBotRunning(chatId))) return;
   const result = await createPreviewJob(chatId, {
     orderId,
     pendingRun: false,
     recipientChatIds: productionRecipientChatIds(chatId),
+    telegramUpdateId,
   });
 
   if (result.created) {
@@ -129,14 +144,16 @@ async function startPreview(chatId: number, orderId?: string): Promise<void> {
       chatId,
       `⏳ بدأ Preview آلي${orderId ? ` للأوردر #${orderId}` : ''}.\nBatch: ${result.job.batchId}\nلو الوقت خلص هكمل لوحدي في request جديد.`
     );
-    triggerBackground(chatId, result.job);
+    await triggerBackground(chatId, result.job);
     return;
   }
 
   if (result.job.status === 'preview_ready') {
     await sendMessage(
       chatId,
-      `✅ Preview Batch ${result.job.batchId} مكتمل بالفعل (${result.job.orderNumbers.length} أوردر). ابعت /run لشحن نفس القائمة، أو /cancel لبدء Batch جديد.`
+      previewOnlyConfig()
+        ? `✅ Preview Batch ${result.job.batchId} مكتمل (${result.job.orderNumbers.length} أوردر). ${manualRunConfig() ? 'أرسل /run جديد للشحن؛ Odoo والطوابير المالية تظل مقفولة.' : 'Run مقفول. ابعت /cancel ثم /preview لاختبار جديد.'}`
+        : `✅ Preview Batch ${result.job.batchId} مكتمل بالفعل (${result.job.orderNumbers.length} أوردر). ابعت /run لشحن نفس القائمة، أو /cancel لبدء Batch جديد.`
     );
   } else if (result.job.status === 'needs_review') {
     await sendMessage(
@@ -150,11 +167,12 @@ async function startPreview(chatId: number, orderId?: string): Promise<void> {
     );
     // If a prior self-request failed to dispatch, this harmless claim attempt
     // restarts a retrying job; a fresh running lease simply rejects it.
-    triggerBackground(chatId, result.job);
+    await triggerBackground(chatId, result.job);
   }
 }
 
-async function startRun(chatId: number, orderId?: string): Promise<void> {
+async function startRun(chatId: number, orderId?: string, telegramUpdateId?: number,
+  telegramFromId?: number, telegramMessageDate?: number): Promise<void> {
   if (!(await ensureBotRunning(chatId))) return;
   if (!isTelegraphEnabled()) {
     await sendMessage(chatId, '⛔ TELEGRAPH_ENABLED مش مفعّل؛ لن أبدأ شحنًا.');
@@ -164,6 +182,9 @@ async function startRun(chatId: number, orderId?: string): Promise<void> {
   const result = await queueRun(chatId, {
     orderId,
     recipientChatIds: productionRecipientChatIds(chatId),
+    telegramUpdateId,
+    telegramFromId,
+    telegramMessageDate,
   });
 
   if (result.action === 'order_mismatch') {
@@ -185,7 +206,7 @@ async function startRun(chatId: number, orderId?: string): Promise<void> {
       chatId,
       `🚚 شحن Batch ${result.job.batchId} شغال بالفعل أو هيُعاد تلقائيًا. مفيش ضغطة Continue ومفيش شحنة هتتكرر.`
     );
-    triggerBackground(chatId, result.job);
+    await triggerBackground(chatId, result.job);
     return;
   }
   if (result.action === 'created_preview') {
@@ -201,10 +222,11 @@ async function startRun(chatId: number, orderId?: string): Promise<void> {
   } else {
     await sendMessage(
       chatId,
-      `🚚 Preview مكتمل — بدأ شحن نفس ${result.job.orderNumbers.length} أوردر في Batch ${result.job.batchId}.`
+      `🚚 Preview مكتمل — اتصرح بشحن نفس ${result.job.orderNumbers.length} أوردر في Batch ${result.job.batchId}.` +
+      (previewOnlyConfig() ? '\n⏳ Odoo إنتاج/محاسبة: intent جديد فقط، العمال والطوابير المالية لم تعمل.' : '')
     );
   }
-  triggerBackground(chatId, result.job);
+  await triggerBackground(chatId, result.job);
 }
 
 async function statusMessage(chatId: number): Promise<void> {
@@ -226,11 +248,12 @@ async function statusMessage(chatId: number): Promise<void> {
       progress,
       `محاولات الخطأ المتتالية: ${job.attemptCount}`,
       ...(job.lastError ? [`آخر ملاحظة: ${job.lastError.slice(0, 250)}`] : []),
+      ...(manualRunConfig() ? ['⏳ Odoo والمحاسبة: مهام جديدة مسجلة فقط، لم يتم تشغيل العمال أو الطوابير العامة.'] : []),
     ].join('\n')
   );
 }
 
-async function handleCommand(chatId: number, command: string, fullText: string): Promise<void> {
+async function handleCommand(chatId: number, command: string, fullText: string, telegramUpdateId: number): Promise<void> {
   if (command === '/start') {
     const user = await getUser(chatId);
     const allowed = await isAllowed(chatId);
@@ -271,13 +294,13 @@ async function handleCommand(chatId: number, command: string, fullText: string):
     await prisma.failedPayload.deleteMany({ where: { source: 'bot_control' } });
     await sendMessage(chatId, '✅ البوت شغال تاني. أي Batch محفوظ يقدر يكمل تلقائيًا.');
     const job = await loadJob(chatId);
-    if (job) triggerBackground(chatId, job);
+    if (job) await triggerBackground(chatId, job);
     return;
   }
 
   if (command === '/cancel') {
     const existing = await loadJob(chatId);
-    await clearJob(chatId);
+    await clearJob(chatId, telegramUpdateId);
     await sendMessage(
       chatId,
       existing
@@ -293,12 +316,12 @@ async function handleCommand(chatId: number, command: string, fullText: string):
   }
 
   if (command === '/run') {
-    await startRun(chatId, parseOrderArgument(fullText));
+    await startRun(chatId, parseOrderArgument(fullText), telegramUpdateId);
     return;
   }
 
   if (command === '/preview') {
-    await startPreview(chatId, parseOrderArgument(fullText));
+    await startPreview(chatId, parseOrderArgument(fullText), telegramUpdateId);
     return;
   }
 
@@ -320,10 +343,67 @@ async function handleCommand(chatId: number, command: string, fullText: string):
   }
 }
 
+/** While recovery is held, ONLY a new private allowlisted message may request a
+ * Preview. No generic command/callback path or global resume is reachable. */
+async function handleOwnerPreviewOnly(update: TelegramUpdate, mode: PreviewOnlyConfig): Promise<LambdaResult> {
+  const message = update.message;
+  if (!message || message.chat.type !== 'private' || !isFreshOwnerPreviewMessage({ chatId: message.chat.id,
+    fromId: message.from?.id, date: message.date, updateId: update.update_id }, mode)) {
+    return { statusCode: 200, body: 'ignored-owner-preview-only' };
+  }
+  const chatId = message.chat.id, text = (message.text ?? '').trim();
+  const command = text.split(/\s/)[0]?.split('@')[0] ?? '';
+  try {
+    if (command === '/preview' || PREVIEW_PHRASES.has(text)) {
+      const existing = await loadJob(chatId);
+      if (existing) {
+        try { assertPreviewCursorInMode(chatId, existing); }
+        catch {
+          await sendMessage(chatId, '🛑 فيه Batch قديم من إصدار مختلف. لن أستكمله أو أشحنه. لو كان Preview، استخدم /cancel ثم /preview لبدء اختبار جديد.');
+          return { statusCode: 200, body: 'old-batch-held' };
+        }
+      }
+      await startPreview(chatId, command === '/preview' ? parseOrderArgument(text) : undefined, update.update_id);
+    } else if (command === '/run' && manualRunConfig()) {
+      await startRun(chatId, parseOrderArgument(text), update.update_id, message.from?.id, message.date);
+    } else if (command === '/status') {
+      await statusMessage(chatId);
+    } else if (command === '/cancel') {
+      const existing = await loadJob(chatId);
+      if (existing?.kind === 'run') {
+        try { assertProductionRunAllowed({ chatId, cursor: existing }); }
+        catch {
+          await sendMessage(chatId, '🛑 دي مهمة شحن قديمة وتفضل مقفولة للمراجعة؛ وضع الاختبار لا يغيرها.');
+          return { statusCode: 200, body: 'old-run-held' };
+        }
+      }
+      await clearJob(chatId, update.update_id);
+      await sendMessage(chatId, '🗑️ اتلغت حالة الـBatch المسموح بها وسجلها محفوظ. أي شحنة سابقة لا تُحذف؛ ابدأ NEW /preview قبل أي Run جديد.');
+    } else {
+      await sendMessage(chatId, manualRunConfig()
+        ? '🧪 تشغيل يدوي للحسابين فقط.\n/preview — NEW ملفات وربط الشحن\n/run — أمر جديد بعد اكتمال نفس Preview فقط\n/status — الحالة\n/cancel — إلغاء Batch مسموح مع حفظ السجل\n🔒 Odoo والمحاسبة والطوابير العامة مقفولة.'
+        : '🧪 البوت متاح لحسابك في وضع Preview فقط.\n/preview — ملفات الإنتاج\n/status — الحالة\n/cancel — إلغاء Preview\n🔒 Run والشحن والمحاسبة والطوابير التلقائية مقفولة.');
+    }
+  } catch (error) {
+    if (error instanceof ProductionTelegramUpdateReplayError) return { statusCode: 200, body: 'duplicate-update' };
+    // Acknowledge a failed owner request instead of making Telegram burn CPU
+    // retrying while Neon is suspended. Never claim that a write didn't happen.
+    console.error('[owner-preview] Request stopped safely', { error: error instanceof Error ? error.name : 'unknown' });
+    await sendMessage(chatId, manualRunConfig()
+      ? '🛑 تعذر إكمال الطلب. قد تكون الموافقة أو حالة الشحن محفوظة بالفعل؛ استخدم /status قبل أي طلب جديد ولا تكرر الشحن. عمال Odoo والمحاسبة والطوابير العامة لم يتم إطلاقهم.'
+      : '🛑 تعذر إكمال طلب Preview. الحالة قد تكون محفوظة؛ استخدم /status قبل طلب جديد. لا شحن ولا محاسبة تم تشغيلهم.');
+  }
+  return { statusCode: 200, body: 'owner-preview-only' };
+}
+
 export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
   const secret = event.headers['x-telegram-bot-api-secret-token'];
-  const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (expectedSecret && secret !== expectedSecret) {
+  const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
+  // Missing configuration is not authorization. Fail before parsing updates,
+  // touching Neon, sending a message, or publishing any continuation.
+  if (!expectedSecret) return { statusCode: 503, body: 'Telegram webhook is not configured' };
+  if (!secret || Buffer.byteLength(secret) !== Buffer.byteLength(expectedSecret)
+      || !timingSafeEqual(Buffer.from(secret), Buffer.from(expectedSecret))) {
     return { statusCode: 401, body: 'Unauthorized' };
   }
   if (event.httpMethod !== 'POST' || !event.body) return { statusCode: 200, body: 'ok' };
@@ -334,6 +414,13 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
   } catch {
     return { statusCode: 200, body: 'ok' };
   }
+  if (!Number.isSafeInteger(update?.update_id) || update.update_id < 0) {
+    return { statusCode: 400, body: 'Invalid update_id' };
+  }
+
+  const previewMode = previewOnlyConfig();
+  manualRunConfig(); // Explicit unsafe manual configuration fails before any effect.
+  if (previewMode) return await handleOwnerPreviewOnly(update, previewMode);
 
   const callback = update.callback_query;
   if (callback) {
@@ -343,7 +430,7 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
       const job = await loadJob(chatId);
       if (job) {
         await sendMessage(chatId, `✅ مش محتاج تدوس Continue تاني. Batch ${job.batchId} بيكمل تلقائيًا.`);
-        triggerBackground(chatId, job);
+        await triggerBackground(chatId, job);
       } else {
         await sendMessage(chatId, 'ℹ️ الـBatch القديم انتهى أو اتلغى.');
       }
@@ -357,15 +444,21 @@ export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
   const text = (message.text ?? '').trim();
   if (!text) return { statusCode: 200, body: 'ok' };
 
-  if (text.startsWith('/')) {
-    const command = text.split(' ')[0]!.split('@')[0]!;
-    await handleCommand(chatId, command, text);
-  } else if (!(await isAllowed(chatId))) {
-    await sendMessage(chatId, `مش مصرّح ليك.\nChat ID بتاعك: ${chatId}`);
-  } else if (RUN_PHRASES.has(text)) {
-    await startRun(chatId);
-  } else if (PREVIEW_PHRASES.has(text)) {
-    await startPreview(chatId);
+  try {
+    if (text.startsWith('/')) {
+      const command = text.split(' ')[0]!.split('@')[0]!;
+      await handleCommand(chatId, command, text, update.update_id);
+    } else if (!(await isAllowed(chatId))) {
+      await sendMessage(chatId, `مش مصرّح ليك.\nChat ID بتاعك: ${chatId}`);
+    } else if (RUN_PHRASES.has(text)) {
+      await startRun(chatId, undefined, update.update_id);
+    } else if (PREVIEW_PHRASES.has(text)) {
+      await startPreview(chatId, undefined, update.update_id);
+    }
+  } catch (error) {
+    // Already accepted (or older than /cancel): acknowledge without re-creating
+    // a batch, sending another notification, or publishing a continuation.
+    if (!(error instanceof ProductionTelegramUpdateReplayError)) throw error;
   }
 
   return { statusCode: 200, body: 'ok' };

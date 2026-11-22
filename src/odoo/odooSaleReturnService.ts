@@ -333,11 +333,14 @@ export class OdooSaleReturnService {
    * or delete the original return/accounting audit trail. Not called by cron.
    */
   async restoreDeliveredAfterReturn(saleOrderId: number): Promise<{ saleOrderName: string; restoredPickingIds: number[] }> {
-    let snapshot = await this.readSnapshot(saleOrderId);
+    let snapshot = await this.readSnapshot(saleOrderId,true);
+    const before=JSON.stringify([snapshot.saleOrder.date_order,snapshot.saleOrder.amount_total,snapshot.saleOrder.order_line,snapshot.saleOrder.mrp_production_ids]);
+    const originalDate=snapshot.saleOrder.date_order;
+    if(typeof originalDate!=='string'||!Array.isArray(snapshot.saleOrder.mrp_production_ids))throw new OdooSaleReturnReviewError('Original SO date/manufacturing evidence is missing');
     const complete = () => snapshot.saleOrder.state === 'sale' && snapshot.saleOrderLines.length > 0 &&
       snapshot.saleOrderLines.every((l) => Math.abs(Number(l.qty_delivered ?? 0) - Number(l.product_uom_qty ?? 0)) <= tolerance);
     if (complete()) return { saleOrderName: snapshot.saleOrder.name ?? String(saleOrderId), restoredPickingIds: [] };
-    if (!['sale', 'cancel'].includes(snapshot.saleOrder.state ?? '') || activeInvoices(snapshot).length > 0 || hasOverReturn(snapshot)) {
+    if (!['sale', 'cancel'].includes(snapshot.saleOrder.state ?? '') || activeInvoices(snapshot).length > 0 || hasOverReturn(snapshot)||snapshot.moves.some(m=>doneReturnedQuantity(snapshot,m.id)>quantity(m)+tolerance)) {
       throw new OdooSaleReturnReviewError('Redelivery recovery requires a returned SO without active customer accounting or over-returns');
     }
     if (!phaseComplete(snapshot, 'internal') || !phaseComplete(snapshot, 'customer') || openReturnPickingIds(snapshot).length > 0) {
@@ -345,23 +348,14 @@ export class OdooSaleReturnService {
     }
     const originalMoveIds = new Set(snapshot.moves.filter((m) => !moveOriginalId(m)).map((m) => m.id));
     const existingPickingIds = new Set(snapshot.pickings.map((p) => p.id));
-    if (snapshot.saleOrder.state === 'cancel') {
-      await this.odoo.call('sale.order', 'action_draft', [[saleOrderId]]);
-      // Standard Odoo 17 sale_stock context: reopen the SO without another MTO
-      // manufacture/procurement. Only the exact return-of-return moves below
-      // restore delivered quantities and stock valuation.
-      await this.odoo.call('sale.order', 'action_confirm', [[saleOrderId]], { context: { skip_procurement: true } });
-      snapshot = await this.readSnapshot(saleOrderId);
-      if (snapshot.pickings.some((p) => !existingPickingIds.has(p.id))) throw new Error('Unexpected procurement while reopening redelivery SO');
-    }
     const restoredPickingIds: number[] = [];
     for (const phase of ['internal', 'customer'] as const) {
-      snapshot = await this.readSnapshot(saleOrderId);
+      snapshot = await this.readSnapshot(saleOrderId,true);
       const phaseIds = new Set(originalPickingsForPhase(snapshot, phase).flatMap((p) => originalMovesForPicking(snapshot, p.id).map((m) => m.id)));
       const returns = snapshot.moves.filter((m) => m.state === 'done' && phaseIds.has(moveOriginalId(m) ?? -1));
       const pickingIds = [...new Set(returns.map((m) => relationId(m.picking_id)).filter((id): id is number => id !== null))];
       for (const pickingId of pickingIds) {
-        snapshot = await this.readSnapshot(saleOrderId);
+        snapshot = await this.readSnapshot(saleOrderId,true);
         const picking = snapshot.pickings.find((p) => p.id === pickingId);
         if (!picking) throw new Error('Redelivery return picking not found');
         const moves = snapshot.moves.filter((m) => relationId(m.picking_id) === pickingId && originalMoveIds.has(moveOriginalId(m) ?? -1));
@@ -371,7 +365,18 @@ export class OdooSaleReturnService {
         restoredPickingIds.push(restoredId);
       }
     }
-    snapshot = await this.readSnapshot(saleOrderId);
+    // Reverse BOTH return legs before reopening, matching the owner-reviewed
+    // recovery sequence. Never trigger new MTO/procurement or customer mail.
+    snapshot=await this.readSnapshot(saleOrderId,true);
+    const knownPickingIds=new Set([...existingPickingIds,...restoredPickingIds]);
+    if(snapshot.saleOrder.state==='cancel'){
+      const context={skip_procurement:true,tracking_disable:true,mail_notrack:true,mail_create_nosubscribe:true};
+      await this.odoo.call('sale.order','action_draft',[[saleOrderId]],{context});
+      await this.odoo.call('sale.order','action_confirm',[[saleOrderId]],{context});
+      await this.odoo.call('sale.order','write',[[saleOrderId],{date_order:originalDate}],{context});
+    }
+    snapshot = await this.readSnapshot(saleOrderId,true);
+    if(JSON.stringify([snapshot.saleOrder.date_order,snapshot.saleOrder.amount_total,snapshot.saleOrder.order_line,snapshot.saleOrder.mrp_production_ids])!==before||snapshot.pickings.some(p=>!knownPickingIds.has(p.id)))throw new Error('Recovery changed original SO/date/lines/manufacturing or created unexpected procurement');
     if (!complete()) throw new Error('Redelivery stock recovery did not restore exact ordered/delivered quantities');
     return { saleOrderName: snapshot.saleOrder.name ?? String(saleOrderId), restoredPickingIds };
   }
@@ -834,11 +839,11 @@ export class OdooSaleReturnService {
     }
   }
 
-  private async readSnapshot(saleOrderId: number): Promise<OdooSaleReturnSnapshot> {
+  private async readSnapshot(saleOrderId: number, recovery=false): Promise<OdooSaleReturnSnapshot> {
     const [saleOrder] = await this.odoo.searchRead<SaleOrderRecord>(
       'sale.order',
       [['id', '=', saleOrderId]],
-      ['name', 'state', 'amount_total', 'invoice_ids', 'picking_ids', 'order_line', 'client_order_ref', 'origin'],
+      ['name', 'state', 'amount_total', 'invoice_ids', 'picking_ids', 'order_line', 'client_order_ref', 'origin',...(recovery?['date_order','mrp_production_ids']:[])],
       { limit: 1 }
     );
     if (!saleOrder) throw new OdooSaleReturnReviewError(`Odoo Sales Order not found: ${saleOrderId}`);
@@ -913,11 +918,16 @@ export class OdooSaleReturnService {
       { limit: 500, order: 'id asc' }
     );
 
+    // A return-of-return is a second-level move. Read it explicitly only in
+    // recovery mode so a retry can prove it exists rather than issue it twice.
+    const restoredMoves=recovery&&returnMoves.length?await this.odoo.searchRead<MoveRecord>('stock.move',[['origin_returned_move_id','in',returnMoves.map(m=>m.id)]],['name','state','product_id','product_uom','product_uom_qty','quantity','picked','to_refund','move_line_ids','picking_id','origin_returned_move_id','returned_move_ids','location_id','location_dest_id'],{limit:1000,order:'id asc'}):[];
+    const restoredPickingIds=[...new Set(restoredMoves.map(m=>relationId(m.picking_id)).filter((id):id is number=>id!==null&&!initialPickings.some(p=>p.id===id)&&!additionalPickings.some(p=>p.id===id)))];
+    const restoredPickings=restoredPickingIds.length?await this.odoo.searchRead<PickingRecord>('stock.picking',[['id','in',restoredPickingIds]],['name','state','location_id','location_dest_id','origin','move_ids'],{limit:500,order:'id asc'}):[];
     return {
       saleOrder,
       saleOrderLines: uniqueById(saleOrderLines),
-      pickings: uniqueById([...initialPickings, ...additionalPickings]),
-      moves: uniqueById([...initialMoves, ...returnMoves]),
+      pickings: uniqueById([...initialPickings, ...additionalPickings,...restoredPickings]),
+      moves: uniqueById([...initialMoves, ...returnMoves,...restoredMoves]),
       invoices: uniqueById(invoices)
     };
   }

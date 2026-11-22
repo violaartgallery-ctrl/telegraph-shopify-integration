@@ -7,6 +7,8 @@
  * No employee Continue button is involved.
  */
 import { sendMessage } from '../../telegram/telegramApi.js';
+import { assertAutomationReleased } from '../../services/automationSafety.js';
+import { previewOnlyConfig, isPreviewOperator, assertProductionInvocationAllowed, assertProductionRunAllowed, assertPreviewCursorInMode } from '../../services/productionPreviewOnly.js';
 import {
   checkpointJob,
   claimJob,
@@ -53,6 +55,11 @@ function maxAutoRetries(): number {
 }
 
 export function productionRecipientChatIds(triggerChatId: number): string[] {
+  const mode = previewOnlyConfig();
+  if (mode) {
+    if (!isPreviewOperator(triggerChatId, mode)) throw new Error('Preview trigger is not allowlisted');
+    return [...mode.recipientChatIds];
+  }
   const configured = process.env.PRODUCTION_RECIPIENT_CHAT_IDS?.trim();
   const recipients = configured ? configured.split(',') : DEFAULT_PRODUCTION_RECIPIENT_CHAT_IDS;
   return [...new Set([String(triggerChatId), ...recipients.map((value) => value.trim())].filter(Boolean))];
@@ -79,7 +86,9 @@ async function scheduleNext(
     });
     await sendMessage(
       chatId,
-      `🚨 Batch ${batchId}\nفشل وضع الجزء التالي في طابور التشغيل. التقدم محفوظ في Neon، والـwatchdog هيحاول تاني. ابعت رقم الـBatch للدعم لو التنبيه اتكرر.`
+      previewOnlyConfig()
+        ? `🚨 Batch ${batchId}\nتعذر إرسال الاستكمال المصرح به. التقدم محفوظ؛ استخدم /status ثم مراجعة الدعم، ولا تكرر إنشاء الشحنات. الـwatchdog العام مقفول.`
+        : `🚨 Batch ${batchId}\nفشل وضع الجزء التالي في طابور التشغيل. التقدم محفوظ في Neon، والـwatchdog هيحاول تاني. ابعت رقم الـBatch للدعم لو التنبيه اتكرر.`
     );
     return false;
   }
@@ -94,8 +103,10 @@ function copyCheckpointState(target: JobCursor, saved: JobCursor): void {
 }
 
 export async function runPipeline(chatId: number, expectedBatchId?: string): Promise<void> {
+  await assertProductionInvocationAllowed(chatId, expectedBatchId);
   const cursor = await claimJob(chatId, expectedBatchId);
   if (!cursor?.executionToken) return;
+  assertPreviewCursorInMode(chatId, cursor);
 
   const executionToken = cursor.executionToken;
   const deadline = Date.now() + jobDeadlineMs();
@@ -124,28 +135,32 @@ export async function runPipeline(chatId: number, expectedBatchId?: string): Pro
         },
       });
 
-      await sendMessage(
-        chatId,
-        `✅ Preview Batch ${cursor.batchId} اكتمل بالكامل: كل الملفات والصور والملخص اتأكد إرسالهم.`
-      );
       const next = await finishPreview(chatId, cursor, executionToken);
+      await sendMessage(chatId, `✅ Preview Batch ${cursor.batchId} اكتمل بالكامل: كل الملفات والصور والملخص اتأكد إرسالهم.`);
       if (next.kind === 'run') {
         await sendMessage(chatId, `🚚 طلب /run متسجل — هبدأ شحن نفس الـ${next.orderNumbers.length} أوردر تلقائيًا.`);
         await scheduleNext(chatId, next.batchId, 0, String(next.updatedAt));
       } else {
-        await sendMessage(chatId, '🔒 الأوردرات اتثبتت. ابعت /run وقت ما تكون جاهز؛ الشحن هيستخدم نفس الـBatch بالضبط.');
+        await sendMessage(chatId, previewOnlyConfig()
+          ? (process.env.PRODUCTION_MANUAL_RUN_ENABLED?.trim().toLowerCase() === 'true'
+            ? '✅ Preview اكتمل للحسابين. أمر /run جديد وصريح فقط يبدأ نفس القائمة؛ Odoo والمحاسبة والطوابير العامة لن تعمل.'
+            : '🧪 Preview اكتمل للحسابين. Run والشحن والمحاسبة والطوابير العامة لسه مقفولة. لا شحن ولا مستند مالي اتعمل.')
+          : '🔒 الأوردرات اتثبتت. ابعت /run وقت ما تكون جاهز؛ الشحن هيستخدم نفس الـBatch بالضبط.');
       }
       return;
     }
 
+    assertProductionRunAllowed({ chatId, cursor });
     await createExactBatchShipments({
       chatId,
       cursor,
       deadline,
       checkpoint,
+      manualContext: { chatId, cursor },
     });
     await completeRun(chatId, cursor, executionToken);
-    await sendMessage(chatId, `✅ Batch ${cursor.batchId} خلص بالكامل واتحفظ تقريره.`);
+    await sendMessage(chatId, `✅ Batch ${cursor.batchId} انتهت مرحلة الشحن واتحفظ تقريرها.` +
+      (previewOnlyConfig() ? '\n⏳ Odoo إنتاج/محاسبة: intent فقط؛ العمال والطوابير العامة لم تعمل. راجع أي fulfillment معلق في التقرير.' : ''));
   } catch (error) {
     if (error instanceof ProductionJobLeaseLostError) {
       // /cancel or another valid lease won. Stop silently; never recreate state.
@@ -205,6 +220,7 @@ export async function resumeProductionInvocation(
   batchId: string,
   delayMs = 0
 ): Promise<void> {
+  await assertProductionInvocationAllowed(chatId, batchId);
   const boundedDelay = Math.min(30_000, Math.max(0, Number(delayMs) || 0));
   if (boundedDelay) {
     await new Promise((resolve) => setTimeout(resolve, boundedDelay));
@@ -215,6 +231,7 @@ export async function resumeProductionInvocation(
 // Compatibility entrypoint for any old direct invocation. It now creates the
 // same preview-first durable workflow instead of running a second code path.
 export const handler = async (event: LambdaEvent): Promise<LambdaResult> => {
+  assertProductionRunAllowed();
   if (!event.body) return { statusCode: 400, body: 'Missing body' };
   let payload: JobPayload;
   try {

@@ -1,5 +1,5 @@
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import { AccurateClient } from '../accurate/accurateClient.js';
 import { isOrderEligibleForShipment } from '../services/orderEligibility.js';
 import { shipmentRepository } from '../services/shipmentRepository.js';
@@ -9,6 +9,13 @@ import { shopifyOrdersClient } from '../shopify/shopifyOrdersClient.js';
 import { OdooSyncService } from '../odoo/odooSyncService.js';
 import { ShipmentStatusSyncService } from '../services/shipmentStatusSyncService.js';
 import { ValidationError } from '../lib/errors.js';
+import { automationHoldReason } from '../services/automationSafety.js';
+import { heldLegacyActionNotice, renderHeldAdminNotice, adminManualShippingEnabled } from '../services/adminReadOnlyPolicy.js';
+import { createAdminManualShippingRouter } from './adminManualShippingRoute.js';
+import {getOperationsDashboard} from '../services/operationsDashboardService.js';
+import {renderOperationsDashboard,renderOperationsDashboardScript} from '../ui/operationsDashboard.js';
+import {createOperationsDecisionRouter} from './operationsDecisionRoute.js';
+import {renderOperationsReviewUi,renderOperationsReviewScript} from '../ui/operationsReviewUi.js';
 
 interface ZoneEntry {
   id: number;
@@ -45,12 +52,14 @@ const renderAdminScriptContext = (adminToken?: string): string => `
         : path;
 `;
 
-const renderAppShell = (adminToken?: string): string => `<!doctype html>
+const renderAppShell = (adminToken?: string, readOnly = Boolean(automationHoldReason()), manualShipping = adminManualShippingEnabled()): string => `<!doctype html>
 <html lang="ar" dir="rtl">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Viola — Telegraph Shipments</title>
+    <meta name="shopify-api-key" content="${escapeHtml(process.env.SHOPIFY_CLIENT_ID ?? '')}" />
+    <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
     <style>
       :root {
         color-scheme: light;
@@ -131,14 +140,17 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
       <header>
         <div>
           <h1>🚚 Viola — Telegraph Shipments</h1>
-          <div class="muted">إنشاء بوالص Accurate يدويًا ومتابعة حالة Odoo في الخلفية</div>
+          <div class="muted">${manualShipping ? 'إنشاء بوالص Telegraph يدويًا بعد مراجعة الأوردر وتأكيدك' : readOnly ? 'عرض ومراجعة فقط — الشحن والمحاسبة من هذه الواجهة متوقفان للحماية' : 'إنشاء بوالص Accurate يدويًا ومتابعة حالة Odoo في الخلفية'}</div>
         </div>
         <div class="toolbar">
           <button id="refresh" type="button">🔄 تحديث الأوردرات</button>
           <button id="locations-refresh" type="button">📍 تحديث المناطق</button>
         </div>
       </header>
+      ${manualShipping ? '<section role="status"><strong>الشحن اليدوي من Shopify مفعّل</strong><p>اضغط إنشاء بوليصة، راجع المحافظة والمنطقة، ثم أكد الإنشاء. فتح الصفحة لا ينشئ شحنات. حمايات منع التكرار باقية.</p></section>' : readOnly ? '<section role="status"><strong>وضع العرض الآمن</strong><p>يمكنك تحديث عرض الأوردرات والمناطق. أزرار إنشاء البوالص وOdoo معطلة، ولن تُشغّل هذه الصفحة أي طابور. التشغيل اليدوي المعتمد يظل من تيليجرام.</p></section>' : ''}
       <div id="toast" class="toast"></div>
+      ${renderOperationsReviewUi()}
+      <details style="margin-top:24px"><summary>التفاصيل التقنية للجدولة والطوابير — للقراءة فقط</summary>${renderOperationsDashboard()}</details>
       <section>
         <h2>الأوردرات الأخيرة</h2>
         <div id="summary-cards" class="summary-grid"></div>
@@ -152,6 +164,8 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
     </main>
     <script>
       ${renderAdminScriptContext(adminToken)}
+      const readOnly = ${JSON.stringify(readOnly)};
+      const manualShipping = ${JSON.stringify(manualShipping)};
 
       // ── Utilities ──────────────────────────────────────────────────────────
       const toast = document.getElementById('toast');
@@ -160,6 +174,8 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
         toast.style.color = error ? '#b42318' : '#0b6b5d';
       };
       const html = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      ${renderOperationsReviewScript()}
+      ${renderOperationsDashboardScript()}
 
       // ── Odoo status → Arabic label ─────────────────────────────────────────
       const ODOO_LABELS = {
@@ -259,8 +275,8 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
             '<td>' + (o.odooRetryAt ? '<span class="muted" title="' + html(new Date(o.odooRetryAt).toLocaleString('ar')) + '">' + html(formatRetryAt(o.odooRetryAt)) + '</span>' : '—') + '</td>' +
             '<td>' + (oodooErr ? '<span class="error-text" title="' + html(oodooErr) + '">' + html(oodooErr.slice(0, 55)) + '</span>' : '—') + '</td>' +
             '<td><div class="stack">' +
-              '<button class="primary" data-order-gid="' + html(o.gid) + '" ' + (o.shipmentCode ? 'disabled' : '') + '>📦 إنشاء بوليصة</button>' +
-              '<button data-odoo-order-gid="' + html(o.gid) + '" ' + (o.odooSaleOrderName ? 'disabled' : '') + '>🔁 Odoo</button>' +
+              '<button class="primary" data-order-gid="' + html(o.gid) + '" ' + ((readOnly && !manualShipping) || o.shipmentCode ? 'disabled' : '') + '>📦 إنشاء بوليصة</button>' +
+              '<button data-odoo-order-gid="' + html(o.gid) + '" ' + (readOnly || o.odooSaleOrderName ? 'disabled' : '') + '>🔁 Odoo</button>' +
             '</div></td>' +
           '</tr>';
         }).join('') + '</tbody></table>';
@@ -276,6 +292,12 @@ const renderAppShell = (adminToken?: string): string => `<!doctype html>
         if (!response.ok) throw new Error(data.message || 'Could not load orders');
         cardsEl.innerHTML = renderSummaryCards(data.orders);
         target.innerHTML = renderOrdersTable(data.orders);
+        // No mutation listeners are installed while operational protection holds.
+        // Server-side exact-route policy independently refuses every write.
+        if (manualShipping) target.querySelectorAll('button[data-order-gid]').forEach((button) => {
+          button.addEventListener('click', () => { window.location.href = adminUrl('/orders/make-telegraph?id=' + encodeURIComponent(button.dataset.orderGid)); });
+        });
+        if (readOnly || manualShipping) return;
 
         // Make Telegraph shipment button
         target.querySelectorAll('button[data-order-gid]').forEach((button) => {
@@ -1057,7 +1079,27 @@ export const createAdminAppRouter = (
 ) => {
   const router = express.Router();
 
-  router.get('/', (request: Request, response: Response) => {
+  router.use(createOperationsDecisionRouter());
+
+  router.get('/api/operations/dashboard',async(_request:Request,response:Response)=>{
+    response.set('Cache-Control','private, no-store');
+    try{response.json(await getOperationsDashboard());}
+    catch{response.status(503).json({ok:false,error:'تعذر قراءة الطوابير من Neon. لم تُشغّل أي طوابير؛ حاول بعد دقيقة.'});}
+  });
+
+  // Existing adminAuth has already run. The new GET is review-only, and only
+  // the separate signed confirmation POST can request one native shipment.
+  router.use(createAdminManualShippingRouter({processor:shopifyOrderProcessor,locations:()=>getLocations(accurateClient)}));
+
+  router.use((request: Request, response: Response, next: NextFunction) => {
+    if (automationHoldReason() && heldLegacyActionNotice(request.method, request.path)) {
+      response.type('html').send(renderHeldAdminNotice(extractAdminToken(request)));
+      return;
+    }
+    next();
+  });
+
+  router.get(['/', '/orders'], (request: Request, response: Response) => {
     response.type('html').send(renderAppShell(extractAdminToken(request)));
   });
 

@@ -15,6 +15,7 @@
 import Jimp from "jimp";
 import { PDFDocument } from "pdf-lib";
 import sharp from "sharp";
+import { PrintPhotoDecodeError, type PrintPhotoSource } from './productionPipelineErrors.js';
 
 const DPI = 300;
 const MM = DPI / 25.4; // px per mm @300 DPI
@@ -38,6 +39,7 @@ export type PrintKind = "wallet" | "keychain";
 export interface PrintPhoto {
   buffer: Buffer;
   kind: PrintKind;
+  source?: PrintPhotoSource;
 }
 
 const px = (mm: number): number => Math.round(mm * MM);
@@ -53,7 +55,7 @@ function errorMessage(error: unknown): string {
  * 2400px matches the Shopify CDN cap above and prevents oversized uploads from
  * consuming unnecessary serverless memory while retaining print resolution.
  */
-export async function decodePrintPhoto(buffer: Buffer): Promise<Jimp> {
+export async function decodePrintPhoto(buffer: Buffer, source?: PrintPhotoSource): Promise<Jimp> {
   try {
     return await Jimp.read(buffer);
   } catch (jimpError) {
@@ -70,10 +72,14 @@ export async function decodePrintPhoto(buffer: Buffer): Promise<Jimp> {
         .toBuffer();
       return await Jimp.read(normalized);
     } catch (normalizationError) {
-      throw new Error(
-        `Print photo could not be decoded (primary: ${errorMessage(jimpError)}; ` +
-        `fallback: ${errorMessage(normalizationError)})`
-      );
+      // A resource/host failure is not evidence that the customer's image is
+      // corrupt. Preserve its normal retry/containment path and actual cause.
+      const resourceFailure = [normalizationError, jimpError].find(error =>
+        /ENOMEM|ENOSPC|EMFILE|ENFILE|out of memory|allocation failed|unable to allocate|memory limit|timed?\s*out|ETIMEDOUT/i.test(errorMessage(error)));
+      if (resourceFailure) throw resourceFailure;
+      throw new PrintPhotoDecodeError(source, {
+        primary: errorMessage(jimpError), fallback: errorMessage(normalizationError),
+      });
     }
   }
 }
@@ -285,7 +291,7 @@ export async function buildPrintSheetPdf(photos: PrintPhoto[]): Promise<Uint8Arr
           heightPx: innerHeight,
         });
       } else {
-        const photo = await decodePrintPhoto(source);
+        const photo = await decodePrintPhoto(source, photos[item.idx]!.source ?? { photoNumber: item.idx + 1 });
         photo.cover(innerWidth, innerHeight); // crop-to-fill, centred
         canvas.composite(photo, ox, oy);
       }

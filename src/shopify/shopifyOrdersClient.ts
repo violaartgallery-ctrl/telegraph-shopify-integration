@@ -30,6 +30,7 @@ interface ShopifyGraphqlLineItem {
   sku?: string | null;
   quantity: number;
   currentQuantity: number;
+  customAttributes?: ShopifyGraphqlAttribute[];
   variantTitle?: string | null;
   variant?: {
     id: string;
@@ -186,6 +187,10 @@ const ORDER_FIELDS = `
         sku
         quantity
         currentQuantity
+        customAttributes {
+          key
+          value
+        }
         variantTitle
         variant {
           id
@@ -291,6 +296,9 @@ export const mapLineItems = (lineItems: ShopifyGraphqlLineItem[]): ShopifyLineIt
     sku: item.sku ?? item.variant?.sku ?? null,
     quantity: item.currentQuantity,
     current_quantity: item.currentQuantity,
+    ...(Array.isArray(item.customAttributes) ? { properties: item.customAttributes.map(attribute => ({
+      name: attribute.key, value: attribute.value ?? ''
+    })) } : {}),
     // ShopifyOrder mirrors the REST shape: price is BEFORE discounts. Odoo
     // applies discount_allocations separately; using the discounted unit price
     // here would apply the same discount twice (1000 - 750 became 0, not 250).

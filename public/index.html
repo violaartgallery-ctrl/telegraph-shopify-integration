@@ -1,1 +1,23 @@
-
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Viola — Telegraph</title>
+</head>
+<body style="font-family:Arial,sans-serif;padding:24px;line-height:1.8">
+  <p role="status">جاري فتح تطبيق Telegraph…</p>
+  <p><a id="open-app" href="/orders">افتح التطبيق</a></p>
+  <noscript>يحتاج التطبيق تفعيل JavaScript داخل المتصفح.</noscript>
+  <script>
+    // Public bootstrap only: never read order data or execute a business action.
+    // Preserve Shopify's signed document parameters for the existing adminAuth.
+    const target = new URL('/orders', window.location.origin);
+    target.search = window.location.search;
+    target.hash = window.location.hash;
+    document.getElementById('open-app').href = target.href;
+    window.location.replace(target.href);
+  </script>
+</body>
+</html>

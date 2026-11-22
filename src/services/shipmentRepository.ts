@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma.js';
 import type { ShopifyOrder } from '../types/shopify.js';
+import { automaticQueueSafetyActive, automaticRecordBlocked, blockedAutomaticOrderIds } from './automaticOperationSafety.js';
 import {
   STATUS_POLL_QUARANTINE_PREFIX,
   buildStatusPollingQuarantineReason,
@@ -261,6 +262,7 @@ export const shipmentRepository = {
     return await prisma.shipmentRecord.findMany({
       where: {
         accurateShipmentId: { not: null },
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('status') },
         OR: [
           { accurateIsTerminal: null },
           { accurateIsTerminal: false }
@@ -656,6 +658,7 @@ export const shipmentRepository = {
    * Returns true if the record was successfully queued.
    */
   markOdooSoPending: async (shopifyOrderId: string): Promise<boolean> => {
+    if (automaticQueueSafetyActive()) { const row=await prisma.shipmentRecord.findUnique({where:{shopifyOrderId},select:{id:true}}); if(!row||await automaticRecordBlocked(row.id,'production'))return false; }
     const result = await prisma.shipmentRecord.updateMany({
       where: {
         shopifyOrderId,
@@ -682,6 +685,7 @@ export const shipmentRepository = {
       where: {
         accurateShipmentId: { not: null },
         rawOrderJson: { not: null },
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('production') },
         OR: [
           { odooSyncStatus: 'odoo-so-pending' },
           { odooSyncStatus: 'odoo-stock-pending' },
@@ -708,6 +712,7 @@ export const shipmentRepository = {
       where: {
         accurateShipmentId: { not: null },
         rawOrderJson: { not: null },
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('production') },
         OR: [
           { odooSyncStatus: 'odoo-so-pending' },
           { odooSyncStatus: 'odoo-stock-pending' },
@@ -727,6 +732,7 @@ export const shipmentRepository = {
    * Prevents duplicate processing when cron overlaps or user clicks twice.
    */
   claimOdooStage: async (recordId: number, fromStatus: string, toStatus: string): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'production'))return false;
     const result = await prisma.shipmentRecord.updateMany({
       where: { id: recordId, odooSyncStatus: fromStatus },
       data: {
@@ -781,6 +787,7 @@ export const shipmentRepository = {
    * Always stores RETRY_FROM:<stage>|<error> so dashboard can show the failing stage.
    */
   markOdooStageFailure: async (recordId: number, retryFromStatus: string, error: string) => {
+    if(automaticQueueSafetyActive()&&/AUTOMATION_|manual review|independent review|outcome unknown/i.test(error))return await prisma.shipmentRecord.update({where:{id:recordId},data:{odooSyncStatus:'needs-review',odooLastError:error,odooRetryAt:null}});
     const record = await prisma.shipmentRecord.findUnique({
       where: { id: recordId },
       select: { odooAttemptCount: true }
@@ -895,6 +902,7 @@ export const shipmentRepository = {
    */
   recoverStuckProcessingRecords: async (stuckThresholdMinutes = 10): Promise<number> => {
     const stuckBefore = new Date(Date.now() - stuckThresholdMinutes * 60_000);
+    if(automaticQueueSafetyActive()){const r=await prisma.shipmentRecord.updateMany({where:{odooSyncStatus:{in:['odoo-so-creating','odoo-stock-preparing','odoo-delivery-confirming','odoo-paid-invoice-processing']},odooSyncedAt:{lt:stuckBefore}},data:{odooSyncStatus:'needs-review',odooRetryAt:null,odooLastError:'AUTOMATION_INTERRUPTED_REVIEW: never replay an expired financial/stock claim'}});return r.count;}
 
     const [r1, r2, r3, r4, legacyWithoutSo, legacyWithSo] = await Promise.all([
       prisma.shipmentRecord.updateMany({
@@ -948,6 +956,7 @@ export const shipmentRepository = {
    * the only source of SKU and quantity truth.
    */
   ensureCollectedProductionQueued: async (recordId: number): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'production'))return false;
     const queuedSalesOrder = await prisma.shipmentRecord.updateMany({
       where: {
         id: recordId,
@@ -985,6 +994,8 @@ export const shipmentRepository = {
   },
 
   queueOdooCollectionSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'collection'))return false;
+    if(automaticQueueSafetyActive()){const current=await prisma.shipmentRecord.findUnique({where:{id:recordId},select:{odooCollectionSyncStatus:true}});if(['completed','needs-review','processing'].includes(current?.odooCollectionSyncStatus??''))return false;}
     const current = await prisma.shipmentRecord.findUnique({
       where: { id: recordId },
       select: { odooSyncStatus: true }
@@ -1076,8 +1087,8 @@ export const shipmentRepository = {
         odooCollectionClaimedAt: { lt: new Date(Date.now() - stuckThresholdMinutes * 60_000) }
       },
       data: {
-        odooCollectionSyncStatus: 'retryable',
-        odooCollectionRetryAt: new Date(),
+        odooCollectionSyncStatus: automaticQueueSafetyActive()?'needs-review':'retryable',
+        odooCollectionRetryAt: automaticQueueSafetyActive()?null:new Date(),
         odooCollectionClaimedAt: null,
         odooCollectionLastError: 'Recovered after an interrupted Odoo collection worker'
       }
@@ -1089,6 +1100,7 @@ export const shipmentRepository = {
     await prisma.shipmentRecord.findMany({
       where: {
         collectionStatus: 'collected',
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('collection') },
         collectedAmount: { gt: 0 },
         rawOrderJson: { not: null },
         accurateShipmentCode: { not: null },
@@ -1106,6 +1118,7 @@ export const shipmentRepository = {
     }),
 
   claimOdooCollectionSync: async (recordId: number): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'collection'))return false;
     const now = new Date();
     const result = await prisma.shipmentRecord.updateMany({
       where: {
@@ -1179,7 +1192,7 @@ export const shipmentRepository = {
       select: { odooCollectionAttemptCount: true }
     });
     const attempt = (current?.odooCollectionAttemptCount ?? 0) + 1;
-    const needsReview = attempt >= 7;
+    const needsReview = attempt >= 7 || automaticQueueSafetyActive()&&/AUTOMATION_|manual review|independent review|outcome unknown/i.test(error);
     return await prisma.shipmentRecord.update({
       where: { id: recordId },
       data: {
@@ -1209,6 +1222,7 @@ export const shipmentRepository = {
     await prisma.shipmentRecord.count({
       where: {
         collectionStatus: 'collected',
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('collection') },
         collectedAmount: { gt: 0 },
         OR: [
           { odooCollectionSyncStatus: 'pending' },
@@ -1221,6 +1235,7 @@ export const shipmentRepository = {
     }),
 
   supersedeOdooCollectionSync: async (recordId: number, reason: string): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'collection'))return false;
     const result = await prisma.shipmentRecord.updateMany({
       where: {
         id: recordId,
@@ -1237,6 +1252,8 @@ export const shipmentRepository = {
   },
 
   queueReturnSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'return'))return false;
+    if(automaticQueueSafetyActive()){const current=await prisma.shipmentRecord.findUnique({where:{id:recordId},select:{returnSyncStatus:true}});if(['completed','needs-review','processing'].includes(current?.returnSyncStatus??''))return false;}
     const staleBefore = new Date(Date.now() - 10 * 60_000);
     const result = await prisma.shipmentRecord.updateMany({
       where: {
@@ -1281,8 +1298,8 @@ export const shipmentRepository = {
         returnSyncClaimedAt: { lt: new Date(Date.now() - stuckThresholdMinutes * 60_000) }
       },
       data: {
-        returnSyncStatus: 'retryable',
-        returnSyncRetryAt: new Date(),
+        returnSyncStatus: automaticQueueSafetyActive()?'needs-review':'retryable',
+        returnSyncRetryAt: automaticQueueSafetyActive()?null:new Date(),
         returnSyncClaimedAt: null,
         returnSyncLastError: 'Recovered after an interrupted return-sync worker'
       }
@@ -1294,6 +1311,7 @@ export const shipmentRepository = {
     await prisma.shipmentRecord.findMany({
       where: {
         collectionStatus: { in: ['returned', 'returned-settled'] },
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('return') },
         OR: [
           { returnSyncStatus: 'pending' },
           {
@@ -1309,6 +1327,7 @@ export const shipmentRepository = {
     }),
 
   claimReturnSync: async (recordId: number): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'return'))return false;
     const now = new Date();
     const result = await prisma.shipmentRecord.updateMany({
       where: {
@@ -1346,6 +1365,7 @@ export const shipmentRepository = {
     });
     const attempt = (current?.returnSyncAttemptCount ?? 0) + 1;
     const permanentlyFailed = attempt >= 7;
+    if(automaticQueueSafetyActive()&&/AUTOMATION_|manual review|independent review|outcome unknown/i.test(error))return await shipmentRepository.reviewReturnSync(recordId,error);
     return await prisma.shipmentRecord.update({
       where: { id: recordId },
       data: {
@@ -1375,6 +1395,7 @@ export const shipmentRepository = {
     await prisma.shipmentRecord.count({
       where: {
         collectionStatus: { in: ['returned', 'returned-settled'] },
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('return') },
         OR: [
           { returnSyncStatus: 'pending' },
           {
@@ -1386,6 +1407,7 @@ export const shipmentRepository = {
     }),
 
   supersedeReturnSync: async (recordId: number, reason: string): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'return'))return false;
     const result = await prisma.shipmentRecord.updateMany({
       where: {
         id: recordId,
@@ -1402,6 +1424,8 @@ export const shipmentRepository = {
   },
 
   queueShopifyPaymentSync: async (recordId: number, fingerprint: string): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'shopify'))return false;
+    if(automaticQueueSafetyActive()){const current=await prisma.shipmentRecord.findUnique({where:{id:recordId},select:{shopifyPaymentSyncStatus:true}});if(['completed','needs-review','processing'].includes(current?.shopifyPaymentSyncStatus??''))return false;}
     const staleBefore = new Date(Date.now() - 10 * 60_000);
     const result = await prisma.shipmentRecord.updateMany({
       where: {
@@ -1446,8 +1470,8 @@ export const shipmentRepository = {
         shopifyPaymentClaimedAt: { lt: new Date(Date.now() - stuckThresholdMinutes * 60_000) }
       },
       data: {
-        shopifyPaymentSyncStatus: 'retryable',
-        shopifyPaymentRetryAt: new Date(),
+        shopifyPaymentSyncStatus: automaticQueueSafetyActive()?'needs-review':'retryable',
+        shopifyPaymentRetryAt: automaticQueueSafetyActive()?null:new Date(),
         shopifyPaymentClaimedAt: null,
         shopifyPaymentLastError: 'Recovered after an interrupted Shopify-payment worker'
       }
@@ -1459,6 +1483,7 @@ export const shipmentRepository = {
     await prisma.shipmentRecord.findMany({
       where: {
         collectionStatus: 'collected',
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('shopify') },
         collectedAmount: { gt: 0 },
         OR: [
           { shopifyPaymentSyncStatus: 'pending' },
@@ -1475,6 +1500,7 @@ export const shipmentRepository = {
     }),
 
   claimShopifyPaymentSync: async (recordId: number): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'shopify'))return false;
     const now = new Date();
     const result = await prisma.shipmentRecord.updateMany({
       where: {
@@ -1520,6 +1546,7 @@ export const shipmentRepository = {
     }),
 
   failShopifyPaymentSync: async (recordId: number, error: string) => {
+    if(automaticQueueSafetyActive()&&/AUTOMATION_|manual review|independent review|outcome unknown/i.test(error))return await shipmentRepository.reviewShopifyPaymentSync(recordId,error);
     const current = await prisma.shipmentRecord.findUnique({
       where: { id: recordId },
       select: { shopifyPaymentAttemptCount: true }
@@ -1544,6 +1571,7 @@ export const shipmentRepository = {
     await prisma.shipmentRecord.count({
       where: {
         collectionStatus: 'collected',
+        shopifyOrderId: { notIn: await blockedAutomaticOrderIds('shopify') },
         collectedAmount: { gt: 0 },
         OR: [
           { shopifyPaymentSyncStatus: 'pending' },
@@ -1556,6 +1584,7 @@ export const shipmentRepository = {
     }),
 
   supersedeShopifyPaymentSync: async (recordId: number, reason: string): Promise<boolean> => {
+    if(await automaticRecordBlocked(recordId,'shopify'))return false;
     const result = await prisma.shipmentRecord.updateMany({
       where: {
         id: recordId,
