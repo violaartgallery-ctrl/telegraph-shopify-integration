@@ -8,6 +8,7 @@ import {
   LIST_SHIPMENTS_QUERY,
   LIST_SHIPMENTS_FOR_PAYMENT_QUERY,
   LIST_ZONES_QUERY,
+  LIST_BRIDGE_SHIPMENTS_QUERY,
   LOGIN_MUTATION,
   SAVE_SHIPMENT_MUTATION
 } from './queries.js';
@@ -350,6 +351,18 @@ export class AccurateClient {
     page = 1
   ): Promise<ListShipmentsResponse['listShipments']> {
     const response = await this.requestWithAuth<ListShipmentsResponse>(LIST_SHIPMENTS_QUERY, { input, first, page });
+    return response.listShipments;
+  }
+
+  /** Read-only list for the WhatsApp-only Odoo bridge (includes waybill price). */
+  async listBridgeShipments(
+    input: Record<string, unknown> = {},
+    first = 100,
+    page = 1
+  ): Promise<{ paginatorInfo: PaginatorInfo; data: Array<AccurateShipmentSummary & { price?: number | null }> }> {
+    const response = await this.requestWithAuth<{
+      listShipments: { paginatorInfo: PaginatorInfo; data: Array<AccurateShipmentSummary & { price?: number | null }> };
+    }>(LIST_BRIDGE_SHIPMENTS_QUERY, { input, first, page });
     return response.listShipments;
   }
 

@@ -182,3 +182,38 @@ export const LIST_SHIPMENTS_FOR_PAYMENT_QUERY = `
     }
   }
 `;
+
+// WhatsApp-only Odoo bridge: same list API plus the waybill COD price, which is
+// needed to prove the full amount was collected. Read only.
+export const LIST_BRIDGE_SHIPMENTS_QUERY = `
+  query ListBridgeShipments($input: ListShipmentsFilterInput, $first: Int!, $page: Int) {
+    listShipments(input: $input, first: $first, page: $page) {
+      paginatorInfo {
+        count
+        hasMorePages
+        currentPage
+        lastPage
+        total
+      }
+      data {
+        id
+        code
+        refNumber
+        price
+        deliveredOrReturnedDate
+        collected
+        paidToCustomer
+        cancelled
+        collectedAmount
+        pendingCollectionAmount
+        returnedValue
+        deliveryFees
+        returnFees
+        returningDueFees
+        customerDue
+        status { code name }
+        returnStatus { code name }
+      }
+    }
+  }
+`;

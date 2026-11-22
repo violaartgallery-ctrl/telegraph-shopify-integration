@@ -8,7 +8,7 @@ import { Script, createContext } from 'node:vm';
 
 for (const key of Object.keys(process.env)) delete process.env[key];
 const require = createRequire(import.meta.url), ts = require('typescript');
-const sources = new Map(['safeQueuePolicy', 'automaticOperationSafety'].map(name => {
+const sources = new Map(['safeQueuePolicy', 'automaticOperationSafety', 'whatsappOdooScope'].map(name => {
   const source = readFileSync(new URL(`../services/${name}.ts`, import.meta.url), 'utf8');
   const compiled = ts.transpileModule(source, {
     fileName: `${name}.ts`, reportDiagnostics: true,
@@ -133,6 +133,8 @@ function fixture({ settings = {}, disabled = false, seedRows = [], seedRecords, 
   const safety = load('automaticOperationSafety', {
     'node:async_hooks': { AsyncLocalStorage }, 'node:crypto': { randomUUID: () => `synthetic-token-${++uuid}` },
     '../lib/prisma.js': { basePrisma: db, prisma: db }, './safeQueuePolicy.js': policy,
+    // WhatsApp bridge scope: never entered by these Shopify-record tests.
+    './whatsappOdooScope.js': load('whatsappOdooScope', { 'node:async_hooks': { AsyncLocalStorage } }),
   });
   return { ...safety, policy, env, rows, records, io, locks, mutations, setFault(fn) { faultHandler = fn; } };
 }
