@@ -222,6 +222,7 @@ class FakeOdoo {
   writes: string[] = [];
   fail?: Fail;
   journalType = 'cash';
+  productTypes = new Map<number, string>([[10, 'product'], [11, 'product'], [99, 'service']]);
   private nextInvoice = 7001; private nextPayment = 8001;
   seed(so: SaleOrder, ls: Line[]) {
     this.sos.set(so.id, structuredClone(so));
@@ -246,6 +247,9 @@ class FakeOdoo {
     return {
       findSaleOrdersByName: async name => [...this.sos.values()].filter(s => s.name === name).map(s => structuredClone(s)),
       findSaleOrdersReferencingCode: async code => [...this.sos.values()].filter(s => s.origin === code || s.client_order_ref === code).map(s => ({ id: s.id, name: s.name })),
+      findSaleOrdersReferencingCodes: async codes => [...this.sos.values()].filter(s => codes.includes(String(s.origin)) || codes.includes(String(s.client_order_ref))).map(s => structuredClone(s)),
+      readProductTypes: async ids => new Map(ids.filter(id => this.productTypes.has(id)).map(id => [id, this.productTypes.get(id)!])),
+      cancelSaleOrder: async id => this.write('cancelSaleOrder', () => { this.sos.get(id)!.state = 'cancel'; }),
       readSaleOrder: async id => structuredClone(this.sos.get(id) ?? null),
       readLines: async ids => ids.map(id => this.lineRows.get(id)).filter(Boolean).map(l => structuredClone(l!)),
       readPickings: async ids => ids.map(id => this.pickings.get(id)).filter(Boolean).map(p => structuredClone(p!)),
@@ -559,6 +563,145 @@ const linkOf = (w: ReturnType<typeof world>, code = 'VI00000756') => w.store.lin
   for (let i = 0; i < 25; i++) w.carrier.set(ship({ id: 9100 + i, code: `VI0000${String(1000 + i).padStart(4, '0')}`, refNumber: `S2${7000 + i}` }));
   const r = await w.service.discover();
   ok(Number(r.registered) + Number(r.unmatched) + Number(r.reviews) <= 10, 'at most 10 new candidates per run');
+}
+
+// ------------------- empty-reference waybills matched by SO origin/client_order_ref
+const codeShip = (over: Partial<Shipment> = {}): Shipment => ship({ id: 9300, code: 'VI00000748', refNumber: null, price: 1076,
+  deliveryFees: 76, status: { code: 'BMT' }, ...over });
+const serviceSo = (over: Partial<SaleOrder> = {}): SaleOrder => saleOrder({ id: 26400, name: 'S26400', origin: 'VI00000748',
+  client_order_ref: 'VI00000748', amount_total: 1000, order_line: [601], picking_ids: [], note: false, ...over });
+const serviceLine = (): Line[] => [{ id: 601, product_id: [99, 'WhatsApp Sale'], product_uom_qty: 1, qty_delivered: 0, price_unit: 1000, discount: 0, display_type: false }];
+ok(policy.isCodeReferenceCandidate(codeShip()), 'active empty-ref hand-made waybill is a candidate');
+ok(policy.isCodeReferenceCandidate(codeShip({ refNumber: '  ' })), 'whitespace ref counts as empty');
+ok(!policy.isCodeReferenceCandidate(codeShip({ refNumber: 'Viola-15891' })), 'Shopify ref is not a code candidate');
+ok(!policy.isCodeReferenceCandidate(codeShip({ code: 'VI0012405' })), 'bot code series is not a code candidate');
+ok(!policy.isCodeReferenceCandidate(codeShip({ cancelled: true })), 'cancelled waybill is not active');
+ok(!policy.isCodeReferenceCandidate(codeShip({ status: { code: 'RTRN' } })), 'returned waybill is not active');
+ok(!policy.isCodeReferenceCandidate(codeShip({ status: { code: 'DTR' }, paidToCustomer: true })), 'settled waybill is terminal');
+ok(policy.isCodeReferenceCandidate(codeShip({ status: { code: 'DTR' }, collected: true })), 'delivered, not settled, still active');
+const byCode = (sos: SaleOrder[], ls: Line[] = serviceLine(), s: Partial<Shipment> = {}) =>
+  policy.matchSaleOrderByCode({ shipment: codeShip(s), sosReferencingCode: sos, lines: ls, config: cfg });
+eq(byCode([serviceSo()]).kind, 'linked', 'exact code reference on one confirmed SO');
+eq((byCode([serviceSo()]) as { matchMethod: string }).matchMethod, 'code-reference', 'code-reference match method');
+eq(byCode([serviceSo({ client_order_ref: false })]).kind, 'linked', 'origin alone is enough');
+eq(byCode([]).kind, 'none', 'no SO references the code: not a WhatsApp-only order');
+eq(byCode([serviceSo(), serviceSo({ id: 26401, name: 'S26401' })]).kind, 'review', 'two SOs reference the code');
+eq(byCode([serviceSo({ client_order_ref: 'VI00000749' })]).kind, 'review', 'other field names another waybill');
+eq(byCode([serviceSo({ state: 'draft' })]).kind, 'unmatched', 'draft SO waits');
+eq(byCode([serviceSo({ state: 'cancel' })]).kind, 'review', 'cancelled SO');
+eq(byCode([serviceSo({ name: 'S100' })]).kind, 'review', 'historical SO before bridge start');
+eq(byCode([serviceSo()], serviceLine(), { price: 1200 }).kind, 'review', 'COD above SO net + max shipping');
+eq(byCode([serviceSo()], serviceLine(), { refNumber: 'S26400' }).kind, 'none', 'a referenced waybill uses the S-path');
+const types = new Map([[10, 'product'], [11, 'product'], [99, 'service']]);
+eq(policy.saleOrderStockKind(serviceSo(), serviceLine(), types), 'service-only', 'service line without pickings');
+eq(policy.saleOrderStockKind(saleOrder(), lines(), types), 'stock', 'goods with pickings');
+eq(policy.saleOrderStockKind(serviceSo(), lines(), types), 'review', 'goods without pickings: never guessed');
+eq(policy.saleOrderStockKind(saleOrder(), serviceLine(), types), 'review', 'service-only SO with pickings: review');
+eq(policy.saleOrderStockKind(serviceSo(), serviceLine(), new Map()), 'review', 'unknown product type: review');
+
+function codeWorld(mode: 'observe' | 'apply' = 'apply') {
+  const w = world(mode);
+  w.odoo.seed(serviceSo(), serviceLine());
+  w.odoo.pickings.clear();
+  for (const p of [56937, 56938]) w.odoo.pickings.set(p, { id: p, state: 'assigned', location_dest_id: [p === 56937 ? 5 : 8, p === 56937 ? 'Partners/Customers' : 'WH/Output'] });
+  w.carrier.set(codeShip());
+  return w;
+}
+{
+  const w = codeWorld();
+  const d = await w.service.discover();
+  const link = linkOf(w, 'VI00000748');
+  eq(d.codeRegistered, 1, 'empty-ref waybill registered by code');
+  eq([link.state, link.odooSaleOrderName, link.carrierRefNumber, link.matchMethod], ['stock-done', 'S26400', '', 'code-reference+service-only'],
+    'service-only SO starts at stock-done (nothing to deliver)');
+  w.carrier.patch(9300, { status: { code: 'DTR' }, collected: true, collectedAmount: 1076 });
+  await w.service.syncStatuses(); await w.service.processActions();
+  eq(linkOf(w, 'VI00000748').state, 'stock-done', 'no invoice before merchant settlement');
+  w.carrier.patch(9300, { paidToCustomer: true, customerDue: 1000 });
+  await w.service.syncStatuses(); await w.service.processActions();
+  const done = linkOf(w, 'VI00000748');
+  eq(done.state, 'paid', 'service-only WhatsApp sale: invoiced and paid');
+  eq(w.odoo.writes.filter(x => x !== 'deliverStock'), ['createMerchantNetInvoice', 'registerPayment'], 'no stock write for the service SO');
+  eq(w.odoo.invoices.get(done.odooInvoiceId!)!.amount_total, 1000, 'invoice at carrier net (customerDue)');
+  eq((w.odoo.payments.get(done.odooPaymentId!)!.journal_id as [number, string])[0], 7, 'Cash journal 7');
+  const before = w.odoo.writes.length;
+  await w.service.discover(); await w.service.syncStatuses(); await w.service.processActions();
+  eq(w.odoo.writes.length, before, 'no rediscovery or repeat after paid');
+}
+{
+  const w = codeWorld();
+  await w.service.discover();
+  w.carrier.patch(9300, { status: { code: 'RTRN' } });
+  await w.service.syncStatuses(); await w.service.processActions();
+  eq(w.odoo.writes.includes('cancelSaleOrder'), false, 'service-only return waits for the grace period');
+  clock += 25 * HOUR;
+  await w.service.syncStatuses(); await w.service.processActions();
+  eq(linkOf(w, 'VI00000748').state, 'returned', 'stable return: service SO closed');
+  eq(w.odoo.writes.filter(x => x === 'cancelSaleOrder').length, 1, 'cancelled exactly once');
+  eq(w.odoo.writes.includes('executeReturn'), false, 'no stock return for a service line');
+  eq(w.odoo.sos.get(26400)!.state, 'cancel', 'SO cancelled');
+  eq([...w.odoo.invoices.values()].filter(i => i.invoice_origin === 'S26400').length, 0, 'no invoice on a return');
+}
+{
+  const w = codeWorld();
+  w.odoo.sos.delete(26400);
+  const d = await w.service.discover();
+  eq([d.codeCandidates, d.codeRegistered], [1, 0], 'empty-ref waybill without an SO is only checked');
+  eq(w.store.links.some(l => l.accurateShipmentCode === 'VI00000748'), false, 'no row, no review noise for Shopify hand-made waybills');
+}
+{
+  const w = codeWorld();
+  w.odoo.seed(serviceSo({ id: 26401, name: 'S26401' }), [{ ...serviceLine()[0]!, id: 602 }]);
+  await w.service.discover();
+  eq(linkOf(w, 'VI00000748').state, 'needs-review', 'two SOs carry the code: review');
+  eq(linkOf(w, 'VI00000748').reviewReason, 'waybill-code-on-several-sale-orders', 'review reason');
+}
+{
+  const w = codeWorld();
+  w.store.shopifyCodes.add('VI00000748');
+  await w.service.discover();
+  eq(linkOf(w, 'VI00000748').reviewReason, 'waybill-owned-by-shopify-order', 'Shopify-owned code with an SO: review');
+}
+{
+  const w = codeWorld();
+  w.odoo.productTypes.set(99, 'product'); // goods line but no pickings
+  await w.service.discover();
+  eq(linkOf(w, 'VI00000748').reviewReason, 'sale-order-stock-lines-unsupported', 'goods SO without pickings: review');
+}
+{
+  const w = codeWorld();
+  await w.service.discover();
+  w.carrier.patch(9300, { refNumber: 'S26400', status: { code: 'DTR' }, collected: true, paidToCustomer: true, collectedAmount: 1076, customerDue: 1000 });
+  await w.service.syncStatuses();
+  eq(linkOf(w, 'VI00000748').state, 'needs-review', 'carrier reference added later: identity change review');
+  eq(w.odoo.writes, [], 'no write after identity change');
+}
+{
+  const w = codeWorld();
+  await w.service.discover();
+  w.odoo.sos.get(26400)!.origin = false; w.odoo.sos.get(26400)!.client_order_ref = false;
+  w.carrier.patch(9300, { status: { code: 'DTR' }, collected: true, paidToCustomer: true, collectedAmount: 1076, customerDue: 1000 });
+  await w.service.syncStatuses(); await w.service.processActions();
+  eq(linkOf(w, 'VI00000748').state, 'needs-review', 'SO reference removed after link: review');
+  eq(w.odoo.writes, [], 'no invoice once the code reference is gone');
+}
+{
+  const w = codeWorld('observe');
+  await w.service.discover();
+  w.carrier.patch(9300, { status: { code: 'DTR' }, collected: true, paidToCustomer: true, collectedAmount: 1076, customerDue: 1000 });
+  await w.service.syncStatuses();
+  eq(linkOf(w, 'VI00000748').plannedAction, 'settle', 'observe: settlement planned for the service SO');
+  await w.service.processActions();
+  eq(w.odoo.writes, [], 'observe: still zero Odoo writes');
+}
+{
+  // An S-ref waybill on a service-only SO also skips the stock step.
+  const w = world();
+  w.odoo.seed(saleOrder({ picking_ids: [], order_line: [601], amount_total: 3065 }), [{ ...serviceLine()[0]!, price_unit: 3065 }]);
+  w.carrier.patch(9001, settled);
+  await w.service.discover(); await w.service.syncStatuses(); await w.service.processActions();
+  eq(linkOf(w).state, 'paid', 'S-ref service-only SO paid');
+  eq(w.odoo.writes, ['createMerchantNetInvoice', 'registerPayment'], 'S-ref service-only: no stock write');
 }
 
 // ------------------------- operation primitive + real Odoo transport hook

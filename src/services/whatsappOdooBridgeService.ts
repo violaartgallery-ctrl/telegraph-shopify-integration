@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { AutomaticOperationReviewError } from './automaticOperationSafety.js';
 import {
   ACTIVE_STATES, BRIDGE_CODE_PATTERN, carrierFingerprint, cents, decideCarrierAction, isBridgeCandidate,
-  isCarrierReturn, matchSaleOrder, planInvoice, relationId, returnCode, reviewMessage, saleOrderFingerprint,
+  isCarrierReturn, isCodeReferenceCandidate, matchSaleOrder, matchSaleOrderByCode, planInvoice, saleOrderStockKind, relationId, returnCode, reviewMessage, saleOrderFingerprint,
   sameMoney, statusCode,
   type BridgeCarrierShipment, type BridgeConfig, type BridgeInvoice, type BridgeLinkState,
   type BridgeSaleOrder, type BridgeSaleOrderLine,
@@ -30,6 +30,10 @@ export interface BridgePayment {
 export interface BridgeOdooPort {
   findSaleOrdersByName(name: string): Promise<BridgeSaleOrder[]>;
   findSaleOrdersReferencingCode(code: string): Promise<Array<Pick<BridgeSaleOrder, 'id' | 'name'>>>;
+  /** Full SO records whose origin or client_order_ref is one of `codes` (one read). */
+  findSaleOrdersReferencingCodes(codes: string[]): Promise<BridgeSaleOrder[]>;
+  /** product.product id -> type ('service' | 'consu' | 'product'). */
+  readProductTypes(ids: number[]): Promise<Map<number, string>>;
   readSaleOrder(id: number): Promise<BridgeSaleOrder | null>;
   readLines(ids: number[]): Promise<BridgeSaleOrderLine[]>;
   readPickings(ids: number[]): Promise<BridgePicking[]>;
@@ -44,6 +48,8 @@ export interface BridgeOdooPort {
   registerPayment(invoiceId: number, amount: number, journalId: number, memo: string): Promise<number | undefined>;
   previewReturn(saleOrderId: number): Promise<{ status: string; reason?: string }>;
   executeReturn(saleOrderId: number): Promise<{ status: string; reason?: string }>;
+  /** Service-only SO on a carrier return: cancel it (no stock, no invoice). */
+  cancelSaleOrder(saleOrderId: number): Promise<void>;
 }
 
 export interface BridgeNotifier { send(chatIds: string[], text: string): Promise<void> }
@@ -65,7 +71,12 @@ const MAX_REMATCH_PER_RUN = 5;
 const REMATCH_EVERY_MS = 55 * 60_000;
 const ACTIONABLE = ['deliver-stock', 'settle', 'pay', 'return'];
 
+const MAX_CODE_REFERENCE_PER_RUN = 10;
 const reasonOf = (error: unknown) => String((error as Error)?.message ?? error).slice(0, 300);
+/** Carrier reference as stored on a link ('' for empty-reference waybills). */
+const refOf = (s: Pick<BridgeCarrierShipment, 'refNumber'>) => (s.refNumber ?? '').trim();
+const sameIdentity = (s: BridgeCarrierShipment, link: Pick<BridgeLink, 'accurateShipmentCode' | 'carrierRefNumber'>) =>
+  s.code === link.accurateShipmentCode && refOf(s) === link.carrierRefNumber;
 
 /** Fields of a carrier return that must stay unchanged through the grace period. */
 export const returnFingerprint = (s: BridgeCarrierShipment) => createHash('sha256')
@@ -101,57 +112,118 @@ export class WhatsappOdooBridgeService {
   async discover(): Promise<Record<string, unknown>> {
     if (!this.config.enabled) return { disabled: true };
     const summary = { scanned: 0, candidates: 0, registered: 0, unmatched: 0, reviews: 0, known: 0, rematched: 0 };
-    const seen = new Map<string, BridgeCarrierShipment>();
+    const seen = new Map<string, BridgeCarrierShipment>(), byCode = new Map<string, BridgeCarrierShipment>();
     for (let page = 1; page <= this.config.discoveryPages; page++) {
       const result = await this.deps.carrier.listRecent(page);
       summary.scanned += result.data.length;
-      for (const row of result.data) if (isBridgeCandidate(row)) seen.set(row.code, row);
+      for (const row of result.data) {
+        if (isBridgeCandidate(row)) seen.set(row.code, row);
+        else if (isCodeReferenceCandidate(row)) byCode.set(row.code, row);
+      }
       if (!result.hasMorePages) break;
     }
     summary.candidates = seen.size;
-    const known = new Set((await this.deps.store.findLinksByCodes([...seen.keys()])).map(l => l.accurateShipmentCode));
+    const known = new Set((await this.deps.store.findLinksByCodes([...seen.keys(), ...byCode.keys()])).map(l => l.accurateShipmentCode));
     summary.known = known.size;
     let budget = MAX_NEW_PER_RUN;
-    for (const shipment of seen.values()) {
-      if (known.has(shipment.code) || budget-- <= 0) continue;
-      const state = await this.register(shipment);
-      if (state === 'linked') summary.registered++;
+    const count = (state: BridgeLinkState | null) => {
+      if (state === 'linked' || state === 'stock-done') summary.registered++;
       else if (state === 'unmatched') summary.unmatched++;
       else if (state === 'needs-review') summary.reviews++;
+    };
+    for (const shipment of seen.values()) {
+      if (known.has(shipment.code) || budget-- <= 0) continue;
+      count(await this.register(shipment));
+    }
+    // Empty-reference hand-made waybills: ONE Odoo read for all unknown codes;
+    // a waybill no SO references is not a WhatsApp-only order (no row).
+    const fresh = [...byCode.values()].filter(s => !known.has(s.code)).slice(0, MAX_CODE_REFERENCE_PER_RUN);
+    const codeSummary = { codeCandidates: byCode.size, codeChecked: fresh.length, codeRegistered: 0 };
+    if (fresh.length > 0) {
+      const sos = await this.deps.odoo.findSaleOrdersReferencingCodes(fresh.map(s => s.code));
+      for (const shipment of fresh) {
+        const matching = sos.filter(so => [so.origin, so.client_order_ref].some(v => typeof v === 'string' && v.trim() === shipment.code));
+        if (matching.length === 0 || budget-- <= 0) continue;
+        const state = await this.registerByCode(shipment, matching);
+        count(state);
+        if (state === 'linked' || state === 'stock-done') codeSummary.codeRegistered++;
+      }
     }
     summary.rematched = await this.rematchUnmatched();
-    return summary;
+    return { ...summary, ...codeSummary };
+  }
+
+  private baseLink(shipment: BridgeCarrierShipment) {
+    return {
+      accurateShipmentId: shipment.id, accurateShipmentCode: shipment.code,
+      carrierRefNumber: refOf(shipment), matchCheckedAt: new Date(this.now()),
+      lastSyncedAt: new Date(this.now()), ...snapshot(shipment),
+    };
+  }
+
+  /** Stock kind for a matched SO: service-only SOs start at stock-done (nothing to deliver). */
+  private async stockKind(so: BridgeSaleOrder, lines: BridgeSaleOrderLine[]) {
+    const ids = [...new Set(lines.map(l => relationId(l.product_id)).filter((id): id is number => id !== null))];
+    return saleOrderStockKind(so, lines, await this.deps.odoo.readProductTypes(ids));
+  }
+
+  /** Create the active link for a verified SO match (shared by both match paths). */
+  private async createMatchedLink(shipment: BridgeCarrierShipment, so: BridgeSaleOrder, lines: BridgeSaleOrderLine[],
+    match: { matchMethod: string; amountTotal: number }): Promise<BridgeLinkState | null> {
+    const base = this.baseLink(shipment);
+    const other = await this.deps.store.findLinkBySaleOrderId(so.id);
+    if (other) {
+      const link = await this.deps.store.createLink({ ...base, state: 'needs-review', odooSaleOrderName: so.name,
+        reviewReason: `sale-order-already-linked-to-${other.accurateShipmentCode}` });
+      if (link) await this.notifyReview(link);
+      return link ? 'needs-review' : null;
+    }
+    const kind = await this.stockKind(so, lines);
+    if (kind === 'review') {
+      const link = await this.deps.store.createLink({ ...base, state: 'needs-review', odooSaleOrderName: so.name,
+        reviewReason: 'sale-order-stock-lines-unsupported' });
+      if (link) await this.notifyReview(link);
+      return link ? 'needs-review' : null;
+    }
+    const state: BridgeLinkState = kind === 'service-only' ? 'stock-done' : 'linked';
+    const link = await this.deps.store.createLink({ ...base, state, odooSaleOrderId: so.id, odooSaleOrderName: so.name,
+      matchMethod: kind === 'service-only' ? `${match.matchMethod}+service-only` : match.matchMethod,
+      soAmountTotal: match.amountTotal, soPartnerId: relationId(so.partner_id), soFingerprint: saleOrderFingerprint(so, lines),
+      stockDoneAt: kind === 'service-only' ? new Date(this.now()) : null,
+      plannedAction: decideCarrierAction({ state, shipment, soAmountTotal: match.amountTotal,
+        maxCustomerShipping: this.config.maxCustomerShipping }).kind });
+    return link ? state : null;
+  }
+
+  private async registerByCode(shipment: BridgeCarrierShipment, sos: BridgeSaleOrder[]): Promise<BridgeLinkState | null> {
+    const base = this.baseLink(shipment);
+    if (await this.deps.store.shopifyRecordUsesCode(shipment.code)) {
+      const link = await this.deps.store.createLink({ ...base, state: 'needs-review', reviewReason: 'waybill-owned-by-shopify-order' });
+      if (link) await this.notifyReview(link);
+      return link ? 'needs-review' : null;
+    }
+    const so = sos.length === 1 ? sos[0]! : undefined;
+    const lines = so?.order_line?.length ? await this.deps.odoo.readLines(so.order_line) : [];
+    const result = matchSaleOrderByCode({ shipment, sosReferencingCode: sos, lines, config: this.config });
+    if (result.kind === 'none') return null;
+    if (result.kind === 'linked') return await this.createMatchedLink(shipment, so!, lines, result);
+    const state: BridgeLinkState = result.kind === 'unmatched' ? 'unmatched' : 'needs-review';
+    const link = await this.deps.store.createLink({ ...base, state, reviewReason: result.reason, odooSaleOrderName: so?.name ?? null });
+    if (link && state === 'needs-review') await this.notifyReview(link);
+    return link ? state : null;
   }
 
   /** Registers one never-seen candidate. Reads only (Odoo + Neon insert). */
   private async register(shipment: BridgeCarrierShipment): Promise<BridgeLinkState | null> {
-    const base = {
-      accurateShipmentId: shipment.id, accurateShipmentCode: shipment.code,
-      carrierRefNumber: shipment.refNumber ?? '', matchCheckedAt: new Date(this.now()),
-      lastSyncedAt: new Date(this.now()), ...snapshot(shipment),
-    };
+    const base = this.baseLink(shipment);
     if (await this.deps.store.shopifyRecordUsesCode(shipment.code)) {
       const link = await this.deps.store.createLink({ ...base, state: 'needs-review', reviewReason: 'waybill-owned-by-shopify-order' });
       if (link) await this.notifyReview(link);
       return link ? 'needs-review' : null;
     }
     const match = await this.evaluateMatch(shipment);
-    if (match.result.kind === 'linked') {
-      const so = match.so!;
-      const other = await this.deps.store.findLinkBySaleOrderId(so.id);
-      if (other) {
-        const link = await this.deps.store.createLink({ ...base, state: 'needs-review', odooSaleOrderName: so.name,
-          reviewReason: `sale-order-already-linked-to-${other.accurateShipmentCode}` });
-        if (link) await this.notifyReview(link);
-        return link ? 'needs-review' : null;
-      }
-      const link = await this.deps.store.createLink({ ...base, state: 'linked', odooSaleOrderId: so.id, odooSaleOrderName: so.name,
-        matchMethod: match.result.matchMethod, soAmountTotal: match.result.amountTotal, soPartnerId: relationId(so.partner_id),
-        soFingerprint: saleOrderFingerprint(so, match.lines),
-        plannedAction: decideCarrierAction({ state: 'linked', shipment, soAmountTotal: match.result.amountTotal,
-          maxCustomerShipping: this.config.maxCustomerShipping }).kind });
-      return link ? 'linked' : null;
-    }
+    if (match.result.kind === 'linked') return await this.createMatchedLink(shipment, match.so!, match.lines, match.result);
+    if (match.result.kind === 'none') return null;
     const state: BridgeLinkState = match.result.kind === 'unmatched' ? 'unmatched' : 'needs-review';
     const link = await this.deps.store.createLink({ ...base, state, reviewReason: match.result.reason,
       odooSaleOrderName: match.so?.name ?? null });
@@ -159,8 +231,16 @@ export class WhatsappOdooBridgeService {
     return link ? state : null;
   }
 
-  private async evaluateMatch(shipment: BridgeCarrierShipment) {
-    const ref = shipment.refNumber ?? '';
+  private async evaluateMatch(shipment: BridgeCarrierShipment): Promise<{
+    result: ReturnType<typeof matchSaleOrderByCode>; so: BridgeSaleOrder | undefined; lines: BridgeSaleOrderLine[];
+  }> {
+    const ref = refOf(shipment);
+    if (ref === '') {
+      const sos = await this.deps.odoo.findSaleOrdersReferencingCodes([shipment.code]);
+      const so = sos.length === 1 ? sos[0]! : undefined;
+      const lines = so?.order_line?.length ? await this.deps.odoo.readLines(so.order_line) : [];
+      return { result: matchSaleOrderByCode({ shipment, sosReferencingCode: sos, lines, config: this.config }), so, lines };
+    }
     const saleOrders = await this.deps.odoo.findSaleOrdersByName(ref);
     const sosReferencingCode = BRIDGE_CODE_PATTERN.test(shipment.code)
       ? await this.deps.odoo.findSaleOrdersReferencingCode(shipment.code) : [];
@@ -180,19 +260,27 @@ export class WhatsappOdooBridgeService {
     for (const link of due) {
       const shipment = live.find(s => s.id === link.accurateShipmentId);
       const at = new Date(this.now());
-      if (!shipment || shipment.code !== link.accurateShipmentCode || shipment.refNumber !== link.carrierRefNumber) {
+      if (!shipment || !sameIdentity(shipment, link)) {
         await this.markReview(link, 'carrier-identity-changed-or-not-visible');
         changed++;
         continue;
       }
       const match = await this.evaluateMatch(shipment);
-      if (match.result.kind === 'linked') {
+      if (match.result.kind === 'none') {
+        await this.markReview(link, 'sale-order-reference-removed');
+        changed++;
+      } else if (match.result.kind === 'linked') {
         const so = match.so!;
+        const kind = await this.stockKind(so, match.lines);
         if (await this.deps.store.findLinkBySaleOrderId(so.id)) {
           await this.markReview(link, 'sale-order-already-linked-to-another-waybill');
+        } else if (kind === 'review') {
+          await this.markReview(link, 'sale-order-stock-lines-unsupported');
         } else {
-          await this.deps.store.updateLink(link.id, 'unmatched', { state: 'linked', odooSaleOrderId: so.id, odooSaleOrderName: so.name,
-            matchMethod: match.result.matchMethod, soAmountTotal: match.result.amountTotal, soPartnerId: relationId(so.partner_id),
+          const serviceOnly = kind === 'service-only';
+          await this.deps.store.updateLink(link.id, 'unmatched', { state: serviceOnly ? 'stock-done' : 'linked', odooSaleOrderId: so.id,
+            odooSaleOrderName: so.name, matchMethod: serviceOnly ? `${match.result.matchMethod}+service-only` : match.result.matchMethod,
+            soAmountTotal: match.result.amountTotal, soPartnerId: relationId(so.partner_id), stockDoneAt: serviceOnly ? at : null,
             soFingerprint: saleOrderFingerprint(so, match.lines), reviewReason: null, matchCheckedAt: at, lastSyncedAt: at, ...snapshot(shipment) });
         }
         changed++;
@@ -226,7 +314,7 @@ export class WhatsappOdooBridgeService {
         await this.deps.store.updateLink(link.id, link.state, { lastSyncedAt: at, lastError: 'carrier-waybill-not-visible' });
         continue;
       }
-      if (shipment.code !== link.accurateShipmentCode || shipment.refNumber !== link.carrierRefNumber) {
+      if (!sameIdentity(shipment, link)) {
         summary.reviews++;
         await this.markReview(link, 'carrier-identity-changed');
         continue;
@@ -306,7 +394,7 @@ export class WhatsappOdooBridgeService {
     if (await this.deps.store.holdApplies(link)) return 'skipped';
     const shipment = await this.freshShipment(link);
     if (!shipment) return 'waiting';
-    const so = await this.verifiedSaleOrder(link);
+    const { so, serviceOnly } = await this.verifiedSaleOrder(link);
     let outcome: 'done' | 'waiting' | 'reviews' | 'skipped' = 'waiting';
     // A single run may advance stock -> invoice -> payment, each its own claim.
     for (let step = 0; step < 3; step++) {
@@ -317,10 +405,10 @@ export class WhatsappOdooBridgeService {
         return outcome;
       }
       let next: BridgeLink | null = null;
-      if (decision.kind === 'deliver-stock') next = await this.deliverStock(link, so, shipment);
-      else if (decision.kind === 'settle') next = await this.invoice(link, so, shipment, decision.target);
+      if (decision.kind === 'deliver-stock') next = await this.deliverStock(link, so, shipment, serviceOnly);
+      else if (decision.kind === 'settle') next = await this.invoice(link, so, shipment, decision.target, serviceOnly);
       else if (decision.kind === 'pay') next = await this.pay(link, shipment, decision.target);
-      else if (decision.kind === 'return') next = await this.returnStock(link, so, shipment);
+      else if (decision.kind === 'return') next = await this.returnStock(link, so, shipment, serviceOnly);
       if (!next) return outcome;
       outcome = 'done';
       link = next;
@@ -333,27 +421,31 @@ export class WhatsappOdooBridgeService {
     const rows = (await this.deps.carrier.listByIds([link.accurateShipmentId])).filter(s => s.id === link.accurateShipmentId);
     if (rows.length !== 1) return null;
     const s = rows[0]!;
-    if (s.code !== link.accurateShipmentCode || s.refNumber !== link.carrierRefNumber) {
+    if (!sameIdentity(s, link)) {
       throw new AutomaticOperationReviewError('carrier-identity-changed');
     }
     return s;
   }
 
   /** The SO must still be exactly what was linked (lines, totals, partner, references). */
-  private async verifiedSaleOrder(link: BridgeLink): Promise<BridgeSaleOrder> {
+  private async verifiedSaleOrder(link: BridgeLink): Promise<{ so: BridgeSaleOrder; serviceOnly: boolean }> {
     if (!link.odooSaleOrderId) throw new AutomaticOperationReviewError('link-has-no-sale-order');
     const so = await this.deps.odoo.readSaleOrder(link.odooSaleOrderId);
-    if (!so || so.name !== link.odooSaleOrderName || so.name !== link.carrierRefNumber) throw new AutomaticOperationReviewError('sale-order-identity-changed');
+    if (!so || so.name !== link.odooSaleOrderName || (link.carrierRefNumber !== '' && so.name !== link.carrierRefNumber)) throw new AutomaticOperationReviewError('sale-order-identity-changed');
     if (so.state !== 'sale') throw new AutomaticOperationReviewError(`sale-order-state-${so.state || 'missing'}`);
     const lines = await this.deps.odoo.readLines(so.order_line ?? []);
     if (saleOrderFingerprint(so, lines) !== link.soFingerprint) throw new AutomaticOperationReviewError('sale-order-changed-after-link');
     const refs = await this.deps.odoo.findSaleOrdersReferencingCode(link.accurateShipmentCode);
     if (refs.some(r => r.id !== so.id)) throw new AutomaticOperationReviewError('waybill-code-on-another-sale-order');
+    // Empty-reference links exist only through the SO reference; it must still be there.
+    if (link.carrierRefNumber === '' && !refs.some(r => r.id === so.id)) throw new AutomaticOperationReviewError('sale-order-reference-removed');
     for (const field of [so.origin, so.client_order_ref]) {
       const value = typeof field === 'string' ? field.trim() : '';
       if (value && value !== link.accurateShipmentCode) throw new AutomaticOperationReviewError('sale-order-reference-names-another-waybill');
     }
-    return so;
+    const kind = await this.stockKind(so, lines);
+    if (kind === 'review') throw new AutomaticOperationReviewError('sale-order-stock-lines-unsupported');
+    return { so, serviceOnly: kind === 'service-only' };
   }
 
   private async pickingsDone(so: BridgeSaleOrder): Promise<boolean> {
@@ -374,8 +466,10 @@ export class WhatsappOdooBridgeService {
     return (await this.deps.store.getLink(link.id))!;
   }
 
-  private async deliverStock(link: BridgeLink, so: BridgeSaleOrder, shipment: BridgeCarrierShipment): Promise<BridgeLink> {
+  private async deliverStock(link: BridgeLink, so: BridgeSaleOrder, shipment: BridgeCarrierShipment, serviceOnly: boolean): Promise<BridgeLink> {
     const at = new Date(this.now());
+    // Service-only SO (e.g. generic WhatsApp Sale product): no stock exists to deliver.
+    if (serviceOnly) return await this.advance(link, 'stock-done', { stockDoneAt: at });
     if (await this.pickingsDone(so)) return await this.advance(link, 'stock-done', { stockDoneAt: at });
     await this.op(link, 'stock:v1', shipment, async () => {
       await this.deps.odoo.deliverStock(so.id);
@@ -384,8 +478,8 @@ export class WhatsappOdooBridgeService {
     return await this.advance(link, 'stock-done', { stockDoneAt: at });
   }
 
-  private async invoice(link: BridgeLink, so: BridgeSaleOrder, shipment: BridgeCarrierShipment, target: number): Promise<BridgeLink | null> {
-    if (!await this.pickingsDone(so)) { await this.markReview(link, 'stock-delivery-reverted-before-invoice'); return null; }
+  private async invoice(link: BridgeLink, so: BridgeSaleOrder, shipment: BridgeCarrierShipment, target: number, serviceOnly: boolean): Promise<BridgeLink | null> {
+    if (!serviceOnly && !await this.pickingsDone(so)) { await this.markReview(link, 'stock-delivery-reverted-before-invoice'); return null; }
     const plan = planInvoice(await this.deps.odoo.readInvoices(so), target);
     const at = new Date(this.now());
     if (plan.kind === 'review') { await this.markReview(link, plan.reason); return null; }
@@ -431,7 +525,7 @@ export class WhatsappOdooBridgeService {
     }
     const partnerId = relationId(invoice.commercial_partner_id) ?? relationId(invoice.partner_id);
     const paymentId = await this.op(link, 'payment:v1', shipment, async () => {
-      const id = await this.deps.odoo.registerPayment(invoice.id, target, journalId, `${link.carrierRefNumber} / ${link.accurateShipmentCode}`);
+      const id = await this.deps.odoo.registerPayment(invoice.id, target, journalId, `${link.odooSaleOrderName} / ${link.accurateShipmentCode}`);
       if (!id) throw new Error('Odoo did not return the payment id');
       const payment = await this.deps.odoo.readPayment(id);
       const paid = await this.deps.odoo.readInvoice(invoice.id);
@@ -447,7 +541,7 @@ export class WhatsappOdooBridgeService {
     return await this.advance(link, 'paid', { odooPaymentId: paymentId, paidAt: at });
   }
 
-  private async returnStock(link: BridgeLink, so: BridgeSaleOrder, shipment: BridgeCarrierShipment): Promise<BridgeLink | null> {
+  private async returnStock(link: BridgeLink, so: BridgeSaleOrder, shipment: BridgeCarrierShipment, serviceOnly: boolean): Promise<BridgeLink | null> {
     const fp = returnFingerprint(shipment);
     if (!link.returnObservedAt || link.returnFingerprint !== fp ||
         this.now() - link.returnObservedAt.getTime() < this.config.returnGraceMs) {
@@ -457,6 +551,16 @@ export class WhatsappOdooBridgeService {
     const invoices = (await this.deps.odoo.readInvoices(so)).filter(i => i.state !== 'cancel');
     if (invoices.length > 0) { await this.markReview(link, 'carrier-return-but-sale-order-invoiced'); return null; }
     const at = new Date(this.now());
+    if (serviceOnly) {
+      // No stock moved for a service line: close the SO, no invoice.
+      await this.op(link, 'cancel:v1', shipment, async () => {
+        await this.deps.odoo.cancelSaleOrder(so.id);
+        const after = await this.deps.odoo.readSaleOrder(so.id);
+        const invoicesAfter = after ? (await this.deps.odoo.readInvoices(after)).filter(i => i.state !== 'cancel') : [];
+        if (after?.state !== 'cancel' || invoicesAfter.length > 0) throw new Error('Service-only SO did not reach cancelled without invoices');
+      });
+      return await this.advance(link, 'returned', { returnedAt: at });
+    }
     const preview = await this.deps.odoo.previewReturn(so.id);
     if (preview.status === 'needs-review') { await this.markReview(link, `odoo-return-preview:${preview.reason ?? 'needs-review'}`); return null; }
     if (preview.status !== 'already-complete') {

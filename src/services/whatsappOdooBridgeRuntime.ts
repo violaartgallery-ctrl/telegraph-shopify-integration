@@ -38,6 +38,16 @@ export function createBridgeOdooPort(odoo: OdooClient, sync: OdooSyncService): B
     findSaleOrdersByName: name => read<BridgeSaleOrder & OdooRecord>('sale.order', [['name', '=', name]], SO_FIELDS, 2),
     findSaleOrdersReferencingCode: code => read<OdooRecord & { name: string }>('sale.order',
       ['|', ['origin', '=', code], ['client_order_ref', '=', code]], ['name'], 5),
+    findSaleOrdersReferencingCodes: codes => codes.length ? read<BridgeSaleOrder & OdooRecord>('sale.order',
+      ['|', ['origin', 'in', codes], ['client_order_ref', 'in', codes]], SO_FIELDS, 50) : Promise.resolve([]),
+    async readProductTypes(ids) {
+      const rows = ids.length ? await read<OdooRecord & { type?: string }>('product.product', [['id', 'in', ids]], ['type'], 200) : [];
+      return new Map(rows.map(r => [r.id, String(r.type ?? '')]));
+    },
+    async cancelSaleOrder(id) {
+      // Same non-interactive cancel the sale-return service uses; no customer mail.
+      await odoo.call('sale.order', 'action_cancel', [[id]], { context: { disable_cancel_warning: true } });
+    },
     async readSaleOrder(id) { return (await read<BridgeSaleOrder & OdooRecord>('sale.order', [['id', '=', id]], SO_FIELDS, 1))[0] ?? null; },
     readLines: ids => ids.length ? read<BridgeSaleOrderLine & OdooRecord>('sale.order.line', [['id', 'in', ids]],
       ['product_id', 'product_uom_qty', 'qty_delivered', 'qty_invoiced', 'price_unit', 'discount', 'display_type'], 200) : Promise.resolve([]),

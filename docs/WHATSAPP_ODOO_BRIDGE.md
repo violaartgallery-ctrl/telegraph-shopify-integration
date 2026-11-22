@@ -31,6 +31,27 @@ and the reference `Viola-<order number>`. The bridge adds a separate path:
 - Waybill COD price ≥ SO total and ≤ SO total + 150 EGP (customer shipping).
 - The SO is fingerprinted (lines, prices, total, partner). Any later edit = review.
 
+### Waybills with NO carrier reference (added 23 Nov, not in the first release)
+
+Older WhatsApp waybills (`VI` + 8 digits) have an empty reference. They are
+picked up only when the waybill is **active** (not cancelled, not returned, not
+already delivered + merchant-settled) and **exactly one** SO has `origin` or
+`client_order_ref` equal to the code (the other field empty or the same code).
+All codes found on a discovery run are checked with ONE Odoo read. A waybill that
+no SO references creates no row and no notice (it is a Shopify hand-made waybill
+or not yet prepared). Two SOs carrying the code, a Shopify record owning it, or
+any later change to the SO reference or the waybill reference = review. Same
+amount, currency, line, fingerprint and claim rules as the `S#####` path.
+
+### Service-only SOs (generic "WhatsApp Sale" product)
+
+When an SO has no pickings and every product line is a `service` product, there
+is no stock: the link starts at `stock-done` (no MO/picking writes). On delivered
++ settled it is invoiced at the carrier net (`customerDue`) and paid on Cash journal
+7 like any other link. On a stable 24 h carrier return the SO is cancelled once
+(claim `cancel:v1`), with no invoice and no stock moves. Goods lines without
+pickings, or a service-only SO that has pickings, go to review.
+
 ### Lifecycle
 
 `linked` → `stock-done` → `invoiced` → `paid`, or `stock-done` → `returned`.
@@ -99,7 +120,7 @@ handful of small Neon queries per run. No new schedules, crons or webhooks.
 
 ## Tests
 
-`npm run test:whatsapp-odoo-bridge` — 153 synthetic checks, no network/DB:
+`npm run test:whatsapp-odoo-bridge` — 207 synthetic checks, no network/DB:
 policy matrix, observe mode, happy path S26318/VI00000756 (3150 COD, net 3079 → one
 invoice 3079 + one journal-7 payment), settled-before-first-run, owner-adopted
 invoices, unknown payment outcome never replayed, failure after a sent write,

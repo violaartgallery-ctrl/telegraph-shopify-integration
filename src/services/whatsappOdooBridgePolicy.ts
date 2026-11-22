@@ -159,7 +159,7 @@ export const returnCode = (s: BridgeCarrierShipment) => text(s.returnStatus?.cod
 export const isCarrierReturn = (s: BridgeCarrierShipment) => RETURNED.has(statusCode(s)) || RETURNED.has(returnCode(s));
 
 export type MatchResult =
-  | { kind: 'linked'; matchMethod: 'origin' | 'client_order_ref' | 'both' | 'note'; amountTotal: number }
+  | { kind: 'linked'; matchMethod: 'origin' | 'client_order_ref' | 'both' | 'note' | 'code-reference'; amountTotal: number }
   | { kind: 'unmatched'; reason: string }
   | { kind: 'review'; reason: string };
 
@@ -207,19 +207,84 @@ export function matchSaleOrder(input: {
     matchMethod = 'note';
   }
 
-  if (relationName(so.currency_id) && relationName(so.currency_id) !== 'EGP') return { kind: 'review', reason: 'sale-order-currency-not-egp' };
-  if (input.lines.length === 0) return { kind: 'review', reason: 'sale-order-has-no-lines' };
-  const productLines = input.lines.filter(l => !l.display_type || l.display_type === 'product');
-  if (productLines.length === 0) return { kind: 'review', reason: 'sale-order-has-no-product-lines' };
+  const content = checkSaleOrderContent(shipment, so, input.lines, config.maxCustomerShipping);
+  if ('reason' in content) return { kind: 'review', reason: content.reason };
+  return { kind: 'linked', matchMethod, amountTotal: content.amountTotal };
+}
+
+/** Currency, lines and COD amount checks shared by both match paths. */
+function checkSaleOrderContent(shipment: BridgeCarrierShipment, so: BridgeSaleOrder, lines: BridgeSaleOrderLine[],
+  maxCustomerShipping: number): { amountTotal: number } | { reason: string } {
+  if (relationName(so.currency_id) && relationName(so.currency_id) !== 'EGP') return { reason: 'sale-order-currency-not-egp' };
+  if (lines.length === 0) return { reason: 'sale-order-has-no-lines' };
+  const productLines = lines.filter(l => !l.display_type || l.display_type === 'product');
+  if (productLines.length === 0) return { reason: 'sale-order-has-no-product-lines' };
   if (productLines.some(l => Number(l.product_uom_qty ?? 0) <= 0 || Number(l.price_unit ?? 0) < 0 ||
       Number(l.discount ?? 0) < 0 || Number(l.discount ?? 0) >= 100)) {
-    return { kind: 'review', reason: 'sale-order-has-negative-or-zero-line' };
+    return { reason: 'sale-order-has-negative-or-zero-line' };
   }
   const amountTotal = Number(so.amount_total);
-  if (!Number.isFinite(amountTotal) || amountTotal <= 0) return { kind: 'review', reason: 'sale-order-total-not-positive' };
-  const amount = checkWaybillAmount(shipment, amountTotal, config.maxCustomerShipping);
-  if (amount) return { kind: 'review', reason: amount };
-  return { kind: 'linked', matchMethod, amountTotal };
+  if (!Number.isFinite(amountTotal) || amountTotal <= 0) return { reason: 'sale-order-total-not-positive' };
+  const amount = checkWaybillAmount(shipment, amountTotal, maxCustomerShipping);
+  if (amount) return { reason: amount };
+  return { amountTotal };
+}
+
+/**
+ * Hand-made waybill with NO carrier reference (older WhatsApp orders): it can
+ * only be matched by an SO whose origin/client_order_ref is exactly its code.
+ * Only active waybills qualify: not cancelled, not returned, not already
+ * delivered and merchant-settled.
+ */
+export function isCodeReferenceCandidate(s: BridgeCarrierShipment): boolean {
+  if (!BRIDGE_CODE_PATTERN.test(s.code) || (s.refNumber ?? '').trim() !== '') return false;
+  if (s.cancelled || isCarrierReturn(s)) return false;
+  return !(statusCode(s) === 'DTR' && s.paidToCustomer);
+}
+
+/**
+ * Match path for empty-reference waybills. `sosReferencingCode` holds the full
+ * SO records whose origin or client_order_ref equals the code.
+ * `none` = no SO references the code (not a WhatsApp-only order; no link row).
+ */
+export function matchSaleOrderByCode(input: {
+  shipment: BridgeCarrierShipment;
+  sosReferencingCode: BridgeSaleOrder[];
+  lines: BridgeSaleOrderLine[];
+  config: Pick<BridgeConfig, 'maxCustomerShipping' | 'minSaleOrderNumber'>;
+}): MatchResult | { kind: 'none' } {
+  const { shipment, config } = input;
+  if (!BRIDGE_CODE_PATTERN.test(shipment.code) || (shipment.refNumber ?? '').trim() !== '') return { kind: 'none' };
+  if (input.sosReferencingCode.length === 0) return { kind: 'none' };
+  if (input.sosReferencingCode.length > 1) return { kind: 'review', reason: 'waybill-code-on-several-sale-orders' };
+  const so = input.sosReferencingCode[0]!;
+  const number = saleOrderNumber(so.name);
+  if (number === null) return { kind: 'review', reason: 'sale-order-name-not-standard' };
+  if (number < config.minSaleOrderNumber) return { kind: 'review', reason: 'sale-order-before-bridge-start' };
+  if (so.state === 'draft' || so.state === 'sent') return { kind: 'unmatched', reason: 'sale-order-not-confirmed' };
+  if (so.state !== 'sale') return { kind: 'review', reason: `sale-order-state-${so.state || 'missing'}` };
+  const origin = text(so.origin), clientRef = text(so.client_order_ref);
+  if (origin !== shipment.code && clientRef !== shipment.code) return { kind: 'review', reason: 'sale-order-reference-not-exact' };
+  if ((origin && origin !== shipment.code) || (clientRef && clientRef !== shipment.code)) {
+    return { kind: 'review', reason: 'sale-order-reference-names-another-waybill' };
+  }
+  const content = checkSaleOrderContent(shipment, so, input.lines, config.maxCustomerShipping);
+  if ('reason' in content) return { kind: 'review', reason: content.reason };
+  return { kind: 'linked', matchMethod: 'code-reference', amountTotal: content.amountTotal };
+}
+
+export type StockKind = 'stock' | 'service-only' | 'review';
+
+/**
+ * service-only: no pickings and every product line is a service (e.g. the
+ * generic "WhatsApp Sale" product): there is no stock to deliver or return.
+ * Pickings missing on goods lines is never guessed.
+ */
+export function saleOrderStockKind(so: BridgeSaleOrder, lines: BridgeSaleOrderLine[], productTypes: Map<number, string>): StockKind {
+  const productLines = lines.filter(l => !l.display_type || l.display_type === 'product');
+  const allService = productLines.length > 0 && productLines.every(l => productTypes.get(relationId(l.product_id) ?? -1) === 'service');
+  if ((so.picking_ids ?? []).length > 0) return allService ? 'review' : 'stock';
+  return allService ? 'service-only' : 'review';
 }
 
 /** Waybill COD must be the SO total plus a plausible customer shipping charge. */
