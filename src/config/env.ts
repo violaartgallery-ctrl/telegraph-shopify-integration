@@ -99,7 +99,7 @@ export const env = {
   },
   accurate: {
     // Shared secret for incoming Accurate/Telegraph webhook calls.
-    // If empty the endpoint accepts any caller with a startup warning (backward compat).
+    // If empty the endpoint rejects every call with 503 (fail closed).
     webhookSecret: optionalString('ACCURATE_WEBHOOK_SECRET'),
     endpoint: required('ACCURATE_GRAPHQL_ENDPOINT'),
     username: required('ACCURATE_USERNAME'),
