@@ -27,6 +27,7 @@
     "odoo:controlled-new-arrivals-return": "tsx src/scripts/runControlledNewArrivalsOdooReturns.ts",
     "odoo:backfill-new-arrivals-returns": "tsx src/scripts/backfillNewArrivalsOdooReturns.ts",
     "test:admin-auth": "tsx src/scripts/testAdminAuth.ts",
+    "test:telegram-webhook-auth": "tsx src/scripts/testTelegramWebhookAuth.ts",
     "shopify:ensure-validation": "tsx src/scripts/ensureShopifyValidation.ts",
     "health:production": "tsx src/scripts/checkProductionHealth.ts",
     "odoo:discover-return-account": "tsx src/scripts/discoverOdooReturnChargeAccount.ts",
