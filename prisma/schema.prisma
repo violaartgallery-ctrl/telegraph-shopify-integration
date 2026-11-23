@@ -81,6 +81,13 @@ model ShipmentRecord {
   @@index([returnSyncStatus, returnSyncRetryAt], map: "ShipmentRecord_return_sync_queue_idx")
   @@index([shopifyPaymentSyncStatus, shopifyPaymentRetryAt], map: "ShipmentRecord_shopify_payment_queue_idx")
   @@index([odooCollectionSyncStatus, odooCollectionRetryAt], map: "ShipmentRecord_odoo_collection_queue_idx")
+  // Lookup indexes added live on 2026-11-23 (CREATE INDEX CONCURRENTLY); see migration 20261123120000_add_lookup_indexes.
+  @@index([odooSyncStatus, odooRetryAt], map: "viola_perf_sr_odoo_sync_idx")
+  @@index([collectionStatus], map: "viola_perf_sr_collection_status_idx")
+  @@index([accurateShipmentCode], map: "viola_perf_sr_accurate_code_idx")
+  @@index([accurateShipmentId], map: "viola_perf_sr_accurate_id_idx")
+  @@index([shopifyOrderName], map: "viola_perf_sr_order_name_idx")
+  @@index([odooSaleOrderId], map: "viola_perf_sr_odoo_so_idx")
 }
 
 model MetaDeliveryOutbox {
@@ -131,6 +138,11 @@ model FailedPayload {
   payloadJson String
   headersJson String?
   createdAt   DateTime @default(now())
+
+  // Lookup indexes added live on 2026-11-23. reason uses a hash index because some values are ~12 KB (too large for btree).
+  @@index([source, externalId], map: "viola_perf_fp_source_external_idx")
+  @@index([externalId], map: "viola_perf_fp_external_idx")
+  @@index([reason], map: "viola_perf_fp_reason_hash_idx", type: Hash)
 }
 
 model LocationCatalogSnapshot {
