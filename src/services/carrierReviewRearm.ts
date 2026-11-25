@@ -181,7 +181,7 @@ export interface RearmPorts {
 }
 
 export async function runCarrierReviewRearm(ports: RearmPorts, options: { limit?: number; epoch?: string; orderReferencePrefix: string; now?: () => number }) {
-  const limit = Math.max(1, Math.min(options.limit ?? 5, 10));
+  const limit = Math.max(1, Math.min(options.limit ?? 5, 30));
   const now = options.now ?? Date.now;
   const cursor = await ports.readCursor();
   let rows = await ports.candidates(cursor, limit);

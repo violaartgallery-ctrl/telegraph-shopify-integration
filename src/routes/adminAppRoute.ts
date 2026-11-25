@@ -16,6 +16,7 @@ import {getOperationsDashboard} from '../services/operationsDashboardService.js'
 import {renderOperationsDashboard,renderOperationsDashboardScript} from '../ui/operationsDashboard.js';
 import {createOperationsDecisionRouter} from './operationsDecisionRoute.js';
 import {renderOperationsReviewUi,renderOperationsReviewScript} from '../ui/operationsReviewUi.js';
+import {renderAccountantDesk,renderAccountantDeskScript} from '../ui/accountantDeskUi.js';
 
 interface ZoneEntry {
   id: number;
@@ -149,6 +150,7 @@ const renderAppShell = (adminToken?: string, readOnly = Boolean(automationHoldRe
       </header>
       ${manualShipping ? '<section role="status"><strong>الشحن اليدوي من Shopify مفعّل</strong><p>اضغط إنشاء بوليصة، راجع المحافظة والمنطقة، ثم أكد الإنشاء. فتح الصفحة لا ينشئ شحنات. حمايات منع التكرار باقية.</p></section>' : readOnly ? '<section role="status"><strong>وضع العرض الآمن</strong><p>يمكنك تحديث عرض الأوردرات والمناطق. أزرار إنشاء البوالص وOdoo معطلة، ولن تُشغّل هذه الصفحة أي طابور. التشغيل اليدوي المعتمد يظل من تيليجرام.</p></section>' : ''}
       <div id="toast" class="toast"></div>
+      ${renderAccountantDesk()}
       ${renderOperationsReviewUi()}
       <details style="margin-top:24px"><summary>التفاصيل التقنية للجدولة والطوابير — للقراءة فقط</summary>${renderOperationsDashboard()}</details>
       <section>
@@ -174,6 +176,7 @@ const renderAppShell = (adminToken?: string, readOnly = Boolean(automationHoldRe
         toast.style.color = error ? '#b42318' : '#0b6b5d';
       };
       const html = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      ${renderAccountantDeskScript()}
       ${renderOperationsReviewScript()}
       ${renderOperationsDashboardScript()}
 

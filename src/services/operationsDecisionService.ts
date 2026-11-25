@@ -8,7 +8,7 @@ import {loadExactCarrierShipment} from './verifiedCarrierShipment.js';
 import {projectAccurateStatusToShopify} from './accurateStatusMapper.js';
 import {buildReturnSyncFingerprint,buildOdooCollectionFingerprint,buildShopifyPaymentFingerprint} from './shipmentStatusSyncService.js';
 import {safeQueueConfig} from './safeQueuePolicy.js';
-import {assertOdooShipmentSourceUnchanged} from './odooShipmentBinding.js';
+import {assertOdooProductionSourceUnchanged} from './odooShipmentBinding.js';
 import {collectionSettlementQuote,financialSourceHash,financialSaleHash,sealFinancialApproval,readOwnerPayments} from './ownerFinancialApproval.js';
 import {invalidateOperationsDashboard} from './operationsDashboardService.js';
 import {DECISION_SOURCE,decisionHash,decisionOptions,decisionPlan,decisionProtected,decisionVersion,laneFields,reviewLanes,reviewReason,signDecisionTicket,verifyDecisionTicket,type DecisionRow} from './operationsDecisionPolicy.js';
@@ -30,7 +30,7 @@ export async function readDecisionFacts(row:DecisionRow):Promise<DecisionRow> {
     const order=await shopifyOrdersClient.getOrderByLegacyId(row.shopifyOrderId);
     if(String(order.id)!==row.shopifyOrderId||order.name!==row.shopifyOrderName||String(order.order_number)!==String(row.shopifyOrderNumber))throw Error('Identity mismatch');
     let sourceUnchanged=false;
-    try{assertOdooShipmentSourceUnchanged(JSON.parse(row.rawOrderJson??'null'),order);sourceUnchanged=true;}catch{/* Display the decision, but never authorize changed products/address/money. */}
+    try{assertOdooProductionSourceUnchanged(JSON.parse(row.rawOrderJson??'null'),order);sourceUnchanged=true;}catch{/* Display the decision, but never authorize changed products/address/money. */}
     const client=new OdooClient();
     const sales=await client.searchRead('sale.order',[['origin','=',order.name]],['name','origin','client_order_ref','state','invoice_ids','partner_id','currency_id','company_id','order_line'],{limit:3});
     const invoiceIds=sales.flatMap(s=>Array.isArray(s.invoice_ids)?s.invoice_ids:[]);
