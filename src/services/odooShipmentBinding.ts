@@ -52,6 +52,68 @@ const approvedBotFollowupPairs = [
 export function isApprovedBotFollowupAccountingPair(a:ManualShipmentBinding,b:ManualShipmentBinding):boolean {
   return a.version===1&&b.version===1&&a.shopifyOrderId===b.shopifyOrderId&&a.orderName===b.orderName&&approvedBotFollowupPairs.some(p=>p.id===a.shopifyOrderId&&p.name===a.orderName&&p.savedHash===a.shippingHash&&p.botHash===b.shippingHash);
 }
+/** Owner rule 12 (2026-11-25), opt-in: for Odoo accounting only, ignore notes,
+ * tags, names, addresses and line customization. Products, quantities, prices,
+ * discounts, shipping, tax, currency, financial status and cancellation still
+ * bind. Never used for shipping, Preview/Run or the strict manual binding. */
+export const accountingMoneyOnlySourceEnabled = (): boolean =>
+  process.env.OPS_ACCOUNTING_MONEY_ONLY_SOURCE?.trim().toLowerCase() === 'true';
+
+const moneyCents = (value: unknown): number | null => {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error('AUTOMATION_REVIEW_REQUIRED: Invalid accounting money value');
+  return Math.round(n * 100);
+};
+
+export interface OdooAccountingMoneyBinding { version: 1; shopifyOrderId: string; orderName: string; moneyKey: string; lineCount: number }
+
+export function bindOdooAccountingMoney(order: ShopifyOrder): OdooAccountingMoneyBinding {
+  const o = order as ShopifyOrder & Record<string, any>;
+  const id = String(o.id);
+  if (!/^[1-9]\d*$/.test(id) || typeof o.name !== 'string' || !/^#\S+$/.test(o.name) || !Array.isArray(o.line_items) || o.line_items.length >= 250) {
+    throw new Error('AUTOMATION_REVIEW_REQUIRED: Invalid accounting money identity');
+  }
+  if (o.shipping_lines != null && !Array.isArray(o.shipping_lines)) throw new Error('AUTOMATION_REVIEW_REQUIRED: Invalid accounting shipping lines');
+  const lines = o.line_items.map((l: Record<string, any>) => {
+    const quantity = Number(l.current_quantity ?? l.quantity);
+    if (!Number.isSafeInteger(quantity) || quantity < 0) throw new Error('AUTOMATION_REVIEW_REQUIRED: Invalid accounting line quantity');
+    return { product: l.product_id ?? null, variant: l.variant_id ?? null, sku: l.sku ?? null, quantity,
+      price: moneyCents(l.price), discount: moneyCents(l.total_discount ?? 0) };
+  }).filter((l: { quantity: number }) => l.quantity > 0)
+    .sort((a: any, b: any) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const shipping = (o.shipping_lines ?? []).reduce((sum: number, s: Record<string, any>) => sum + (moneyCents(s.discounted_price ?? s.price) ?? 0), 0);
+  const money = {
+    // Pending/authorized/paid are the same accounting input for the SO: our own COD payment
+    // record moves pending -> paid. Refunds, voids and partial states still differ.
+    currency: o.currency ?? null, financialStatus: ['pending', 'authorized', 'paid'].includes(String(o.financial_status ?? '')) ? 'open-or-paid' : (o.financial_status ?? null),
+    cancelled: Boolean(o.cancelled_at), test: Boolean(o.test),
+    total: moneyCents(o.current_total_price ?? o.total_price), subtotal: moneyCents(o.current_subtotal_price ?? o.subtotal_price),
+    discounts: moneyCents(o.current_total_discounts ?? o.total_discounts), tax: moneyCents(o.current_total_tax ?? o.total_tax),
+    shipping, lines,
+  };
+  if (money.total === null) throw new Error('AUTOMATION_REVIEW_REQUIRED: Missing accounting order total');
+  // Canonical text, compared exactly (this module stays free of crypto imports).
+  return { version: 1, shopifyOrderId: id, orderName: o.name, moneyKey: JSON.stringify(money), lineCount: lines.length };
+}
+
+/** True only when both orders are the same order with identical accounting money inputs. */
+export function accountingMoneyUnchanged(saved: ShopifyOrder, fresh: ShopifyOrder): boolean {
+  try {
+    const a = bindOdooAccountingMoney(saved), b = bindOdooAccountingMoney(fresh);
+    return a.shopifyOrderId === b.shopifyOrderId && a.orderName === b.orderName && a.lineCount > 0 && a.moneyKey === b.moneyKey;
+  } catch { return false; }
+}
+
+/** Production (Odoo SO) source fence: the strict check, then the opt-in money-only rule. */
+export function assertOdooProductionSourceUnchanged(saved: ShopifyOrder, fresh: ShopifyOrder): void {
+  try { assertOdooShipmentSourceUnchanged(saved, fresh); }
+  catch (error) {
+    if (accountingMoneyOnlySourceEnabled() && accountingMoneyUnchanged(saved, fresh)) return;
+    throw error;
+  }
+}
+
 export function assertOdooShipmentSourceUnchanged(saved: ShopifyOrder, fresh: ShopifyOrder): void {
   const a = bindOdooShipmentAccountingSource(saved);
   const b = bindOdooShipmentAccountingSource(fresh);

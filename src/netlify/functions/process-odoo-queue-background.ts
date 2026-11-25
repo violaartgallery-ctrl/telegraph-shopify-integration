@@ -27,7 +27,7 @@ import {OdooClient} from '../../odoo/odooClient.js';
 import {safeQueueHoldReason} from '../../services/safeQueuePolicy.js';
 import {isDatabaseQuotaError} from '../../services/automationSafety.js';
 import {loadExactCarrierShipment} from '../../services/verifiedCarrierShipment.js';
-import {assertOdooShipmentSourceUnchanged} from '../../services/odooShipmentBinding.js';
+import {assertOdooProductionSourceUnchanged} from '../../services/odooShipmentBinding.js';
 import {assertRecoveryNotExcluded,isOdooOnlyRecovery} from '../../services/cancellationRecoveryPolicy.js';
 import type {AccurateClient} from '../../accurate/accurateClient.js';
 
@@ -193,7 +193,7 @@ async function processOne(record: QueueRecord, odooSyncService: OdooSvc,accurate
           const rows=await new OdooClient().searchRead('sale.order',[['id','=',record.odooSaleOrderId]],['name','state','origin','client_order_ref'],{limit:2});const so=rows[0];
           if(rows.length!==1||so.state!=='sale'||so.origin!==fresh.name||so.client_order_ref!==fresh.name+' / Viola-'+fresh.order_number)throw new Error('AUTOMATION_REVIEW_REQUIRED: linked Sales Order is cancelled, foreign, or mismatched');
         }
-        if(stageToRun==='odoo-so-pending')assertOdooShipmentSourceUnchanged(JSON.parse(record.rawOrderJson!),fresh);
+        if(stageToRun==='odoo-so-pending')assertOdooProductionSourceUnchanged(JSON.parse(record.rawOrderJson!),fresh);
       }
       return await runStage(record, stageToRun, odooSyncService);
     });

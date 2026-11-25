@@ -336,7 +336,13 @@ async function runLane(lane: OpsLane): Promise<unknown> {
   // has settled. Explicit opt-in; queue metadata + receipt only (no business
   // write); diagnostic-only so it can never fail or redeliver the lane.
   if (safeQueueReleaseRequested() && process.env.OPS_CARRIER_REVIEW_REARM_ENABLED?.trim().toLowerCase() === 'true') {
-    await attempt('carrierReviewRearm', async () => (await import('./carrierReviewRearmRuntime.js')).runNativeCarrierReviewRearm({ limit: 5 }), true);
+    await attempt('carrierReviewRearm', async () => (await import('./carrierReviewRearmRuntime.js')).runNativeCarrierReviewRearm({ limit: 15 }), true);
+  }
+  // Owner rules 6 and 12: re-arm zero-effect return reviews (goods back, no money)
+  // and production reviews where only notes/tags/customization changed. Opt-in,
+  // queue metadata + receipt only, diagnostic-only like the carrier re-arm.
+  if (safeQueueReleaseRequested() && process.env.OPS_ACCOUNTANT_RULES_ENABLED?.trim().toLowerCase() === 'true') {
+    await attempt('accountantRulesRearm', async () => (await import('./reviewRearmExtraRuntime.js')).runNativeExtraReviewRearm({ limit: 10 }), true);
   }
   await attempt('shopify', () => sync.processShopifyPaymentQueue({ apply: true, limit: 12, budgetMs: 35_000, allowDiscounts: false }));
   await attempt('collections', () => sync.processOdooCollectionQueue({ apply: true, limit: 20, budgetMs: 50_000 }));

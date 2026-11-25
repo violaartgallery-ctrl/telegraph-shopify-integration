@@ -1,6 +1,7 @@
 import {basePrisma} from '../lib/prisma.js';
 import {safeQueueConfig} from './safeQueuePolicy.js';
 import {STATUS_POLL_QUARANTINE_PREFIX} from './statusPollingPolicy.js';
+import {categorizeReviewCase} from './accountantCategories.js';
 
 // Display-only projection. No worker/finder/claim/replay functions are imported.
 const LANES=['production','return','collection','shopify','status'] as const;
@@ -75,7 +76,7 @@ export function projectOperations(rows:Row[],metadata:Row[],config:{epoch:string
   const seenReview=new Set<string>();
   const addReview=(r:Row,l:Lane,reason:unknown,caseId:string,classification:string)=>{
     if(seenReview.has(caseId))return;seenReview.add(caseId);
-    reviewCases.push({...detail(r),caseId,lane:l,label:LABELS[l],reason:dashboardText(reason||status(r,l)||'مراجعة مطلوبة'),classification,
+    reviewCases.push({...detail(r),caseId,lane:l,label:LABELS[l],reason:dashboardText(reason||status(r,l)||'مراجعة مطلوبة'),classification,category:categorizeReviewCase({reason,classification,lane:l}),
       requiredAction:classification==='durable-hold'?'راجع السبب والمستندات الأصلية؛ لا يُرفع الإيقاف تلقائيًا.':classification==='diagnostic-hold'?'تحتاج تحققًا تقنيًا من هوية البوليصة؛ ليست موافقة شحن جديدة ولا يُعاد إنشاؤها.':'تأكيد الحالة أو المبلغ/المستند الصحيح قبل أي إعادة تنفيذ.'});
   };
   const claimFor=(r:Row,l:Lane)=>{
