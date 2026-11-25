@@ -26,6 +26,8 @@ const order: any = {
 const noteOnly = clone(order); noteOnly.note = 'العميل عايز التوصيل بعد الضهر'; noteOnly.tags = 'wa-needs-agent, accurate-delivered';
 noteOnly.shipping_address.address1 = 'شارع 2'; noteOnly.line_items[0].properties = [{ name: 'اسم', value: 'محمد' }]; noteOnly.name = '#90001';
 ok(accountingMoneyUnchanged(order, noteOnly), 'notes/tags/address/customization do not change accounting money');
+const paidCod = clone(order); paidCod.financial_status = 'paid';
+ok(accountingMoneyUnchanged(order, paidCod), 'our own COD payment (pending -> paid) is not a money change');
 const reordered = clone(order); reordered.line_items.reverse();
 ok(accountingMoneyUnchanged(order, reordered), 'line order does not matter');
 const removedZero = clone(order); removedZero.line_items.push({ product_id: 3, variant_id: 33, sku: 'X', quantity: 1, current_quantity: 0, price: '99.00' });
@@ -38,7 +40,8 @@ for (const [label, change] of [
   ['discount', (o: any) => { o.total_discounts = '50.00'; }],
   ['shipping', (o: any) => { o.shipping_lines[0].discounted_price = '0.00'; }],
   ['cancelled', (o: any) => { o.cancelled_at = '2026-11-25T00:00:00Z'; }],
-  ['financial status', (o: any) => { o.financial_status = 'paid'; }],
+  ['refund status', (o: any) => { o.financial_status = 'partially_refunded'; }],
+  ['voided', (o: any) => { o.financial_status = 'voided'; }],
   ['other order', (o: any) => { o.id = 900002; }],
   ['added product', (o: any) => { o.line_items.push({ product_id: 4, variant_id: 44, sku: 'NEW', quantity: 1, current_quantity: 1, price: '10.00' }); }],
 ] as const) { const x = clone(order); change(x); ok(!accountingMoneyUnchanged(order, x), `${label} change still blocks`); }

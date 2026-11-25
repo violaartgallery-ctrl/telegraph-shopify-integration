@@ -84,7 +84,10 @@ export function bindOdooAccountingMoney(order: ShopifyOrder): OdooAccountingMone
     .sort((a: any, b: any) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   const shipping = (o.shipping_lines ?? []).reduce((sum: number, s: Record<string, any>) => sum + (moneyCents(s.discounted_price ?? s.price) ?? 0), 0);
   const money = {
-    currency: o.currency ?? null, financialStatus: o.financial_status ?? null, cancelled: Boolean(o.cancelled_at), test: Boolean(o.test),
+    // Pending/authorized/paid are the same accounting input for the SO: our own COD payment
+    // record moves pending -> paid. Refunds, voids and partial states still differ.
+    currency: o.currency ?? null, financialStatus: ['pending', 'authorized', 'paid'].includes(String(o.financial_status ?? '')) ? 'open-or-paid' : (o.financial_status ?? null),
+    cancelled: Boolean(o.cancelled_at), test: Boolean(o.test),
     total: moneyCents(o.current_total_price ?? o.total_price), subtotal: moneyCents(o.current_subtotal_price ?? o.subtotal_price),
     discounts: moneyCents(o.current_total_discounts ?? o.total_discounts), tax: moneyCents(o.current_total_tax ?? o.total_tax),
     shipping, lines,
